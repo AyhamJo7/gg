@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import type { OrchestratorEvent } from "./types";
 
 const MAX_TERMINAL_LINES = 2000;
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_MAX_MS = 15_000;
 
 export interface TerminalLine {
   id: number;
@@ -10,41 +12,113 @@ export interface TerminalLine {
   ts: string;
 }
 
-/** Subscribes to the mission WebSocket. The server replays persisted history
- * first, so a reloaded page catches up automatically. */
+interface SeenRef {
+  ids: Set<string>;
+  order: string[];
+}
+
+/** Bounded id set for replay dedupe (server replays history on connect). */
+function makeSeen(): SeenRef {
+  return { ids: new Set(), order: [] };
+}
+
+function seenAdd(seen: SeenRef, id: string): boolean {
+  if (seen.ids.has(id)) return false;
+  seen.ids.add(id);
+  seen.order.push(id);
+  if (seen.order.length > 5000) {
+    const drop = seen.order.splice(0, seen.order.length - 5000);
+    for (const d of drop) seen.ids.delete(d);
+  }
+  return true;
+}
+
+/** Subscribes to the mission WebSocket with automatic reconnect.
+ *
+ * - bounded exponential backoff with jitter, single reconnect timer
+ * - server replays durable history + bounded terminal tail on (re)connect;
+ *   event-id dedupe makes replay idempotent (no duplicate renders)
+ * - cleanup on unmount: socket closed, timer cancelled, no socket leaks
+ */
 export function useMissionEvents(missionId: string | null) {
   const [terminal, setTerminal] = useState<TerminalLine[]>([]);
   const [events, setEvents] = useState<OrchestratorEvent[]>([]);
   const [connected, setConnected] = useState(false);
-  const idRef = useRef(0);
+  const lineIdRef = useRef(0);
+  const seenRef = useRef<SeenRef>(makeSeen());
 
   useEffect(() => {
     if (!missionId) return;
     setTerminal([]);
     setEvents([]);
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/missions/${missionId}`);
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => setConnected(false);
-    ws.onerror = () => setConnected(false);
-    ws.onmessage = (msg) => {
-      try {
-        const event = JSON.parse(msg.data) as OrchestratorEvent;
-        setEvents((prev) => [...prev.slice(-499), event]);
-        if (event.type === "PROVIDER_OUTPUT") {
-          const line: TerminalLine = {
-            id: ++idRef.current,
-            provider: String(event.payload.provider ?? "?"),
-            text: String(event.payload.line ?? ""),
-            ts: event.created_at,
-          };
-          setTerminal((prev) => [...prev.slice(-MAX_TERMINAL_LINES), line]);
-        }
-      } catch {
-        // malformed frame — ignore
-      }
+    setConnected(false);
+    seenRef.current = makeSeen();
+
+    let disposed = false;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+
+    const scheduleReconnect = () => {
+      if (disposed) return;
+      setConnected(false);
+      if (reconnectTimer !== null) return; // single timer invariant
+      attempt += 1;
+      const backoff = Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_MAX_MS);
+      const jitter = Math.random() * backoff * 0.25;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, backoff + jitter);
     };
-    return () => ws.close();
+
+    const connect = () => {
+      if (disposed) return;
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/ws/missions/${missionId}`);
+      ws.onopen = () => {
+        if (disposed) return;
+        attempt = 0;
+        setConnected(true);
+      };
+      ws.onmessage = (msg) => {
+        if (disposed) return;
+        try {
+          const event = JSON.parse(msg.data) as OrchestratorEvent;
+          if (event.id && !seenAdd(seenRef.current, event.id)) return; // replay duplicate
+          setEvents((prev) => [...prev.slice(-499), event]);
+          if (event.type === "PROVIDER_OUTPUT") {
+            const line: TerminalLine = {
+              id: ++lineIdRef.current,
+              provider: String(event.payload.provider ?? "?"),
+              text: String(event.payload.line ?? ""),
+              ts: event.created_at,
+            };
+            setTerminal((prev) => [...prev.slice(-MAX_TERMINAL_LINES), line]);
+          }
+        } catch {
+          // malformed frame — ignore
+        }
+      };
+      ws.onclose = scheduleReconnect;
+      ws.onerror = () => ws?.close(); // let onclose drive the single reconnect path
+    };
+
+    connect();
+
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws) {
+        ws.onclose = null; // do not schedule reconnect after disposal
+        ws.close();
+        ws = null;
+      }
+      setConnected(false);
+    };
   }, [missionId]);
 
   return { terminal, events, connected };
