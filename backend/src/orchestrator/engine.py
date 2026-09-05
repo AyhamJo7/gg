@@ -38,9 +38,10 @@ from .providers.base import ExecutionRequest, ExecutionResult, ProviderAdapter
 from .providers.registry import ProviderRegistry
 from .review import (
     REVIEW_INSTRUCTIONS,
+    mark_findings_repair_attempted,
     open_blockers,
     persist_findings,
-    resolve_open_findings,
+    resolve_repaired_findings,
 )
 from .security import ensure_gitignore_protections, redact
 from .verify import run_verification
@@ -79,8 +80,7 @@ ROLE_PROMPTS = {
         "Follow existing project conventions and instruction files. Keep changes focused."
     ),
     Role.TESTING: (
-        "Run the project's test/build toolchain. Fix any failures you find. "
-        "Do not weaken tests to make them pass."
+        "Run the project's test/build toolchain. Fix any failures you find. Do not weaken tests to make them pass."
     ),
     Role.REVIEW: REVIEW_INSTRUCTIONS,
     Role.REPAIR: "Fix the open review findings listed below. Verify your fixes by running relevant tests.",
@@ -114,12 +114,14 @@ class MissionEngine:
         self.workspace: WorkspaceInfo | None = None
         self.project_path: Path | None = None
 
-    # -- control ------------------------------------------------------------
     def request_pause(self) -> None:
         self._pause.set()
         self._wake.set()
         if self._current_adapter and self._current_run_id:
             asyncio.create_task(self._current_adapter.interrupt(self._current_run_id))
+
+    def pause(self) -> None:
+        self.request_pause()
 
     def request_cancel(self) -> None:
         self._cancel.set()
@@ -128,8 +130,17 @@ class MissionEngine:
         if self._current_adapter and self._current_run_id:
             asyncio.create_task(self._current_adapter.interrupt(self._current_run_id))
 
+    def cancel(self) -> None:
+        self.request_cancel()
+
+    def resume(self) -> None:
+        self._pause.clear()
+        self._gate_resolved.set()
+        self._wake.set()
+
     def resolve_gate(self) -> None:
         self._gate_resolved.set()
+        self._wake.set()
 
     def wake(self) -> None:
         self._wake.set()
@@ -183,8 +194,21 @@ class MissionEngine:
             try:
                 ensure_gitignore_protections(self.project_path)
                 sha = await git_ops.checkpoint(self.project_path, message)
+                self._checkpoint_failures = 0
             except git_ops.GitError as exc:
                 logger.warning("checkpoint failed: %s", exc)
+                self._checkpoint_failures = getattr(self, "_checkpoint_failures", 0) + 1
+                self.events.publish(EventType.GIT_CHECKPOINT_FAILED, self.mission_id, error=str(exc), message=message)
+                max_ckpt_failures = int(self.config.get("git.max_checkpoint_failures", 2))
+                if self._checkpoint_failures >= max_ckpt_failures:
+                    self.db.update(
+                        "missions",
+                        self.mission_id,
+                        {
+                            "blocking_issue": f"git checkpoint failed repeatedly ({self._checkpoint_failures}x): {exc}",
+                            "updated_at": utcnow(),
+                        },
+                    )
                 return None
         if sha:
             self.db.insert(
@@ -315,23 +339,37 @@ class MissionEngine:
             handoff_content = self._make_handoff(role, last_provider, provider_name, ROLE_PROMPTS[role])
             prompt = self._build_prompt(role, mission, handoff_content, extra_context)
 
-            task = TaskRecord(mission_id=self.mission_id, role=role, status="running", prompt=prompt[-4000:],
-                attempts=1)
+            task = TaskRecord(
+                mission_id=self.mission_id, role=role, status="running", prompt=prompt[-4000:], attempts=1
+            )
             self.db.insert(
                 "tasks",
                 {
-                    "id": task.id, "mission_id": task.mission_id, "role": task.role.value,
-                    "status": task.status, "prompt": task.prompt, "summary": "",
-                    "attempts": 1, "created_at": task.created_at,
+                    "id": task.id,
+                    "mission_id": task.mission_id,
+                    "role": task.role.value,
+                    "status": task.status,
+                    "prompt": task.prompt,
+                    "summary": "",
+                    "attempts": 1,
+                    "created_at": task.created_at,
                 },
             )
-            self.events.publish(EventType.TASK_STARTED, self.mission_id, task_id=task.id, role=role.value,
-                provider=provider_name)
+            self.events.publish(
+                EventType.TASK_STARTED, self.mission_id, task_id=task.id, role=role.value, provider=provider_name
+            )
 
             run_id = f"run-{utcnow().timestamp()}".replace(".", "")
             if self.project_path is None:
                 raise RuntimeError("engine project path not initialized")
             log_dir = self.project_path / ".orchestrator" / "logs"
+            def on_spawn(pid: int, pgid: int, start_ts: float, r_id: str = run_id) -> None:
+                self.db.update(
+                    "provider_runs",
+                    r_id,
+                    {"pid": pid, "pgid": pgid, "started_at_ts": start_ts},
+                )
+
             request = ExecutionRequest(
                 prompt=prompt,
                 workdir=self.project_path,
@@ -339,12 +377,46 @@ class MissionEngine:
                 timeout_s=self.config.provider_timeout_s(provider_name),
                 run_id=run_id,
                 log_dir=log_dir,
+                on_spawn=on_spawn,
             )
             commit_before = await git_ops.head_sha(self.project_path) if self.project_path else None
+
+            # Persist initial run record before execution so startup recovery
+            # has process identity (pgid) to reap on an abnormal backend exit.
+            self.db.insert(
+                "provider_runs",
+                {
+                    "id": run_id,
+                    "mission_id": self.mission_id,
+                    "task_id": task.id,
+                    "provider": provider_name,
+                    "role": role.value,
+                    "command": [redact(provider_name)],
+                    "cwd": str(request.workdir),
+                    "started_at": utcnow().isoformat(),
+                    "finished_at": None,
+                    "exit_code": None,
+                    "failure_class": "RUNNING",
+                    "provider_state": "RUNNING",
+                    "stdout_path": str(request.log_dir / f"{run_id}.stdout.log"),
+                    "stderr_path": str(request.log_dir / f"{run_id}.stderr.log"),
+                    "git_commit_before": commit_before,
+                    "git_commit_after": None,
+                    "summary": "",
+                    "pgid": None,
+                    "pid": None,
+                    "started_at_ts": None,
+                },
+            )
 
             self.registry.mark_busy(provider_name)
             self.db.update("missions", self.mission_id, {"current_provider": provider_name, "updated_at": utcnow()})
             self.events.publish(EventType.PROVIDER_STARTED, self.mission_id, provider=provider_name, role=role.value)
+            # Register cancellation BEFORE exposing the run as interruptible,
+            # closing the lost-interrupt race between run start and cancel.
+            cancel_ev = adapter.cancel_event_for(run_id)
+            if self._cancel.is_set():
+                cancel_ev.set()
             self._current_adapter, self._current_run_id = adapter, run_id
 
             def on_output(line: str, provider: str = provider_name) -> None:
@@ -373,30 +445,43 @@ class MissionEngine:
                 used = set(self._mission().providers_used)
                 if provider_name not in used:
                     self.db.update(
-                        "missions", self.mission_id,
-                        {"providers_used": sorted(set(self._mission().providers_used) | {provider_name}),
-                            "updated_at": utcnow()},
+                        "missions",
+                        self.mission_id,
+                        {
+                            "providers_used": sorted(set(self._mission().providers_used) | {provider_name}),
+                            "updated_at": utcnow(),
+                        },
                     )
-                self.db.update("tasks", task.id, {"status": "completed", "summary": result.summary,
-                    "finished_at": utcnow()})
+                self.db.update(
+                    "tasks", task.id, {"status": "completed", "summary": result.summary, "finished_at": utcnow()}
+                )
                 self.events.publish(EventType.TASK_COMPLETED, self.mission_id, task_id=task.id, provider=provider_name)
                 await self._checkpoint(f"agent({provider_name}): {role.value} checkpoint")
                 self._completed_work.append(f"[{role.value}] {provider_name}: {result.summary[:200]}")
                 return result
 
             # failure path
-            state = self.registry.record_failure(provider_name, result.failure_class, result.duration_s,
-                result.raw_tail[:300])
-            self.db.update("tasks", task.id, {"status": "failed", "summary": result.raw_tail[-300:],
-                "finished_at": utcnow()})
+            state = self.registry.record_failure(
+                provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
+            )
+            self.db.update(
+                "tasks", task.id, {"status": "failed", "summary": result.raw_tail[-300:], "finished_at": utcnow()}
+            )
             failed = set(self._mission().providers_failed)
             failed.add(provider_name)
             self.db.update("missions", self.mission_id, {"providers_failed": sorted(failed), "updated_at": utcnow()})
-            event_type = EventType.PROVIDER_RATE_LIMITED if result.failure_class in (FailureClass.RATE_LIMIT,
-                FailureClass.QUOTA_EXHAUSTED) else EventType.PROVIDER_FAILED
+            event_type = (
+                EventType.PROVIDER_RATE_LIMITED
+                if result.failure_class in (FailureClass.RATE_LIMIT, FailureClass.QUOTA_EXHAUSTED)
+                else EventType.PROVIDER_FAILED
+            )
             self.events.publish(
-                event_type, self.mission_id,
-                provider=provider_name, failure=result.failure_class.value, state=state.value, role=role.value,
+                event_type,
+                self.mission_id,
+                provider=provider_name,
+                failure=result.failure_class.value,
+                state=state.value,
+                role=role.value,
             )
             if result.failure_class == FailureClass.CANCELLED:
                 if self._cancel.is_set():
@@ -422,7 +507,8 @@ class MissionEngine:
                 )
                 return None
 
-            await self._checkpoint(f"orchestrator: checkpoint before provider switch ({role.value})")
+            if self.config.get("orchestration.checkpoint_before_provider_switch", True):
+                await self._checkpoint(f"orchestrator: checkpoint before provider switch ({role.value})")
             last_provider = provider_name
             attempt += 1
 
@@ -444,16 +530,11 @@ class MissionEngine:
         before: str | None,
         after: str | None,
     ) -> None:
-        self.db.insert(
+        self.db.update(
             "provider_runs",
+            run_id,
             {
-                "id": run_id,
-                "mission_id": self.mission_id,
-                "task_id": task_id,
-                "provider": provider,
-                "role": role.value,
                 "command": [redact(a if len(a) < 300 else f"<prompt {len(a)} chars>") for a in result.argv],
-                "cwd": str(request.workdir),
                 "started_at": result.started_at,
                 "finished_at": result.finished_at,
                 "exit_code": result.exit_code,
@@ -464,6 +545,8 @@ class MissionEngine:
                 "git_commit_before": before,
                 "git_commit_after": after,
                 "summary": result.summary[:500],
+                "pid": result.pid,
+                "pgid": result.pgid,
             },
         )
 
@@ -503,8 +586,9 @@ class MissionEngine:
             },
         )
         self._set_status(MissionStatus.WAITING_FOR_HUMAN, blocking_issue=reason)
-        self.events.publish(EventType.HUMAN_GATE_CREATED, self.mission_id, gate_id=gate_id, reason=reason,
-            choices=choices)
+        self.events.publish(
+            EventType.HUMAN_GATE_CREATED, self.mission_id, gate_id=gate_id, reason=reason, choices=choices
+        )
         await self._wait_for_gate()
 
     async def _wait_for_gate(self) -> None:
@@ -574,34 +658,40 @@ class MissionEngine:
             self.events.publish(EventType.PHASE_COMPLETED, self.mission_id, phase=phase.value)
 
         # all phases done
-        head = await git_ops.head_sha(self.project_path) if self.workspace and self.workspace.is_git_repo else None
         await self._checkpoint("orchestrator: final verified state")
+        head = await git_ops.head_sha(self.project_path) if self.workspace and self.workspace.is_git_repo else None
         self._set_status(MissionStatus.COMPLETED, current_provider=None, git_head=head)
         self.events.publish(EventType.MISSION_COMPLETED, self.mission_id)
 
     async def _phase_analyze(self) -> bool:
-        self.workspace = await inspect_workspace(self._project_path(), self.config.allowed_roots())
+        project_path = self._project_path()
+        self.project_path = project_path
+        self.workspace = await inspect_workspace(project_path, self.config.allowed_roots())
         if not self.workspace.is_git_repo:
-            await git_ops.init_repo(self.project_path)  # type: ignore[arg-type]
+            await git_ops.init_repo(project_path)
             self.workspace.is_git_repo = True
             await self._checkpoint("orchestrator: initial repository checkpoint")
         else:
-            st = await git_ops.status(self.project_path)  # type: ignore[arg-type]
+            st = await git_ops.status(project_path)
+            if not st.branch:
+                # F-10: detached HEAD detected. Check out a dedicated mission branch.
+                mission_branch = f"gg/mission-{self.mission_id[:8]}"
+                logger.info("detached HEAD detected; checking out mission branch %s", mission_branch)
+                await git_ops._git(project_path, "checkout", "-b", mission_branch)
+                st = await git_ops.status(project_path)
             if not st.is_clean:
                 await self._checkpoint("orchestrator: checkpoint before mission start (pre-existing changes)")
-        self.db.update(
-            "projects", self._mission().project_id, {"detected_type": self.workspace.project_type}
-        )
+        self.db.update("projects", self._mission().project_id, {"detected_type": self.workspace.project_type})
         return True
 
     async def _phase_provider(self, role: Role) -> bool:
         if role == Role.IMPLEMENTATION and self._mission().autonomy == Autonomy.SAFE:
-            open_gate = self.db.query(
-                "SELECT id FROM human_gates WHERE mission_id=? "
-                "AND reason LIKE 'Approve implementation%' AND status='open'",
+            gates = self.db.query(
+                "SELECT id, status, resolution FROM human_gates WHERE mission_id=? "
+                "AND reason LIKE 'Approve implementation%' ORDER BY created_at DESC LIMIT 1",
                 (self.mission_id,),
             )
-            if not open_gate:
+            if not gates:
                 plan = self.db.query(
                     "SELECT summary FROM tasks WHERE mission_id=? AND role='planning' ORDER BY created_at DESC LIMIT 1",
                     (self.mission_id,),
@@ -615,6 +705,19 @@ class MissionEngine:
                 )
                 if self._cancel.is_set() or self._pause.is_set():
                     return False
+            else:
+                last_gate = gates[0]
+                if last_gate["status"] == "open":
+                    await self._wait_for_gate()
+                    if self._cancel.is_set() or self._pause.is_set():
+                        return False
+                elif last_gate["status"] == "resolved":
+                    resolution = (last_gate["resolution"] or "").strip().lower()
+                    if resolution in ("cancel", "cancel mission"):
+                        self.request_cancel()
+                        return False
+            if self._mission().status == MissionStatus.WAITING_FOR_HUMAN:
+                self._set_status(self._status_for_role(role))
         result = await self._run_provider_phase(role)
         if result is None:
             return False
@@ -622,7 +725,7 @@ class MissionEngine:
             self._tests_run.append(f"provider testing phase: {result.summary[:150]}")
         return True
 
-    def _record_review_provenance(self) -> None:
+    def _record_review_provenance(self, review_parsed: bool = True) -> None:
         """Persist who reviewed vs. who implemented, with truthful independence.
 
         Self-review is an accepted V1 degraded mode when no alternative provider
@@ -656,6 +759,7 @@ class MissionEngine:
                 "review_provider": reviewer,
                 "independent": int(independent),
                 "degradation_reason": reason,
+                "review_parsed": int(review_parsed),
                 "created_at": utcnow(),
             },
         )
@@ -672,19 +776,35 @@ class MissionEngine:
         if not self.config.get("orchestration.review_required", True):
             return True
         max_cycles = int(self.config.get("orchestration.max_repair_cycles", 3))
+        unparseable_attempts = 0
+        max_unparseable_attempts = int(self.config.get("orchestration.max_unparseable_review_attempts", 2))
         while True:
             result = await self._run_provider_phase(Role.REVIEW)
             if result is None:
                 return False
-            self._record_review_provenance()
-            findings = persist_findings(self.db, self.mission_id, result.raw_tail + "\n" + result.summary)
+            parsed_ok, findings = persist_findings(self.db, self.mission_id, result.raw_tail + "\n" + result.summary)
+            self._record_review_provenance(review_parsed=parsed_ok)
             for f in findings:
                 self.events.publish(
-                    EventType.REVIEW_FINDING_CREATED, self.mission_id,
-                    severity=f.severity.value, description=f.description[:200],
+                    EventType.REVIEW_FINDING_CREATED,
+                    self.mission_id,
+                    severity=f.severity.value,
+                    description=f.description[:200],
                 )
+            if not parsed_ok:
+                unparseable_attempts += 1
+                if unparseable_attempts >= max_unparseable_attempts:
+                    self._set_status(
+                        MissionStatus.UNVERIFIED,
+                        blocking_issue="reviewer output unparseable after retries — cannot verify code review",
+                        current_provider=None,
+                    )
+                    return False
+                continue
+
             blockers = open_blockers(self.db, self.mission_id)
             if not blockers:
+                resolve_repaired_findings(self.db, self.mission_id)
                 return True
             cycles = self._mission().repair_cycles
             if cycles >= max_cycles:
@@ -706,7 +826,7 @@ class MissionEngine:
             )
             if repair is None:
                 return False
-            resolve_open_findings(self.db, self.mission_id)
+            mark_findings_repair_attempted(self.db, self.mission_id)
             self._set_status(MissionStatus.REVIEWING)
 
     async def _phase_final_validation(self) -> bool:
@@ -731,13 +851,15 @@ class MissionEngine:
             if cycles < int(self.config.get("orchestration.max_repair_cycles", 3)):
                 self.db.update("missions", self.mission_id, {"repair_cycles": cycles + 1, "updated_at": utcnow()})
                 self._set_status(MissionStatus.REPAIRING)  # current_phase stays FINAL_VALIDATION
-                repair = await self._run_provider_phase(Role.REPAIR,
-                    extra_context=f"## Verification failures to fix\n{detail}")
+                repair = await self._run_provider_phase(
+                    Role.REPAIR, extra_context=f"## Verification failures to fix\n{detail}"
+                )
                 if repair is None:
                     return False
                 return await self._phase_final_validation()
-            self._set_status(MissionStatus.UNVERIFIED, blocking_issue=f"verification failed:\n{detail[:800]}",
-                current_provider=None)
+            self._set_status(
+                MissionStatus.UNVERIFIED, blocking_issue=f"verification failed:\n{detail[:800]}", current_provider=None
+            )
             return False
         return True
 

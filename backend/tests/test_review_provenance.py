@@ -5,10 +5,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from conftest import make_config, make_orchestrator
 from orchestrator.models import MissionStatus
 from orchestrator.providers.fake import FakeAdapter
-
-from conftest import make_config, make_orchestrator
 
 ALL_ROLES = ("planning", "implementation", "testing", "review", "repair")
 

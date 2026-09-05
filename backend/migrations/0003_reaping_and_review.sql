@@ -1,0 +1,4 @@
+ALTER TABLE provider_runs ADD COLUMN pgid INTEGER;
+ALTER TABLE provider_runs ADD COLUMN pid INTEGER;
+ALTER TABLE provider_runs ADD COLUMN started_at_ts REAL;
+ALTER TABLE reviews ADD COLUMN review_parsed INTEGER NOT NULL DEFAULT 1;

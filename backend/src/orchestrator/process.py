@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import time
@@ -19,10 +20,13 @@ from pathlib import Path
 
 from .security import redact
 
+logger = logging.getLogger(__name__)
+
 GRACEFUL_TERMINATE_SECONDS = 5.0
 MAX_TAIL_LINES = 4000
 
 OutputCallback = Callable[[str, str], None]  # (stream, line)
+SpawnCallback = Callable[[int, int, float], None]  # (pid, pgid, start_time)
 
 
 @dataclass
@@ -33,6 +37,8 @@ class ProcessResult:
     duration_s: float
     stdout_tail: list[str] = field(default_factory=list)
     stderr_tail: list[str] = field(default_factory=list)
+    pid: int | None = None
+    pgid: int | None = None
 
     @property
     def combined_tail(self) -> str:
@@ -66,6 +72,7 @@ async def run_process(
     cwd: Path,
     timeout_s: float,
     on_output: OutputCallback | None = None,
+    on_spawn: SpawnCallback | None = None,
     stdout_path: Path | None = None,
     stderr_path: Path | None = None,
     env: dict[str, str] | None = None,
@@ -100,6 +107,7 @@ async def run_process(
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd),
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
@@ -107,6 +115,19 @@ async def run_process(
     )
     if proc.stdout is None or proc.stderr is None:
         raise RuntimeError("subprocess pipes not captured")
+
+    spawn_pid = proc.pid
+    try:
+        spawn_pgid = os.getpgid(proc.pid)
+    except Exception:
+        spawn_pgid = proc.pid
+    spawn_time = time.time()
+    if on_spawn:
+        try:
+            on_spawn(spawn_pid, spawn_pgid, spawn_time)
+        except Exception:
+            logger.debug("on_spawn callback failed", exc_info=True)
+
     pumps = [
         asyncio.create_task(_pump(proc.stdout, "stdout", stdout_tail, stdout_fh)),
         asyncio.create_task(_pump(proc.stderr, "stderr", stderr_tail, stderr_fh)),
@@ -149,4 +170,6 @@ async def run_process(
         duration_s=time.monotonic() - start,
         stdout_tail=stdout_tail,
         stderr_tail=stderr_tail,
+        pid=spawn_pid,
+        pgid=spawn_pgid,
     )

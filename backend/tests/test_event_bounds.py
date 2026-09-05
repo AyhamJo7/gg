@@ -11,11 +11,10 @@ import asyncio
 import os
 from pathlib import Path
 
+from conftest import make_orchestrator
 from orchestrator.events import TRANSIENT_REPLAY_LIMIT, EventBus
 from orchestrator.models import EventType, MissionStatus
 from orchestrator.providers.fake import FakeAdapter
-
-from conftest import make_config, make_orchestrator
 
 ALL_ROLES = ("planning", "implementation", "testing", "review", "repair")
 

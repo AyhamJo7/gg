@@ -30,6 +30,7 @@ orchestration:
   cooldown_base_seconds: 60
   cooldown_multiplier: 2.0
   cooldown_max_seconds: 3600
+  max_provider_wait_seconds: 7200
   scheduler_tick_seconds: 2
 
 # Role-specific provider priority (top = most preferred). Editable via UI/API.
@@ -45,15 +46,11 @@ git:
 
 security:
   # Workspace projects must resolve strictly inside one of these roots.
-  # Empty list = default policy: the user's home directory and /tmp
-  # (root itself is never a valid workspace). System trees (/etc, /usr,
-  # /var, ...) are always rejected regardless of this list.
-  allowed_roots: []
-  # Example explicit policy:
-  # allowed_roots:
-  #   - ~/projects
-  #   - ~/work
-  #   - /tmp
+  # Root itself is never a valid workspace. System trees (/etc, /usr, /var, ...)
+  # and sensitive directories (.ssh, .gnupg, .aws, ...) are always rejected.
+  allowed_roots:
+    - ~/projects
+    - /tmp
 
 server:
   host: 127.0.0.1

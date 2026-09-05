@@ -30,7 +30,7 @@ If everything is acceptable, output: {MARKER} []
 """.strip()
 
 
-def parse_findings(raw_output: str) -> list[dict[str, Any]]:
+def parse_review_output(raw_output: str) -> tuple[bool, list[dict[str, Any]]]:
     for line in raw_output.splitlines():
         stripped = line.strip()
         if not stripped.startswith(MARKER):
@@ -52,12 +52,46 @@ def parse_findings(raw_output: str) -> list[dict[str, Any]]:
             for item in data:
                 if isinstance(item, dict) and item.get("description"):
                     findings.append(item)
+            return True, findings
+
+    # No structured review block found: synthesize finding (F-08)
+    unstructured_finding = {
+        "severity": "MEDIUM",
+        "category": "architecture",
+        "file": None,
+        "description": "Reviewer output was unstructured; no valid REVIEW_FINDINGS_JSON block detected.",
+        "recommended_fix": "Provide structured code review adhering to the REVIEW_FINDINGS_JSON contract.",
+    }
+    return False, [unstructured_finding]
+
+
+def parse_findings(raw_output: str) -> list[dict[str, Any]]:
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(MARKER):
+            continue
+        payload = stripped[len(MARKER):].strip()
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            match = re.search(r"\[.*\]", payload)
+            if not match:
+                continue
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                continue
+        if isinstance(data, list):
+            findings: list[dict[str, Any]] = []
+            for item in data:
+                if isinstance(item, dict) and item.get("description"):
+                    findings.append(item)
             return findings
     return []
 
 
-def persist_findings(db: Database, mission_id: str, raw_output: str) -> list[ReviewFinding]:
-    parsed = parse_findings(raw_output)
+def persist_findings(db: Database, mission_id: str, raw_output: str) -> tuple[bool, list[ReviewFinding]]:
+    parsed_ok, parsed = parse_review_output(raw_output)
     findings: list[ReviewFinding] = []
     for item in parsed:
         try:
@@ -87,7 +121,7 @@ def persist_findings(db: Database, mission_id: str, raw_output: str) -> list[Rev
                 "created_at": finding.created_at,
             },
         )
-    return findings
+    return parsed_ok, findings
 
 
 def open_blockers(db: Database, mission_id: str) -> list[dict[str, Any]]:
@@ -97,5 +131,23 @@ def open_blockers(db: Database, mission_id: str) -> list[dict[str, Any]]:
     )
 
 
+def mark_findings_repair_attempted(db: Database, mission_id: str) -> None:
+    """Transition open findings to repair_attempted before repair run."""
+    db.execute(
+        "UPDATE review_findings SET status='repair_attempted' WHERE mission_id=? AND status='open'",
+        (mission_id,),
+    )
+
+
+def resolve_repaired_findings(db: Database, mission_id: str) -> None:
+    """Transition repair_attempted findings to resolved once verified by subsequent review."""
+    db.execute(
+        "UPDATE review_findings SET status='resolved' WHERE mission_id=? AND status='repair_attempted'",
+        (mission_id,),
+    )
+
+
 def resolve_open_findings(db: Database, mission_id: str) -> None:
-    db.execute("UPDATE review_findings SET status='resolved' WHERE mission_id=? AND status='open'", (mission_id,))
+    """Backward-compatible helper: marks open findings repair_attempted."""
+    mark_findings_repair_attempted(db, mission_id)
+

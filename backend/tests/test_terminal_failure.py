@@ -10,11 +10,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from orchestrator.models import MissionStatus
-from orchestrator.orchestrator import Orchestrator
-from orchestrator.providers.fake import FakeAdapter
-
 from conftest import make_config, make_orchestrator
+from orchestrator.models import MissionStatus
+from orchestrator.orchestrator import IllegalMissionTransitionError, Orchestrator
+from orchestrator.providers.fake import FakeAdapter
 
 ALL_ROLES = ("planning", "implementation", "testing", "review", "repair")
 
@@ -26,9 +25,9 @@ def _seed_project(orch: Orchestrator, workspace: Path) -> None:
     )
 
 
-def _failing_orch(tmp_path: Path, token: str = "ratelimit", providers: list[str] | None = None) -> Orchestrator:
+def _failing_orch(tmp_path: Path, behavior: str = "ratelimit", providers: list[str] | None = None) -> Orchestrator:
     names = providers or ["fake-a"]
-    adapters = {n: FakeAdapter(n, [token]) for n in names}
+    adapters = {n: FakeAdapter(n, [behavior]) for n in names}
     config = make_config(
         priority={r: names for r in ALL_ROLES},
         providers=names,
@@ -77,7 +76,6 @@ def test_exhaustion_at_every_provider_phase(tmp_path: Path):
             "fake-good": FakeAdapter("fake-good", ["ok"]),
             "fake-bad": FakeAdapter("fake-bad", ["ratelimit"]),
         }
-        failing = {r: ["fake-bad"] for r in ALL_ROLES}
         succeeding = {r: ["fake-good"] for r in ALL_ROLES}
         priority = dict(succeeding)
         priority[phase_marker] = ["fake-bad"]
@@ -246,3 +244,51 @@ def test_all_providers_disabled_fails_fast_durably(tmp_path: Path, workspace: Pa
         await orch2.shutdown()
 
     asyncio.run(main())
+
+
+def test_f02_terminal_state_transitions_rejected_domain(tmp_path: Path, workspace: Path):
+    """F-02: terminal states (COMPLETED, CANCELLED, FAILED, UNVERIFIED) reject start/resume/pause."""
+    import pytest
+
+    async def main() -> None:
+        orch = _failing_orch(tmp_path, "ok")
+        await orch.registry.detect_all()
+        _seed_project(orch, workspace)
+
+        for terminal_status in (
+            MissionStatus.COMPLETED,
+            MissionStatus.CANCELLED,
+            MissionStatus.FAILED,
+            MissionStatus.UNVERIFIED,
+        ):
+            m = orch.create_mission("p1", f"m-{terminal_status.value}", "t", "AUTONOMOUS", "balanced")
+            orch.db.update("missions", m["id"], {"status": terminal_status.value})
+
+            # start rejected
+            with pytest.raises(IllegalMissionTransitionError, match="terminal state"):
+                orch.start_mission(m["id"])
+
+            # resume rejected
+            with pytest.raises(IllegalMissionTransitionError, match="terminal state"):
+                orch.resume_mission(m["id"])
+
+            # pause rejected
+            with pytest.raises(IllegalMissionTransitionError, match="terminal state"):
+                orch.pause_mission(m["id"])
+
+            # cancel is idempotent no-op (leaves status unchanged)
+            orch.cancel_mission(m["id"])
+            assert orch.db.get("missions", m["id"])["status"] == terminal_status.value
+
+        # Non-existent mission raises KeyError
+        with pytest.raises(KeyError):
+            orch.start_mission("nonexistent-mission")
+        with pytest.raises(KeyError):
+            orch.pause_mission("nonexistent-mission")
+        with pytest.raises(KeyError):
+            orch.resume_mission("nonexistent-mission")
+        with pytest.raises(KeyError):
+            orch.cancel_mission("nonexistent-mission")
+
+    asyncio.run(main())
+
