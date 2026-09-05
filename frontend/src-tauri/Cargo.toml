@@ -1,0 +1,15 @@
+[package]
+name = "gg-orchestrator-shell"
+version = "0.1.0"
+edition = "2021"
+description = "Tauri shell for GG Orchestrator Mission Control"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+
+[features]
+default = []

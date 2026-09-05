@@ -1,0 +1,22 @@
+# Optional supporting services. The orchestrator itself runs natively —
+# provider CLIs are host-authenticated and must NOT be containerized.
+#
+#   docker compose --profile litellm up -d   # starts LiteLLM on :4000 (OPTIONAL)
+#
+# LiteLLM is an optional normalization layer only; high-level orchestration
+# (provider selection, failover, handoffs) always lives in the backend.
+version: "3.9"
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    profiles: ["litellm"]
+    ports:
+      - "4000:4000"
+    environment:
+      # Provider API keys come from YOUR environment or .env.local — never committed.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    command: ["--port", "4000", "--num_workers", "1"]
+    restart: unless-stopped
