@@ -41,10 +41,10 @@ class WorkspaceInfo:
         return "\n".join(lines)
 
 
-async def inspect_workspace(path: str | Path) -> WorkspaceInfo:
+async def inspect_workspace(path: str | Path, allowed_roots: list[Path] | None = None) -> WorkspaceInfo:
     from . import git_ops  # local import to avoid cycle at module load
 
-    root = validate_workspace_path(path)
+    root = validate_workspace_path(path, allowed_roots)
     info = WorkspaceInfo(path=root, is_git_repo=await git_ops.is_repo(root))
 
     has_py = (root / "pyproject.toml").exists() or (root / "requirements.txt").exists()

@@ -88,13 +88,13 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     @app.post("/api/projects", status_code=201)
     async def add_project(req: CreateProjectRequest) -> dict[str, Any]:
         try:
-            path = validate_workspace_path(req.path)
+            path = validate_workspace_path(req.path, orchestrator.config.allowed_roots())
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         existing = orchestrator.db.get("projects", str(path), key="path")
         if existing:
             return existing
-        info = await inspect_workspace(path)
+        info = await inspect_workspace(path, orchestrator.config.allowed_roots())
         project_id = __import__("uuid").uuid4().hex[:16]
         name = req.name or path.name
         orchestrator.db.insert(
@@ -129,7 +129,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         project = orchestrator.db.get("projects", project_id)
         if not project:
             raise HTTPException(404, "project not found")
-        info = await inspect_workspace(project["path"])
+        info = await inspect_workspace(project["path"], orchestrator.config.allowed_roots())
         st = await git_ops.status(Path(project["path"]))
         return {
             "workspace": info.summary(),

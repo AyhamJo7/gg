@@ -580,7 +580,7 @@ class MissionEngine:
         self.events.publish(EventType.MISSION_COMPLETED, self.mission_id)
 
     async def _phase_analyze(self) -> bool:
-        self.workspace = await inspect_workspace(self._project_path())
+        self.workspace = await inspect_workspace(self._project_path(), self.config.allowed_roots())
         if not self.workspace.is_git_repo:
             await git_ops.init_repo(self.project_path)  # type: ignore[arg-type]
             self.workspace.is_git_repo = True
@@ -666,7 +666,7 @@ class MissionEngine:
         if self.project_path is None:
             raise RuntimeError("engine project path not initialized")
         if self.workspace is None:
-            self.workspace = await inspect_workspace(self.project_path)
+            self.workspace = await inspect_workspace(self.project_path, self.config.allowed_roots())
         report = await run_verification(self.workspace, self.db, self.events, self.mission_id, self.project_path)
         self._tests_run.extend(r.command for r in report.results)
         if not report.attempted:

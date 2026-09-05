@@ -45,21 +45,58 @@ def is_sensitive_file(relative_path: str) -> bool:
     return any(p.search(normalized) for p in SENSITIVE_FILE_PATTERNS)
 
 
-def validate_workspace_path(path: str | Path) -> Path:
+# System trees that must never become AI workspaces, even if a caller
+# manages to construct a path under an allowed root that reaches them.
+SYSTEM_TREE_PREFIXES = (
+    "/etc", "/usr", "/var", "/bin", "/sbin", "/boot", "/dev",
+    "/proc", "/sys", "/lib", "/lib64", "/opt", "/snap", "/run",
+)
+
+
+def default_allowed_roots() -> list[Path]:
+    """Default workspace policy: the user's home directory and /tmp.
+
+    Projects must be strictly INSIDE one of these roots (the root itself is
+    never a valid workspace). This is deliberately general — personal
+    directory layouts belong in config (`security.allowed_roots`).
+    """
+    return [Path.home(), Path("/tmp")]
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    return candidate == root or root in candidate.parents
+
+
+def validate_workspace_path(path: str | Path, allowed_roots: list[Path] | None = None) -> Path:
     """Resolve and validate a user-supplied workspace path.
 
-    Raises ValueError for nonexistent paths, non-directories, and anything
-    suspicious (e.g. filesystem root or home dir itself, to avoid an agent
-    being unleashed on the user's entire $HOME).
+    Policy (allow-roots model):
+    - the path is canonicalized with resolve() FIRST, so symlinks and `..`
+      are evaluated against their real target;
+    - the resolved path must be strictly inside one of the allowed roots
+      (default: $HOME and /tmp — see default_allowed_roots);
+    - system trees (/etc, /usr, /var, …) are always rejected;
+    - the allowed root itself (e.g. $HOME or /tmp) is never a valid workspace.
+
+    Raises ValueError with a human-readable reason on rejection.
     """
-    p = Path(path).expanduser().resolve()
+    roots = allowed_roots if allowed_roots else default_allowed_roots()
+    resolved_roots = [r.expanduser().resolve() for r in roots]
+    p = Path(path).expanduser().resolve()  # follows symlinks, collapses ..
     if not p.exists():
         raise ValueError(f"Workspace path does not exist: {p}")
     if not p.is_dir():
         raise ValueError(f"Workspace path is not a directory: {p}")
-    if p == Path.home() or p == p.anchor or len(p.parts) < 2:  # type: ignore[comparison-overlap]
-        raise ValueError(f"Refusing unsafe workspace root: {p}")
-    return p
+    for prefix in SYSTEM_TREE_PREFIXES:
+        if p == Path(prefix) or str(p).startswith(prefix + "/"):
+            raise ValueError(f"Refusing system directory as workspace: {p}")
+    for root in resolved_roots:
+        if p == root:
+            raise ValueError(f"Refusing workspace at allowed root itself: {p} (choose a subdirectory)")
+        if _is_within(p, root):
+            return p
+    roots_str = ", ".join(str(r) for r in resolved_roots)
+    raise ValueError(f"Workspace path {p} is outside allowed roots ({roots_str})")
 
 
 def ensure_within(root: Path, candidate: str | Path) -> Path:

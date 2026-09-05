@@ -43,6 +43,18 @@ priority:
 git:
   auto_checkpoint: true
 
+security:
+  # Workspace projects must resolve strictly inside one of these roots.
+  # Empty list = default policy: the user's home directory and /tmp
+  # (root itself is never a valid workspace). System trees (/etc, /usr,
+  # /var, ...) are always rejected regardless of this list.
+  allowed_roots: []
+  # Example explicit policy:
+  # allowed_roots:
+  #   - ~/projects
+  #   - ~/work
+  #   - /tmp
+
 server:
   host: 127.0.0.1
   port: 8787

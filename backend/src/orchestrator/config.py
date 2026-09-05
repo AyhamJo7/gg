@@ -38,6 +38,13 @@ class Config:
     def provider_enabled(self, name: str) -> bool:
         return bool(self.get(f"providers.{name}.enabled", False))
 
+    def allowed_roots(self) -> list[Path]:
+        """Configured workspace roots ([] → security.default_allowed_roots())."""
+        raw = self.get("security.allowed_roots", [])
+        if not raw:
+            return []
+        return [Path(str(p)).expanduser() for p in raw]
+
     def provider_timeout_s(self, name: str) -> float:
         return float(self.get(f"providers.{name}.timeout_minutes", 60)) * 60.0
 
