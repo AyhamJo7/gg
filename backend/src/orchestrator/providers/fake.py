@@ -24,6 +24,7 @@ class FakeAdapter(ProviderAdapter):
         # script behaviors: ok, ratelimit, crash, slow, auth, work
         self.script = script or ["ok"]
         self.calls = 0
+        self.flood_lines = 0  # when >0, execute() emits this many output lines
         self._cancelled = asyncio.Event()
 
     async def interrupt(self, run_id: str) -> bool:
@@ -40,6 +41,10 @@ class FakeAdapter(ProviderAdapter):
         self.calls += 1
         on_output(f"[{self.name}] starting role={request.role} behavior={behavior}")
         await asyncio.sleep(0.01)
+
+        if self.flood_lines:
+            for i in range(self.flood_lines):
+                on_output(f"[{self.name}] flood line {i}")
 
         if behavior == "slow":
             for _ in range(36_000):  # ~1h, interruptible

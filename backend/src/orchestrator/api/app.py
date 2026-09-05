@@ -310,9 +310,13 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         await websocket.accept()
         queue = orchestrator.events.subscribe()
         try:
-            # replay persisted history first so a reloaded UI catches up
+            # Replay: durable structured history (authoritative) + bounded
+            # transient terminal tail. Raw provider output is NOT persisted
+            # (see events.py); reconnect restores the last 500 lines at most.
             for row in orchestrator.events.history(mission_id, limit=1000):
                 await websocket.send_text(json.dumps(row, default=str))
+            for event in orchestrator.events.transient_replay(mission_id):
+                await websocket.send_text(event.model_dump_json())
             while True:
                 event = await queue.get()
                 if event.mission_id == mission_id or event.mission_id is None:
