@@ -64,3 +64,11 @@ class OpencodeAdapter(ProviderAdapter):
         if texts:
             return texts[-1][:2000]
         return super().extract_summary(stdout_tail)
+
+    def is_success_marker(self, text: str) -> bool:
+        normalized = text.replace(" ", "")
+        return (
+            '"type":"finish"' in normalized
+            or '"type":"done"' in normalized
+            or '"step_finish"' in normalized
+        )

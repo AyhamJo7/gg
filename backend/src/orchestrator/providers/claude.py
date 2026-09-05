@@ -59,3 +59,9 @@ class ClaudeAdapter(ProviderAdapter):
             if event and event.get("type") == "result" and event.get("result"):
                 return str(event["result"])[:2000]
         return super().extract_summary(stdout_tail)
+
+    def is_success_marker(self, text: str) -> bool:
+        normalized = text.replace(" ", "")
+        return '"subtype":"success"' in normalized or (
+            '"type":"result"' in normalized and '"is_error":true' not in normalized
+        )

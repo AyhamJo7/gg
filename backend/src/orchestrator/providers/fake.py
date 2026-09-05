@@ -7,6 +7,7 @@ ledger, checkpoints and verification engine exercise genuine behavior.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from ..models import FailureClass, ProviderState
@@ -25,22 +26,24 @@ class FakeAdapter(ProviderAdapter):
         self.script = script or ["ok"]
         self.calls = 0
         self.flood_lines = 0  # when >0, execute() emits this many output lines
-        self._cancelled = asyncio.Event()
-
-    async def interrupt(self, run_id: str) -> bool:
-        self._cancelled.set()
-        return True
 
     def build_command(self, request: ExecutionRequest) -> list[str]:
         return ["true"]  # never actually spawned — execute() is overridden
 
     async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
-        self._cancelled.clear()
+        cancel_event = self.cancel_event_for(request.run_id)
         idx = min(self.calls, len(self.script) - 1)
         behavior = self.script[idx]
         self.calls += 1
         on_output(f"[{self.name}] starting role={request.role} behavior={behavior}")
         await asyncio.sleep(0.01)
+        if request.on_spawn:
+            import os
+            try:
+                pgid = os.getpgrp() if hasattr(os, "getpgrp") else os.getpid()
+            except Exception:
+                pgid = os.getpid()
+            request.on_spawn(os.getpid(), pgid, time.time())
 
         if self.flood_lines:
             for i in range(self.flood_lines):
@@ -48,7 +51,7 @@ class FakeAdapter(ProviderAdapter):
 
         if behavior == "slow":
             for _ in range(36_000):  # ~1h, interruptible
-                if self._cancelled.is_set():
+                if cancel_event.is_set():
                     on_output(f"[{self.name}] interrupted")
                     return ExecutionResult(
                         state=ProviderState.AVAILABLE,
@@ -64,11 +67,12 @@ class FakeAdapter(ProviderAdapter):
             marker = request.workdir / "agent_work.txt"
             marker.write_text(f"{self.name} {request.role} call={self.calls}\n")
             on_output(f"[{self.name}] wrote {marker.name}")
-        if request.role == "review" and behavior == "ok":
+        if request.role == "review" and behavior in ("ok", "work"):
             on_output("REVIEW_FINDINGS_JSON: []")
 
         result_map = {
             "ok": (ProviderState.COMPLETED, FailureClass.NONE, 0),
+            "work": (ProviderState.COMPLETED, FailureClass.NONE, 0),
             "ratelimit": (ProviderState.RATE_LIMITED, FailureClass.RATE_LIMIT, 1),
             "crash": (ProviderState.CRASHED, FailureClass.CRASH, 2),
             "auth": (ProviderState.AUTH_REQUIRED, FailureClass.AUTH, 1),
@@ -76,6 +80,9 @@ class FakeAdapter(ProviderAdapter):
         state, failure, code = result_map.get(behavior, (ProviderState.COMPLETED, FailureClass.NONE, 0))
         if behavior == "ratelimit":
             on_output("Error: rate limit exceeded — try again later")
+        raw_tail = f"fake output {behavior}"
+        if request.role == "review" and behavior in ("ok", "work"):
+            raw_tail += "\nREVIEW_FINDINGS_JSON: []"
         return ExecutionResult(
             state=state,
             failure_class=failure,
@@ -84,7 +91,7 @@ class FakeAdapter(ProviderAdapter):
             summary=f"fake {self.name} {request.role} ({behavior})",
             stdout_path=Path(request.log_dir / f"{request.run_id}.stdout.log"),
             stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
-            raw_tail=f"fake output {behavior}",
+            raw_tail=raw_tail,
         )
 
 

@@ -59,3 +59,11 @@ class CodexAdapter(ProviderAdapter):
                 if text:
                     return str(text)[:2000]
         return super().extract_summary(stdout_tail)
+
+    def is_success_marker(self, text: str) -> bool:
+        normalized = text.replace(" ", "")
+        return (
+            '"turn.completed"' in normalized
+            or '"finish_reason":"stop"' in normalized
+            or '"item.completed"' in normalized
+        )

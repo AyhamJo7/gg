@@ -37,6 +37,7 @@ class ExecutionRequest:
     timeout_s: float
     run_id: str
     log_dir: Path
+    on_spawn: Callable[[int, int, float], None] | None = None
 
 
 @dataclass
@@ -52,6 +53,8 @@ class ExecutionResult:
     raw_tail: str = ""
     started_at: str = field(default_factory=lambda: utcnow().isoformat())
     finished_at: str = field(default_factory=lambda: utcnow().isoformat())
+    pid: int | None = None
+    pgid: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -69,6 +72,15 @@ class ProviderAdapter(abc.ABC):
             self.executable = executable
         self._cancel_events: dict[str, asyncio.Event] = {}
 
+    def cancel_event_for(self, run_id: str) -> asyncio.Event:
+        """Return (creating if needed) the cancellation event for a run.
+
+        The orchestrator registers the event BEFORE starting execution, so an
+        interrupt arriving in the gap between run registration and subprocess
+        start is never lost.
+        """
+        return self._cancel_events.setdefault(run_id, asyncio.Event())
+
     # -- detection ---------------------------------------------------------
     def detect(self) -> tuple[bool, str | None]:
         """Return (installed, executable_path)."""
@@ -81,7 +93,8 @@ class ProviderAdapter(abc.ABC):
             return None
         try:
             proc = await asyncio.create_subprocess_exec(
-                path, "--version",
+                path,
+                "--version",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -120,8 +133,7 @@ class ProviderAdapter(abc.ABC):
         request.log_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = request.log_dir / f"{request.run_id}.stdout.log"
         stderr_path = request.log_dir / f"{request.run_id}.stderr.log"
-        cancel_event = asyncio.Event()
-        self._cancel_events[request.run_id] = cancel_event
+        cancel_event = self.cancel_event_for(request.run_id)
 
         def handle_line(stream: str, line: str) -> None:
             display = self.normalize_output_line(line) if stream == "stdout" else line
@@ -133,6 +145,7 @@ class ProviderAdapter(abc.ABC):
             cwd=request.workdir,
             timeout_s=request.timeout_s,
             on_output=handle_line,
+            on_spawn=request.on_spawn,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             cancel_event=cancel_event,
@@ -153,6 +166,8 @@ class ProviderAdapter(abc.ABC):
             raw_tail=result.combined_tail[-4000:],
             started_at=started.isoformat(),
             finished_at=finished.isoformat(),
+            pid=result.pid,
+            pgid=result.pgid,
         )
 
     async def interrupt(self, run_id: str) -> bool:
@@ -162,9 +177,13 @@ class ProviderAdapter(abc.ABC):
             return True
         return False
 
+    def is_success_marker(self, text: str) -> bool:
+        """Hook for provider-specific success events in output."""
+        return False
+
     # -- failure translation -------------------------------------------------
     def classify_failure(self, exit_code: int | None, combined: str, timed_out: bool, cancelled: bool) -> FailureClass:
-        return classify_output(exit_code, combined, timed_out=timed_out, cancelled=cancelled)
+        return classify_output(exit_code, combined, timed_out=timed_out, cancelled=cancelled, adapter=self)
 
     async def health_check(self) -> ProviderState:
         installed, _ = self.detect()

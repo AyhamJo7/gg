@@ -163,6 +163,9 @@ class ProviderRegistry:
         row = self._db.get("providers", name, key="name") or {}
         failures = int(row.get("consecutive_failures", 0)) + 1
         cooldown_s = min(base * (mult ** (failures - 1)), cap)
+        if failure == FailureClass.QUOTA_EXHAUSTED:
+            # Daily or long-horizon quota limit: enforce minimum 4-hour floor (F-18)
+            cooldown_s = max(cooldown_s, float(self._config.get("orchestration.quota_cooldown_seconds", 14400)))
         state_by_failure = {
             FailureClass.RATE_LIMIT: ProviderState.RATE_LIMITED,
             FailureClass.QUOTA_EXHAUSTED: ProviderState.RATE_LIMITED,

@@ -36,9 +36,13 @@ class AgyAdapter(ProviderAdapter):
         event = extract_json_line(line)
         if event is None:
             return line or None
-        # agy stream-json events (claude-code-compatible shape)
-        etype = event.get("type")
-        if etype == "assistant":
+        # agy stream-json events
+        etype = event.get("event") or event.get("type")
+        if etype == "step_update":
+            step = event.get("step_update", {})
+            if "text_delta" in step:
+                return str(step["text_delta"]).rstrip()
+        elif etype == "assistant":
             parts = []
             for block in event.get("message", {}).get("content", []):
                 if block.get("type") == "text":
@@ -47,12 +51,30 @@ class AgyAdapter(ProviderAdapter):
                     parts.append(f"[tool: {block.get('name', '?')}]")
             return "\n".join(p for p in parts if p) or None
         if etype == "result":
-            return str(event.get("result") or f"[agy result: {event.get('subtype', '?')}]")
+            res = event.get("result")
+            if isinstance(res, dict):
+                return str(res.get("response") or res.get("status") or f"[agy result: {event.get('subtype', '?')}]")
+            return str(res or f"[agy result: {event.get('subtype', '?')}]")
         return None
 
     def extract_summary(self, stdout_tail: list[str]) -> str:
         for line in reversed(stdout_tail):
             event = extract_json_line(line)
-            if event and event.get("type") == "result" and event.get("result"):
-                return str(event["result"])[:2000]
+            if event:
+                etype = event.get("event") or event.get("type")
+                if etype == "result":
+                    res = event.get("result")
+                    if isinstance(res, dict) and res.get("response"):
+                        return str(res["response"])[:2000]
+                    if res:
+                        return str(res)[:2000]
         return super().extract_summary(stdout_tail)
+
+    def is_success_marker(self, text: str) -> bool:
+        normalized = text.replace(" ", "")
+        return (
+            ('"type":"result"' in normalized and '"is_error":true' not in normalized)
+            or ('"event":"result"' in normalized and '"is_error":true' not in normalized)
+            or '"status":"SUCCESS"' in text
+            or '"type":"turn_complete"' in normalized
+        )
