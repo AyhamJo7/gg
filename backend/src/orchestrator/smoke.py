@@ -22,7 +22,8 @@ SMOKE_PROMPT = "Reply with exactly the token ORCHESTRATOR_OK and nothing else. D
 async def smoke_one(name: str, adapter: object, workdir: Path) -> dict[str, object]:
     from .providers.base import ProviderAdapter
 
-    assert isinstance(adapter, ProviderAdapter)
+    if not isinstance(adapter, ProviderAdapter):
+        return {"provider": name, "error": "invalid adapter"}
     installed, path = adapter.detect()
     if not installed:
         return {"provider": name, "installed": False}

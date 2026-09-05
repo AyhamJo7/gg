@@ -26,7 +26,11 @@ def build_real_adapters(config: Any) -> dict[str, ProviderAdapter]:
     for name, cls in classes.items():
         executable = config.get(f"providers.{name}.executable", name)
         if config.provider_enabled(name):
-            adapters[name] = cls(executable=executable)
+            if cls is OpencodeAdapter:
+                model = config.get(f"providers.{name}.model")
+                adapters[name] = cls(executable=executable, model=model)
+            else:
+                adapters[name] = cls(executable=executable)
     return adapters
 
 

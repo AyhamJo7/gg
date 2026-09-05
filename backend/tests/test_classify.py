@@ -28,3 +28,22 @@ def test_crash_and_clean():
 def test_auth_beats_rate_limit_when_both_present():
     out = "401 unauthorized; also 429 mentioned"
     assert classify_output(1, out, timed_out=False, cancelled=False) == FailureClass.AUTH
+
+
+def test_claude_telemetry_success_not_misclassified():
+    # Real captured claude stream-json tail: success result + rate_limit telemetry
+    tail = (
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1788890400}}\n'
+        '{"type":"result","subtype":"success","is_error":false,"result":"ORCHESTRATOR_OK"}'
+    )
+    assert classify_output(0, tail, timed_out=False, cancelled=False) == FailureClass.NONE
+
+
+def test_codex_turn_failed_is_rate_limit():
+    tail = '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit. Upgrade to Pro"}}'
+    assert classify_output(1, tail, timed_out=False, cancelled=False) == FailureClass.RATE_LIMIT
+
+
+def test_agy_success_status():
+    tail = '{"event":"result","result":{"status":"SUCCESS","response":"ORCHESTRATOR_OK"}}'
+    assert classify_output(0, tail, timed_out=False, cancelled=False) == FailureClass.NONE

@@ -36,7 +36,10 @@ def workspace(tmp_path: Path) -> Path:
 def make_config(priority: dict[str, list[str]] | None = None, providers: list[str] | None = None) -> Config:
     names = providers or ["fake-a", "fake-b", "fake-c"]
     data: dict = {
-        "providers": {name: {"enabled": True, "timeout_minutes": 1} for name in names},
+        "providers": {
+            name: {"enabled": True, "timeout_minutes": 1, **({"model": "m"} if name == "opencode" else {})}
+            for name in names
+        },
         "orchestration": {
             "checkpoint_before_provider_switch": True,
             "review_required": True,

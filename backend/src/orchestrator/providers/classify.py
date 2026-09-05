@@ -23,8 +23,13 @@ _PATTERNS: list[tuple[FailureClass, re.Pattern[str]]] = [
     (
         FailureClass.RATE_LIMIT,
         re.compile(
-            r"(rate[ _-]?limit|429\b|too many requests|usage limit (reached|exceeded)|"
-            r"you'?ve hit your (usage )?limit|limit reached|try again (at|in|after)|"
+            # NOTE: bare "rate limit" prose (and structured telemetry lines
+            # like claude's rate_limit_event with status allowed/allowed_warning)
+            # is NOT a failure — only blocking outcomes are.
+            r"(429\b|too many requests|usage limit (reached|exceeded)|"
+            r"you'?ve hit your (usage )?limit|rate limit (reached|exceeded)|"
+            r"rate_limited|\"status\"\s*:\s*\"(blocked|rejected|exhausted)\"|"
+            r"limit reached|try again (at|in|after)|"
             r"quota exceeded|exceeded your current quota|resource_exhausted|"
             r"insufficient_quota|overloaded_error|529\b|tokens? per (minute|day) limit)",
             re.IGNORECASE,
@@ -32,7 +37,7 @@ _PATTERNS: list[tuple[FailureClass, re.Pattern[str]]] = [
     ),
     (
         FailureClass.OVERLOADED,
-        re.compile(r"(overloaded|503\b|service unavailable|capacity)", re.IGNORECASE),
+        re.compile(r"(\"overloaded\"|overloaded_error|503\b|service unavailable|at capacity)", re.IGNORECASE),
     ),
     (
         FailureClass.HUMAN_INPUT,
@@ -65,9 +70,16 @@ def classify_output(exit_code: int | None, combined_output: str, *, timed_out: b
     if timed_out:
         return FailureClass.TIMEOUT
     tail = combined_output[-8000:]
-    for failure_class, pattern in _PATTERNS:
-        if pattern.search(tail):
-            return failure_class
+    # A clean exit with an explicit success result overrides failure-pattern
+    # matches: structured telemetry may contain failure-shaped strings
+    # (e.g. claude rate_limit_event with status "allowed_warning") without
+    # anything actually being blocked.
+    normalized = tail.replace(" ", "")
+    clean_success = exit_code == 0 and ('"subtype":"success"' in normalized or '"status":"SUCCESS"' in normalized)
+    if not clean_success:
+        for failure_class, pattern in _PATTERNS:
+            if pattern.search(tail):
+                return failure_class
     if exit_code not in (0, None):
         return FailureClass.CRASH
     return FailureClass.NONE

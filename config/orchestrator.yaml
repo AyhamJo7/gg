@@ -17,6 +17,9 @@ providers:
   opencode:
     enabled: true
     executable: opencode
+    # opencode's interactive default model may hang in headless runs;
+    # pin a model verified to respond non-interactively.
+    model: opencode-go/kimi-k2.7-code
     timeout_minutes: 60
 
 orchestration:
