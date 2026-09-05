@@ -155,7 +155,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return [_jsonable(r) for r in rows]
 
     @app.post("/api/missions", status_code=201)
-    def create_mission(req: CreateMissionRequest) -> dict[str, Any]:
+    async def create_mission(req: CreateMissionRequest) -> dict[str, Any]:
         if not orchestrator.db.get("projects", req.project_id):
             raise HTTPException(404, "project not found")
         mission = orchestrator.create_mission(req.project_id, req.title, req.task, req.autonomy, req.profile)
