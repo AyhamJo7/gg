@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "GG Orchestrator — Mission Control",
         "width": 1440,
         "height": 900,

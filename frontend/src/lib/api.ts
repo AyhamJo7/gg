@@ -1,7 +1,8 @@
 /** Typed API client. All requests go through Vite's dev proxy in dev,
  * or the backend directly in the Tauri shell. */
 
-const BASE = "";
+const isTauri = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || window.location.origin.startsWith("tauri://"));
+export const BASE: string = (import.meta.env.VITE_API_BASE as string | undefined) ?? (isTauri ? "http://127.0.0.1:8787" : "");
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(`${BASE}${path}`, {
@@ -53,6 +54,8 @@ export const api = {
     }) => req<Mission>("/api/missions", { method: "POST", body: JSON.stringify(body) }),
     action: (id: string, action: "start" | "pause" | "resume" | "cancel") =>
       req<{ status: string }>(`/api/missions/${id}/${action}`, { method: "POST" }),
+    retry: (id: string) =>
+      req<Mission>(`/api/missions/${id}/retry`, { method: "POST" }),
     resolveGate: (missionId: string, gateId: string, resolution: string) =>
       req<{ status: string }>(`/api/missions/${missionId}/gates/${gateId}/resolve`, {
         method: "POST",

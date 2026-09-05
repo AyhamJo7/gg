@@ -74,8 +74,12 @@ export function useMissionEvents(missionId: string | null) {
 
     const connect = () => {
       if (disposed) return;
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/ws/missions/${missionId}`);
+      const isTauri = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || window.location.origin.startsWith("tauri://"));
+      const defaultWsBase = isTauri
+        ? "ws://127.0.0.1:8787"
+        : `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`;
+      const wsBase = (import.meta.env.VITE_WS_BASE as string | undefined) ?? defaultWsBase;
+      ws = new WebSocket(`${wsBase}/ws/missions/${missionId}`);
       ws.onopen = () => {
         if (disposed) return;
         attempt = 0;

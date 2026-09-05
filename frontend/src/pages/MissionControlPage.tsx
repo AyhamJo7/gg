@@ -89,6 +89,17 @@ export function MissionControlPage() {
             <button className="danger" onClick={() => act("cancel")}>✕ Cancel</button>
           </>
         )}
+        {mission && ["FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status) && (
+          <button
+            onClick={async () => {
+              const newM = await api.missions.retry(mission.id);
+              setSelectedId(newM.id);
+              refreshMissions();
+            }}
+          >
+            🔄 Retry
+          </button>
+        )}
       </div>
 
       {mission && (
