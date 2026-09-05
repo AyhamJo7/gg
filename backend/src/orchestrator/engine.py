@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,7 @@ from .events import EventBus
 from .handoff import persist_handoff, render_handoff
 from .locks import ResourceLocks
 from .models import (
+    TERMINAL_STATUSES,
     Autonomy,
     EventType,
     FailureClass,
@@ -146,10 +148,21 @@ class MissionEngine:
     def _set_status(self, status: MissionStatus, **extra: Any) -> None:
         data: dict[str, Any] = {"status": status.value, "updated_at": utcnow()}
         data.update(extra)
-        if status in (MissionStatus.COMPLETED, MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.UNVERIFIED):
+        if status in TERMINAL_STATUSES:
             data["finished_at"] = utcnow()
         self.db.update("missions", self.mission_id, data)
         self.events.publish(EventType.MISSION_STATUS_CHANGED, self.mission_id, status=status.value, **extra)
+
+    # -- terminal-state invariant -------------------------------------------------
+    # A terminal event must correspond to a durable terminal mission state.
+    # Order is always: persist terminal state FIRST, then publish the terminal
+    # event. The database is authoritative — if event publication fails after
+    # persistence, recovery must still see the mission as terminal.
+
+    def _fail(self, reason: str) -> None:
+        """Persist FAILED (durable, terminal), then emit MISSION_FAILED."""
+        self._set_status(MissionStatus.FAILED, blocking_issue=reason, current_provider=None)
+        self.events.publish(EventType.MISSION_FAILED, self.mission_id, reason=reason)
 
     def _project_path(self) -> Path:
         mission = self._mission()
@@ -254,23 +267,43 @@ class MissionEngine:
     async def _run_provider_phase(self, role: Role, extra_context: str = "") -> ExecutionResult | None:
         """Run one provider for a role, with failover across the priority list.
 
-        Returns the successful ExecutionResult, or None if the mission was
-        paused/cancelled or all providers are unavailable.
+        Returns the successful ExecutionResult, or None when the mission stopped
+        (paused/cancelled/gated/failed) — in every such case the durable status
+        has already been persisted by the responsible path.
+
+        Attempt counting: only actual provider *executions* count toward
+        max_phase_attempts. Waiting for a cooling-down provider does not consume
+        attempts, but is bounded by max_provider_wait_seconds; if no provider can
+        ever become eligible (all disabled/uninstalled), the mission fails fast.
         """
         max_attempts = int(self.config.get("orchestration.max_phase_attempts", 4))
+        max_wait_s = float(self.config.get("orchestration.max_provider_wait_seconds", 7200))
         last_provider: str | None = None
         attempt = 0
+        wait_started: float | None = None
 
         while attempt < max_attempts:
             if self._cancel.is_set() or self._pause.is_set():
+                self._check_pause_cancel()  # persists PAUSED/CANCELLED durably
                 return None
             provider_name = self._select_provider(role)
             if provider_name is None:
-                self._set_status(MissionStatus.WAITING_FOR_PROVIDER, blocking_issue="no eligible provider")
+                if not self.registry.has_potentially_available():
+                    self._fail(f"no provider available for {role.value}: all providers disabled or uninstalled")
+                    return None
+                if wait_started is None:
+                    wait_started = time.monotonic()
+                    self._set_status(
+                        MissionStatus.WAITING_FOR_PROVIDER, blocking_issue="all providers cooling down or unavailable"
+                    )
+                elif time.monotonic() - wait_started > max_wait_s:
+                    self._fail(f"no eligible provider for {role.value} within {int(max_wait_s)}s")
+                    return None
                 await self._wait_for_wake()
-                self._set_status(self._status_for_role(role))
-                attempt += 1
                 continue
+            if wait_started is not None:
+                wait_started = None
+                self._set_status(self._status_for_role(role), blocking_issue=None)
 
             adapter = self.registry.get_adapter(provider_name)
             if adapter is None:
@@ -393,7 +426,11 @@ class MissionEngine:
             last_provider = provider_name
             attempt += 1
 
-        self.events.publish(EventType.MISSION_FAILED, self.mission_id, reason=f"phase {role.value} exhausted providers")
+        mission = self._mission()
+        self._fail(
+            f"phase {role.value} exhausted after {attempt} attempt(s); "
+            f"providers failed: {', '.join(mission.providers_failed) or 'none eligible'}"
+        )
         return None
 
     def _record_run(

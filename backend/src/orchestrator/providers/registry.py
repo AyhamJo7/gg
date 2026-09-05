@@ -104,6 +104,15 @@ class ProviderRegistry:
                         row["cooldown_until"] = None
         return rows
 
+    def has_potentially_available(self) -> bool:
+        """True if any provider could become eligible later (installed and not
+        DISABLED). Cooldown/transient states count as potentially available."""
+        rows = self._db.query("SELECT state, installed FROM providers")
+        for row in rows:
+            if row["installed"] and row["state"] != ProviderState.DISABLED.value:
+                return True
+        return False
+
     def is_eligible(self, name: str) -> bool:
         row = self._db.get("providers", name, key="name")
         if not row or not row["installed"] or row["state"] == ProviderState.DISABLED.value:
@@ -114,6 +123,19 @@ class ProviderRegistry:
                 until = until.replace(tzinfo=UTC)
             if datetime.now(UTC) < until:
                 return False
+            # Cooldown expired — lazily reconcile state so eligibility never
+            # depends on a scheduler tick having run health() first.
+            if row["state"] in (
+                ProviderState.RATE_LIMITED.value,
+                ProviderState.TIMED_OUT.value,
+                ProviderState.CRASHED.value,
+                ProviderState.UNAVAILABLE.value,
+            ):
+                self._db.execute(
+                    "UPDATE providers SET state=?, cooldown_until=NULL WHERE name=?",
+                    (ProviderState.AVAILABLE.value, name),
+                )
+                row["state"] = ProviderState.AVAILABLE.value
         # Serial scheduler v1: only AVAILABLE providers are eligible.
         # BUSY/COOLDOWN/RATE_LIMITED/etc. are all excluded.
         return bool(row["state"] == ProviderState.AVAILABLE.value)

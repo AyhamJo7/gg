@@ -17,7 +17,9 @@ from .db import Database
 from .engine import MissionEngine
 from .events import EventBus
 from .locks import ResourceLocks
-from .models import ACTIVE_STATUSES, EventType, MissionStatus, utcnow
+from .models import ACTIVE_STATUSES, TERMINAL_STATUSES, EventType, MissionStatus, utcnow
+
+TERMINAL_STATUS_VALUES = frozenset(s.value for s in TERMINAL_STATUSES)
 from .notifications import Notifier, default_notifier
 from .providers.base import ProviderAdapter
 from .providers.registry import ProviderRegistry
@@ -66,6 +68,11 @@ class Orchestrator:
             tuple(s.value for s in ACTIVE_STATUSES),
         )
         for row in rows:
+            # Defense in depth: never recover a mission in a terminal state,
+            # even if ACTIVE_STATUSES is edited incorrectly in the future.
+            if row["status"] in TERMINAL_STATUS_VALUES:
+                logger.warning("skipping terminal mission %s (%s) in recovery", row["id"], row["status"])
+                continue
             self.db.update("missions", row["id"], {"status": MissionStatus.RECOVERING.value, "updated_at": utcnow()})
             self.events.publish(EventType.MISSION_STATUS_CHANGED, row["id"], status="RECOVERING",
                 reason="backend restart")
@@ -108,12 +115,18 @@ class Orchestrator:
                 await engine.run()
             except Exception:
                 logger.exception("mission %s engine crashed", mission_id)
+                # Durable terminal state FIRST, best-effort event SECOND.
+                # A failing event bus must never kill the runner or mask the
+                # persisted FAILED state (recovery reads the DB, not events).
                 self.db.update(
                     "missions", mission_id,
                     {"status": MissionStatus.FAILED.value, "blocking_issue": "engine crash — see backend logs",
-                        "updated_at": utcnow()},
+                        "updated_at": utcnow(), "finished_at": utcnow()},
                 )
-                self.events.publish(EventType.MISSION_FAILED, mission_id, reason="engine crash")
+                try:
+                    self.events.publish(EventType.MISSION_FAILED, mission_id, reason="engine crash")
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception("failed to publish MISSION_FAILED for %s", mission_id)
             finally:
                 self._engines.pop(mission_id, None)
                 self._engine_tasks.pop(mission_id, None)

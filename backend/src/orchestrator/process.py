@@ -130,7 +130,12 @@ async def run_process(
                 continue
         if timed_out or cancelled:
             await _kill_process_tree(proc)
-        await proc.wait()
+        # Bounded final reap: after kill escalation the process is expected to
+        # be dead; never wait forever (zombie/pipe edge cases must not deadlock).
+        try:
+            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=GRACEFUL_TERMINATE_SECONDS)
+        except TimeoutError:  # pragma: no cover - defensive
+            pass
     finally:
         await asyncio.gather(*pumps, return_exceptions=True)
         for fh in (stdout_fh, stderr_fh):
