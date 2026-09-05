@@ -1,0 +1,48 @@
+# GG Orchestrator runtime configuration.
+# Values here are defaults; per-project overrides live in <project>/.orchestrator/config.yaml
+
+providers:
+  claude:
+    enabled: true
+    executable: claude
+    timeout_minutes: 60
+  codex:
+    enabled: true
+    executable: codex
+    timeout_minutes: 60
+  agy:
+    enabled: true
+    executable: agy
+    timeout_minutes: 60
+  opencode:
+    enabled: true
+    executable: opencode
+    timeout_minutes: 60
+
+orchestration:
+  checkpoint_before_provider_switch: true
+  review_required: true
+  max_repair_cycles: 3
+  max_phase_attempts: 4
+  cooldown_base_seconds: 60
+  cooldown_multiplier: 2.0
+  cooldown_max_seconds: 3600
+  scheduler_tick_seconds: 2
+
+# Role-specific provider priority (top = most preferred). Editable via UI/API.
+priority:
+  planning:    [claude, codex, agy, opencode]
+  implementation: [opencode, codex, agy, claude]
+  testing:     [codex, claude, opencode, agy]
+  review:      [claude, codex, agy, opencode]
+  repair:      [codex, opencode, claude, agy]
+
+git:
+  auto_checkpoint: true
+
+server:
+  host: 127.0.0.1
+  port: 8787
+
+database:
+  path: .orchestrator/orchestrator.db
