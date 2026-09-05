@@ -44,3 +44,25 @@ async def test_not_a_repo(tmp_path):
     assert not st.is_repo
     with pytest.raises(git_ops.GitError):
         await git_ops.checkpoint(tmp_path, "nope")
+
+
+async def test_f01_git_command_contract_and_spawn_git(tmp_path):
+    # Non-repo check must return False without AttributeError
+    assert not await git_ops.is_repo(tmp_path)
+    assert await git_ops.head_sha(tmp_path) is None
+
+    # Spawn git directly and verify GitCommandResult contract
+    res = await git_ops._spawn_git(tmp_path, "status")
+    assert isinstance(res, git_ops.GitCommandResult)
+    assert isinstance(res.returncode, int)
+    assert isinstance(res.stdout, bytes)
+    assert isinstance(res.stderr, bytes)
+
+    # Now init repo and verify operations
+    await git_ops.init_repo(tmp_path)
+    assert await git_ops.is_repo(tmp_path)
+    (tmp_path / "f.txt").write_text("hello")
+    sha = await git_ops.checkpoint(tmp_path, "commit 1")
+    assert sha
+    assert await git_ops.head_sha(tmp_path) == sha
+

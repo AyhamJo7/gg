@@ -24,8 +24,13 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 SENSITIVE_FILE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(^|/)\.env(\..*)?$"),
     re.compile(r"(^|/)\.env\.local$"),
-    re.compile(r".*\.(pem|key|p12|pfx)$"),
-    re.compile(r"(^|/)(credentials|auth)\.json$"),
+    re.compile(r".*\.(pem|key|p12|pfx|ppk|jks|keystore)$", re.IGNORECASE),
+    re.compile(r"(^|/)id_(rsa|ed25519|ecdsa|dsa).*"),
+    re.compile(r"(^|/)\.(npmrc|pypirc|netrc|git-credentials)$"),
+    re.compile(r"(^|/)[^/]*credentials[^/]*$", re.IGNORECASE),
+    re.compile(r"(^|/)auth\.json$", re.IGNORECASE),
+    re.compile(r"(^|/)[^/]*secret[^/]*\.ya?ml$", re.IGNORECASE),
+    re.compile(r"(^|/)(\.aws|\.ssh|\.orchestrator)(/|$)"),
 ]
 
 
@@ -39,8 +44,9 @@ NEVER_SENSITIVE = {".env.example", ".env.sample", ".env.template"}
 
 
 def is_sensitive_file(relative_path: str) -> bool:
-    normalized = relative_path.replace("\\", "/")
-    if normalized.rsplit("/", 1)[-1] in NEVER_SENSITIVE:
+    normalized = relative_path.replace("\\", "/").strip("/")
+    basename = normalized.rsplit("/", 1)[-1]
+    if basename in NEVER_SENSITIVE:
         return False
     return any(p.search(normalized) for p in SENSITIVE_FILE_PATTERNS)
 
@@ -52,6 +58,11 @@ SYSTEM_TREE_PREFIXES = (
     "/proc", "/sys", "/lib", "/lib64", "/opt", "/snap", "/run",
 )
 
+# Sensitive directory names that must never become AI workspaces (F-16).
+DENIED_WORKSPACE_PARTS = {
+    ".ssh", ".gnupg", ".aws", ".config", ".local", ".claude",
+}
+
 
 def default_allowed_roots() -> list[Path]:
     """Default workspace policy: the user's home directory and /tmp.
@@ -60,7 +71,7 @@ def default_allowed_roots() -> list[Path]:
     never a valid workspace). This is deliberately general — personal
     directory layouts belong in config (`security.allowed_roots`).
     """
-    return [Path.home(), Path("/tmp")]
+    return [Path.home(), Path("/tmp")]  # noqa: S108
 
 
 def _is_within(candidate: Path, root: Path) -> bool:
@@ -76,6 +87,7 @@ def validate_workspace_path(path: str | Path, allowed_roots: list[Path] | None =
     - the resolved path must be strictly inside one of the allowed roots
       (default: $HOME and /tmp — see default_allowed_roots);
     - system trees (/etc, /usr, /var, …) are always rejected;
+    - sensitive dotfile directories (.ssh, .gnupg, .aws, …) are always rejected;
     - the allowed root itself (e.g. $HOME or /tmp) is never a valid workspace.
 
     Raises ValueError with a human-readable reason on rejection.
@@ -84,19 +96,22 @@ def validate_workspace_path(path: str | Path, allowed_roots: list[Path] | None =
     resolved_roots = [r.expanduser().resolve() for r in roots]
     p = Path(path).expanduser().resolve()  # follows symlinks, collapses ..
     if not p.exists():
-        raise ValueError(f"Workspace path does not exist: {p}")
+        raise ValueError(f"Workspace path does not exist: {path}")
     if not p.is_dir():
-        raise ValueError(f"Workspace path is not a directory: {p}")
+        raise ValueError(f"Workspace path is not a directory: {path}")
     for prefix in SYSTEM_TREE_PREFIXES:
         if p == Path(prefix) or str(p).startswith(prefix + "/"):
-            raise ValueError(f"Refusing system directory as workspace: {p}")
+            raise ValueError(f"Refusing system directory as workspace: {path}")
+    for part in p.parts:
+        if part in DENIED_WORKSPACE_PARTS:
+            raise ValueError(f"Refusing sensitive directory as workspace: {path}")
     for root in resolved_roots:
         if p == root:
-            raise ValueError(f"Refusing workspace at allowed root itself: {p} (choose a subdirectory)")
+            raise ValueError(f"Refusing workspace at allowed root itself: {path} (choose a subdirectory)")
         if _is_within(p, root):
             return p
     roots_str = ", ".join(str(r) for r in resolved_roots)
-    raise ValueError(f"Workspace path {p} is outside allowed roots ({roots_str})")
+    raise ValueError(f"Workspace path {path} is outside allowed roots ({roots_str})")
 
 
 def ensure_within(root: Path, candidate: str | Path) -> Path:
@@ -107,7 +122,38 @@ def ensure_within(root: Path, candidate: str | Path) -> Path:
     return resolved
 
 
-GITIGNORE_SECRET_ENTRIES = [".env", ".env.*", "!.env.example", "*.pem", "*.key"]
+GITIGNORE_SECRET_ENTRIES = [
+    ".env",
+    ".env.*",
+    "!.env.example",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.ppk",
+    "id_rsa*",
+    "id_ed25519*",
+    "id_ecdsa*",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".git-credentials",
+    "*credentials*",
+    "*secret*.yaml",
+    "*secret*.yml",
+    "*.jks",
+    "*.keystore",
+    ".aws/",
+    ".ssh/",
+    ".orchestrator/",
+    "node_modules/",
+    "__pycache__/",
+    "*.pyc",
+    "dist/",
+    "build/",
+    ".venv/",
+    "target/",
+]
 
 
 def ensure_gitignore_protections(git_root: Path) -> list[str]:

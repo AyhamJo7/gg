@@ -9,10 +9,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .security import is_sensitive_file
+from .security import SECRET_PATTERNS, is_sensitive_file
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,26 +37,59 @@ class GitError(RuntimeError):
     pass
 
 
-async def _git(root: Path, *args: str, check: bool = True) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "git", "-C", str(root), *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+@dataclass(frozen=True)
+class GitCommandResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+    @property
+    def text(self) -> str:
+        return self.stdout.decode(errors="replace").strip()
+
+    @property
+    def err_text(self) -> str:
+        return self.stderr.decode(errors="replace").strip()
+
+
+GIT_TIMEOUT_S = 30.0
+
+
+def _run_git_sync(root: Path, args: tuple[str, ...]) -> GitCommandResult:
+    import subprocess
+
+    proc = subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        timeout=GIT_TIMEOUT_S,
+        check=False,
     )
-    out, err = await proc.communicate()
-    if check and proc.returncode != 0:
-        raise GitError(f"git {' '.join(args)} failed: {err.decode(errors='replace')[:400]}")
-    return out.decode(errors="replace").strip()
+    return GitCommandResult(proc.returncode, proc.stdout, proc.stderr)
+
+
+async def _spawn_git(root: Path, *args: str) -> GitCommandResult:
+    """Run a short-lived git command in a worker thread with a hard timeout.
+
+    Uses subprocess.run in a thread instead of asyncio subprocess machinery:
+    an engine task must never freeze on event-loop subprocess edge cases;
+    any hang becomes a GitError (classified, recoverable) instead.
+    """
+    try:
+        return await asyncio.to_thread(_run_git_sync, root, args)
+    except __import__("subprocess").TimeoutExpired as exc:
+        raise GitError(f"git {' '.join(args)} timed out after {GIT_TIMEOUT_S}s") from exc
+
+
+async def _git(root: Path, *args: str, check: bool = True) -> str:
+    res = await _spawn_git(root, *args)
+    if check and res.returncode != 0:
+        raise GitError(f"git {' '.join(args)} failed: {res.stderr.decode(errors='replace')[:400]}")
+    return res.text
 
 
 async def is_repo(root: Path) -> bool:
-    proc = await asyncio.create_subprocess_exec(
-        "git", "-C", str(root), "rev-parse", "--is-inside-work-tree",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out, _ = await proc.communicate()
-    return proc.returncode == 0 and out.decode().strip() == "true"
+    res = await _spawn_git(root, "rev-parse", "--is-inside-work-tree")
+    return res.returncode == 0 and res.text == "true"
 
 
 async def init_repo(root: Path) -> None:
@@ -63,13 +99,8 @@ async def init_repo(root: Path) -> None:
 
 
 async def head_sha(root: Path) -> str | None:
-    proc = await asyncio.create_subprocess_exec(
-        "git", "-C", str(root), "rev-parse", "HEAD",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out, _ = await proc.communicate()
-    return out.decode().strip() if proc.returncode == 0 else None
+    res = await _spawn_git(root, "rev-parse", "HEAD")
+    return res.text if res.returncode == 0 else None
 
 
 async def status(root: Path) -> GitStatus:
@@ -110,19 +141,52 @@ async def recent_commits(root: Path, count: int = 10) -> list[str]:
 async def checkpoint(root: Path, message: str) -> str | None:
     """Commit all non-sensitive changes. Returns commit SHA or None if nothing to commit.
 
-    Sensitive files are never staged — they are explicitly reset out of the index.
+    Sensitive files and internal logs (.orchestrator/) are never staged — they are
+    explicitly reset out of the index, and staged additions are scanned for secret patterns.
     """
     st = await status(root)
     if not st.is_repo:
         raise GitError("not a git repository")
-    # Stage everything, then unstage sensitive paths. `git add -A` + targeted reset
-    # is safer than enumerating files ourselves (handles renames/deletes).
+    # Stage everything, then unstage internal and sensitive paths.
     await _git(root, "add", "-A")
-    sensitive = [p for p in (st.modified + st.added + st.untracked) if is_sensitive_file(p)]
-    for path in sensitive:
-        await _git(root, "reset", "-q", "--", path, check=False)
-    staged = await _git(root, "diff", "--cached", "--name-only")
-    if not staged.strip():
+
+    # Unconditionally exclude orchestrator directory from commits
+    await _git(root, "reset", "-q", "--", ".orchestrator", check=False)
+
+    # 1. Path-based sensitive file check
+    staged_raw = await _git(root, "diff", "--cached", "--name-only", check=False)
+    staged_files = [p.strip() for p in staged_raw.splitlines() if p.strip()]
+    for path in staged_files:
+        if is_sensitive_file(path):
+            await _git(root, "reset", "-q", "--", path, check=False)
+
+    # 2. Content-based secret check on remaining staged diffs
+    staged_raw = await _git(root, "diff", "--cached", "--name-only", check=False)
+    remaining_staged = [p.strip() for p in staged_raw.splitlines() if p.strip()]
+    for path in remaining_staged:
+        patch = await _git(root, "diff", "--cached", "-U0", "--", path, check=False)
+        has_secret = False
+        for line in patch.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                added_text = line[1:]
+                for pat, _ in SECRET_PATTERNS:
+                    if pat.search(added_text):
+                        has_secret = True
+                        break
+            if has_secret:
+                break
+        if has_secret:
+            await _git(root, "reset", "-q", "--", path, check=False)
+        else:
+            try:
+                fp = root / path
+                if fp.is_file() and fp.stat().st_size > 5 * 1024 * 1024:
+                    logger.warning("Staged file exceeds 5MB threshold: %s (%d bytes)", path, fp.stat().st_size)
+            except OSError:
+                pass
+
+    staged_final = await _git(root, "diff", "--cached", "--name-only", check=False)
+    if not staged_final.strip():
         return None
-    await _git(root, "commit", "-m", message, "--no-verify")
+    await _git(root, "commit", "-m", message)
     return await head_sha(root)
