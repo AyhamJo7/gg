@@ -141,3 +141,82 @@ async def test_websocket_replays_history(client: httpx.AsyncClient, workspace: P
         with tc.websocket_connect(f"/ws/missions/{mission['id']}") as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "MISSION_CREATED"
+
+
+async def test_f02_f17_terminal_states_and_404s(client: httpx.AsyncClient, workspace: Path):
+    orch = client.orchestrator  # type: ignore[attr-defined]
+    project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
+
+    # 404 on nonexistent mission
+    for endpoint in ("start", "pause", "resume", "cancel"):
+        resp = await client.post(f"/api/missions/nonexistent/{endpoint}")
+        assert resp.status_code == 404
+
+    # 409 on terminal statuses
+    for status in ("COMPLETED", "CANCELLED", "FAILED", "UNVERIFIED"):
+        m = orch.create_mission(project["id"], f"m-{status}", "t", "AUTONOMOUS", "balanced")
+        orch.db.update("missions", m["id"], {"status": status})
+
+        for endpoint in ("start", "pause", "resume"):
+            resp = await client.post(f"/api/missions/{m['id']}/{endpoint}")
+            assert resp.status_code == 409, f"{status} -> {endpoint} did not return 409: {resp.status_code}"
+
+        # Cancel on already terminal is idempotent 200
+        resp = await client.post(f"/api/missions/{m['id']}/cancel")
+        assert resp.status_code == 200
+
+
+async def test_f13_websocket_origin_check(client: httpx.AsyncClient, workspace: Path):
+    from starlette.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    orch = client.orchestrator  # type: ignore[attr-defined]
+    project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
+    mission = orch.create_mission(project["id"], "m", "t", "AUTONOMOUS", "balanced")
+
+    with TestClient(client._transport.app) as tc:  # type: ignore[union-attr]
+        # Untrusted origin rejected with 1008
+        try:
+            with tc.websocket_connect(
+                f"/ws/missions/{mission['id']}", headers={"origin": "http://evil.example"}
+            ) as ws:
+                ws.receive_text()
+                pytest.fail("untrusted origin was accepted")
+        except WebSocketDisconnect as exc:
+            assert exc.code == 1008
+
+        # Trusted origin accepted
+        with tc.websocket_connect(
+            f"/ws/missions/{mission['id']}", headers={"origin": "http://localhost:5173"}
+        ) as ws:
+            first = json.loads(ws.receive_text())
+            assert first["type"] == "MISSION_CREATED"
+
+
+async def test_f14_project_deletion_fk_and_cascade(client: httpx.AsyncClient, workspace: Path):
+    orch = client.orchestrator  # type: ignore[attr-defined]
+    project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
+    orch.create_mission(project["id"], "m", "t", "AUTONOMOUS", "balanced")
+
+    # Without force -> 409 Conflict
+    resp = await client.delete(f"/api/projects/{project['id']}")
+    assert resp.status_code == 409
+    assert "force=true" in resp.json()["detail"]
+
+    # With force=true -> 204 No Content
+    resp = await client.delete(f"/api/projects/{project['id']}?force=true")
+    assert resp.status_code == 204
+    assert orch.db.get("projects", project["id"]) is None
+
+
+async def test_f15_priority_persisted_to_settings(client: httpx.AsyncClient):
+    orch = client.orchestrator  # type: ignore[attr-defined]
+    resp = await client.post(
+        "/api/settings/priority",
+        json={"role": "planning", "providers": ["fake-b", "fake-a"]},
+    )
+    assert resp.status_code == 200
+    row = orch.db.get("settings", "priority.planning", key="key")
+    assert row is not None
+    assert json.loads(row["value"]) == ["fake-b", "fake-a"]
+

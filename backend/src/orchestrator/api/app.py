@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from .. import git_ops
 from ..config import Config
 from ..models import utcnow
-from ..orchestrator import Orchestrator
+from ..orchestrator import IllegalMissionTransitionError, Orchestrator
 from ..security import validate_workspace_path
 from ..workspace import inspect_workspace
 
@@ -121,8 +121,34 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return project
 
     @app.delete("/api/projects/{project_id}", status_code=204)
-    def remove_project(project_id: str) -> None:
-        orchestrator.db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+    def remove_project(project_id: str, force: bool = False) -> None:
+        project = orchestrator.db.get("projects", project_id)
+        if not project:
+            raise HTTPException(404, "project not found")
+        missions = orchestrator.db.query("SELECT id FROM missions WHERE project_id=?", (project_id,))
+        if missions and not force:
+            raise HTTPException(
+                409,
+                f"cannot delete project {project_id}: contains {len(missions)} mission(s); "
+                "pass force=true to cascade delete",
+            )
+        import sqlite3
+
+        try:
+            if force and missions:
+                for m in missions:
+                    mid = m["id"]
+                    orchestrator.db.execute("DELETE FROM review_findings WHERE mission_id=?", (mid,))
+                    orchestrator.db.execute("DELETE FROM reviews WHERE mission_id=?", (mid,))
+                    orchestrator.db.execute("DELETE FROM human_gates WHERE mission_id=?", (mid,))
+                    orchestrator.db.execute("DELETE FROM handoffs WHERE mission_id=?", (mid,))
+                    orchestrator.db.execute("DELETE FROM tasks WHERE mission_id=?", (mid,))
+                    orchestrator.db.execute("DELETE FROM provider_runs WHERE mission_id=?", (mid,))
+                    orchestrator.db.execute("DELETE FROM events WHERE mission_id=?", (mid,))
+                    orchestrator.db.execute("DELETE FROM missions WHERE id=?", (mid,))
+            orchestrator.db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        except sqlite3.IntegrityError as e:
+            raise HTTPException(409, f"cannot delete project: {e}") from e
 
     @app.post("/api/projects/{project_id}/validate")
     async def validate_project(project_id: str) -> dict[str, Any]:
@@ -202,23 +228,53 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
 
     @app.post("/api/missions/{mission_id}/start")
     async def start_mission(mission_id: str) -> dict[str, str]:
-        orchestrator.start_mission(mission_id)
+        try:
+            orchestrator.start_mission(mission_id)
+        except KeyError:
+            raise HTTPException(404, f"mission {mission_id} not found") from None
+        except IllegalMissionTransitionError as exc:
+            raise HTTPException(409, str(exc)) from exc
         return {"status": "started"}
 
     @app.post("/api/missions/{mission_id}/pause")
     async def pause_mission(mission_id: str) -> dict[str, str]:
-        orchestrator.pause_mission(mission_id)
+        try:
+            orchestrator.pause_mission(mission_id)
+        except KeyError:
+            raise HTTPException(404, f"mission {mission_id} not found") from None
+        except IllegalMissionTransitionError as exc:
+            raise HTTPException(409, str(exc)) from exc
         return {"status": "pausing"}
 
     @app.post("/api/missions/{mission_id}/resume")
     async def resume_mission(mission_id: str) -> dict[str, str]:
-        orchestrator.resume_mission(mission_id)
+        try:
+            orchestrator.resume_mission(mission_id)
+        except KeyError:
+            raise HTTPException(404, f"mission {mission_id} not found") from None
+        except IllegalMissionTransitionError as exc:
+            raise HTTPException(409, str(exc)) from exc
         return {"status": "resumed"}
 
     @app.post("/api/missions/{mission_id}/cancel")
     async def cancel_mission(mission_id: str) -> dict[str, str]:
-        orchestrator.cancel_mission(mission_id)
-        return {"status": "cancelled"}
+        try:
+            orchestrator.cancel_mission(mission_id)
+        except KeyError:
+            raise HTTPException(404, f"mission {mission_id} not found") from None
+        except IllegalMissionTransitionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"status": "cancelling"}
+
+    @app.post("/api/missions/{mission_id}/retry")
+    async def retry_mission(mission_id: str) -> dict[str, Any]:
+        try:
+            new_mission = orchestrator.retry_mission(mission_id)
+            return new_mission
+        except KeyError:
+            raise HTTPException(404, f"mission {mission_id} not found") from None
+        except IllegalMissionTransitionError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/api/missions/{mission_id}/gates/{gate_id}/resolve")
     async def resolve_gate(mission_id: str, gate_id: str, req: GateResolutionRequest) -> dict[str, str]:
@@ -273,9 +329,22 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             for role in ("planning", "implementation", "testing", "review", "repair")
         }
 
+    ALLOWED_ORIGINS = {
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "http://localhost:8787",
+        "http://127.0.0.1:8787",
+    }
+
     @app.post("/api/settings/priority")
     async def set_priority(req: PriorityUpdateRequest) -> dict[str, list[str]]:
         orchestrator.config.set_priority(req.role, req.providers)
+        orchestrator.db.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+            (f"priority.{req.role}", json.dumps(req.providers)),
+        )
         return get_priority()
 
     @app.post("/api/settings/profiles")
@@ -307,6 +376,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     # ---------------- websocket ----------------
     @app.websocket("/ws/missions/{mission_id}")
     async def mission_ws(websocket: WebSocket, mission_id: str) -> None:
+        origin = websocket.headers.get("origin")
+        if origin and origin not in ALLOWED_ORIGINS:
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         queue = orchestrator.events.subscribe()
         try:
@@ -328,6 +401,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
 
     @app.websocket("/ws/events")
     async def global_ws(websocket: WebSocket) -> None:
+        origin = websocket.headers.get("origin")
+        if origin and origin not in ALLOWED_ORIGINS:
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         queue = orchestrator.events.subscribe()
         try:

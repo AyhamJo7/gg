@@ -80,10 +80,18 @@ class TestDefaultPolicy:
         finally:
             home_project.rmdir()
 
-    def test_default_roots_are_general(self):
-        roots = default_allowed_roots()
-        assert Path.home() in roots
-        assert Path("/tmp") in roots
+    def test_sensitive_dot_directories_rejected(self, tmp_path: Path):
+        for sensitive in [".ssh", ".gnupg", ".aws", ".config", ".local", ".claude"]:
+            sensitive_dir = tmp_path / sensitive
+            sensitive_dir.mkdir()
+            with pytest.raises(ValueError, match="Refusing sensitive directory as workspace"):
+                validate_workspace_path(sensitive_dir)
+
+    def test_validation_error_preserves_input_path(self):
+        input_path = "some/relative/nonexistent/path"
+        with pytest.raises(ValueError) as exc:
+            validate_workspace_path(input_path)
+        assert input_path in str(exc.value)
 
     def test_default_roots_are_general(self):
         roots = default_allowed_roots()
