@@ -182,6 +182,13 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         mission["findings"] = orchestrator.db.query(
             "SELECT * FROM review_findings WHERE mission_id=? ORDER BY created_at", (mission_id,)
         )
+        reviews = orchestrator.db.query(
+            "SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at", (mission_id,)
+        )
+        mission["reviews"] = reviews
+        latest_review = reviews[-1] if reviews else None
+        mission["latest_review"] = latest_review
+        mission["degraded_review"] = bool(latest_review and not latest_review["independent"])
         mission["runs"] = orchestrator.db.query(
             "SELECT id, provider, role, failure_class, provider_state, exit_code, started_at, finished_at, "
             "summary FROM provider_runs WHERE mission_id=? ORDER BY started_at",

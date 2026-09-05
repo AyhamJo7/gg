@@ -28,11 +28,24 @@ export interface Mission {
   finished_at: string | null;
 }
 
+export interface ReviewRecord {
+  id: string;
+  mission_id: string;
+  implementation_provider: string | null;
+  review_provider: string;
+  independent: number;
+  degradation_reason: string | null;
+  created_at: string;
+}
+
 export interface MissionDetail extends Mission {
   tasks: TaskRecord[];
   gates: HumanGate[];
   findings: ReviewFinding[];
   runs: ProviderRun[];
+  reviews: ReviewRecord[];
+  latest_review: ReviewRecord | null;
+  degraded_review: boolean;
   latest_handoff: string | null;
 }
 

@@ -19,6 +19,7 @@ export function statusColor(status: string): string {
       return "yellow";
     case "RATE_LIMITED":
     case "TIMED_OUT":
+    case "SELF-REVIEW":
       return "orange";
     case "FAILED":
     case "CRASHED":

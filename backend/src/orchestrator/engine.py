@@ -622,6 +622,52 @@ class MissionEngine:
             self._tests_run.append(f"provider testing phase: {result.summary[:150]}")
         return True
 
+    def _record_review_provenance(self) -> None:
+        """Persist who reviewed vs. who implemented, with truthful independence.
+
+        Self-review is an accepted V1 degraded mode when no alternative provider
+        is eligible — but it is always recorded and disclosed, never presented
+        as independent review.
+        """
+        implementer = self._last_provider_for(Role.IMPLEMENTATION)
+        rows = self.db.query(
+            "SELECT provider FROM provider_runs WHERE mission_id=? AND role='review' AND failure_class='NONE' "
+            "ORDER BY started_at DESC LIMIT 1",
+            (self.mission_id,),
+        )
+        if not rows:
+            return
+        reviewer = rows[0]["provider"]
+        if implementer is None:
+            independent = False
+            reason = "implementation provider unknown (cannot prove independence)"
+        elif reviewer == implementer:
+            independent = False
+            reason = "no alternative provider eligible; reviewer is the implementer (self-review)"
+        else:
+            independent = True
+            reason = None
+        self.db.insert(
+            "reviews",
+            {
+                "id": f"rev-{utcnow().timestamp()}".replace(".", ""),
+                "mission_id": self.mission_id,
+                "implementation_provider": implementer,
+                "review_provider": reviewer,
+                "independent": int(independent),
+                "degradation_reason": reason,
+                "created_at": utcnow(),
+            },
+        )
+        self.events.publish(
+            EventType.REVIEW_RECORDED,
+            self.mission_id,
+            review_provider=reviewer,
+            implementation_provider=implementer,
+            independent=independent,
+            degradation_reason=reason,
+        )
+
     async def _phase_review_loop(self) -> bool:
         if not self.config.get("orchestration.review_required", True):
             return True
@@ -630,6 +676,7 @@ class MissionEngine:
             result = await self._run_provider_phase(Role.REVIEW)
             if result is None:
                 return False
+            self._record_review_provenance()
             findings = persist_findings(self.db, self.mission_id, result.raw_tail + "\n" + result.summary)
             for f in findings:
                 self.events.publish(

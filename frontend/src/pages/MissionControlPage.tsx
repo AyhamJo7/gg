@@ -107,6 +107,18 @@ export function MissionControlPage() {
               <pre className="muted" style={{ whiteSpace: "pre-wrap", margin: 0 }}>{mission.blocking_issue}</pre>
             </div>
           )}
+          {detail?.degraded_review && detail.latest_review && (
+            <div className="card" style={{ borderColor: "var(--orange)" }} data-testid="self-review-warning">
+              <div className="row">
+                <Badge value="SELF-REVIEW" />
+                <strong>DEGRADED REVIEW — independent reviewer unavailable</strong>
+              </div>
+              <p className="muted" style={{ margin: "6px 0 0" }}>
+                Reviewer <span className="mono">{detail.latest_review.review_provider}</span> also performed the
+                implementation. {detail.latest_review.degradation_reason}
+              </p>
+            </div>
+          )}
           <div className="grid-2">
             <div className="card">
               <h3>Current task</h3>
