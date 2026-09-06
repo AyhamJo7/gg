@@ -54,8 +54,11 @@ def test_startup_reaps_orphaned_process_tree(tmp_path: Path, workspace: Path):
     assert os.path.exists(f"/proc/{parent_pid}")
     assert os.path.exists(f"/proc/{child_pid}")
 
-    # Set up orchestrator with a DB recording this active run
-    orch = make_orchestrator(tmp_path, {"fake-a": FakeAdapter("fake-a", ["ok"])})
+    # Set up orchestrator with a DB recording this active run.
+    # Provider name is "python" so the cmdline ownership check matches the
+    # actual Python process command line (reaping verification must identify
+    # the process as ours before sending signals).
+    orch = make_orchestrator(tmp_path, {"python": FakeAdapter("python", ["ok"])})
     _seed_project(orch, workspace)
     mission = orch.create_mission("p1", "m", "t", "AUTONOMOUS", "balanced")
     orch.db.update("missions", mission["id"], {"status": MissionStatus.IMPLEMENTING.value, "current_phase": "IMPLEMENTING"})
@@ -66,9 +69,9 @@ def test_startup_reaps_orphaned_process_tree(tmp_path: Path, workspace: Path):
             "id": run_id,
             "mission_id": mission["id"],
             "task_id": "t1",
-            "provider": "fake-a",
+            "provider": "python",
             "role": "implementation",
-            "command": "['fake']",
+            "command": "['python']",
             "cwd": str(workspace),
             "started_at": "2026-01-01T00:00:00Z",
             "finished_at": None,

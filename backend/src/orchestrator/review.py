@@ -40,6 +40,18 @@ def _is_valid_finding(item: Any) -> bool:
     severity = str(item.get("severity", "")).upper()
     if severity not in {"BLOCKER", "HIGH", "MEDIUM", "LOW"}:
         return False
+    # category must be a string if present
+    category = item.get("category")
+    if category is not None and not isinstance(category, str):
+        return False
+    # file must be string or None
+    file_val = item.get("file")
+    if file_val is not None and not isinstance(file_val, str):
+        return False
+    # recommended_fix must be a string if present
+    fix = item.get("recommended_fix")
+    if fix is not None and not isinstance(fix, str):
+        return False
     return True
 
 

@@ -64,3 +64,21 @@ def test_review_schema_empty_array_valid():
     parsed_ok, findings = parse_review_output(raw)
     assert parsed_ok
     assert findings == []
+
+
+def test_review_schema_rejects_invalid_category_type():
+    raw = 'REVIEW_FINDINGS_JSON: [{"severity": "HIGH", "description": "bug", "category": 123}]'
+    parsed_ok, _findings = parse_review_output(raw)
+    assert not parsed_ok, "Integer category should be rejected"
+
+
+def test_review_schema_rejects_invalid_file_type():
+    raw = 'REVIEW_FINDINGS_JSON: [{"severity": "HIGH", "description": "bug", "file": 123}]'
+    parsed_ok, _findings = parse_review_output(raw)
+    assert not parsed_ok, "Integer file should be rejected"
+
+
+def test_review_schema_rejects_invalid_recommended_fix_type():
+    raw = 'REVIEW_FINDINGS_JSON: [{"severity": "HIGH", "description": "bug", "recommended_fix": 123}]'
+    parsed_ok, _findings = parse_review_output(raw)
+    assert not parsed_ok, "Integer recommended_fix should be rejected"

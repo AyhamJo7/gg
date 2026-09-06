@@ -144,14 +144,26 @@ class Orchestrator:
                 logger.warning("PID %d: could not verify start time — not killing", pid)
                 return False
         
-        # 3. Verify command line contains something provider-related
+        # 3. Verify command line contains provider-related token
         try:
-            (proc_path / "cmdline").read_bytes()
-            # Just verify it's readable (basic sanity that it's a real process)
-            # Don't be too strict - provider commands vary
-        except OSError:
-            pass  # cmdline check is best-effort
-        
+            cmdline_bytes = (proc_path / "cmdline").read_bytes()
+            if not cmdline_bytes:
+                logger.warning("PID %d: empty cmdline — not killing", pid)
+                return False
+            cmdline = cmdline_bytes.replace(b"\x00", b" ").decode(errors="replace").lower()
+            provider_token = provider.replace("-", "").replace("_", "").lower()
+            if provider_token not in cmdline:
+                logger.warning(
+                    "PID %d cmdline does not contain provider token '%s': %s — not killing",
+                    pid,
+                    provider_token,
+                    cmdline[:200],
+                )
+                return False
+        except OSError as exc:
+            logger.warning("PID %d: cannot read cmdline (%s) — not killing", pid, exc)
+            return False
+
         return True
 
     def _reap_orphaned_processes(self) -> None:
