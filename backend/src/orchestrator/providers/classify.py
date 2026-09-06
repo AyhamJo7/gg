@@ -19,7 +19,8 @@ _AUTH_PATTERNS = re.compile(
 
 _QUOTA_PATTERNS = re.compile(
     r"(quota (exceeded|exhausted)|exceeded your current quota|"
-    r"insufficient_quota|tokens? per day limit|daily.*limit reached)",
+    r"insufficient_quota|tokens? per day limit|daily.*limit reached|"
+    r"individual quota reached)",
     re.IGNORECASE,
 )
 

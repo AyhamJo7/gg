@@ -51,6 +51,7 @@ class ExecutionResult:
     stdout_path: Path | None = None
     stderr_path: Path | None = None
     raw_tail: str = ""
+    assistant_text: str = ""
     started_at: str = field(default_factory=lambda: utcnow().isoformat())
     finished_at: str = field(default_factory=lambda: utcnow().isoformat())
     pid: int | None = None
@@ -127,6 +128,14 @@ class ProviderAdapter(abc.ABC):
                 return text[:2000]
         return ""
 
+    def extract_assistant_text(self, stdout_tail: list[str]) -> str:
+        """Reconstruct the canonical assistant response from raw stdout lines.
+
+        JSON-streaming providers override this to translate NDJSON events into
+        plain assistant text. Default implementation simply joins stdout lines.
+        """
+        return "\n".join(stdout_tail)
+
     async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
         argv = self.build_command(request)
         started = utcnow()
@@ -164,6 +173,7 @@ class ProviderAdapter(abc.ABC):
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             raw_tail=result.combined_tail[-4000:],
+            assistant_text=self.extract_assistant_text(result.stdout_tail),
             started_at=started.isoformat(),
             finished_at=finished.isoformat(),
             pid=result.pid,

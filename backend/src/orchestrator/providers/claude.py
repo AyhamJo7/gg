@@ -52,6 +52,28 @@ class ClaudeAdapter(ProviderAdapter):
             return None
         return None
 
+    def extract_assistant_text(self, stdout_tail: list[str]) -> str:
+        """Reconstruct assistant response from NDJSON stream-json events."""
+        parts: list[str] = []
+        for line in stdout_tail:
+            event = extract_json_line(line)
+            if not event:
+                continue
+            etype = event.get("type")
+            if etype == "assistant":
+                message = event.get("message", {})
+                for block in message.get("content", []):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+            elif etype == "result":
+                res = event.get("result")
+                if isinstance(res, str):
+                    parts.append(res)
+                elif isinstance(res, dict):
+                    response = res.get("response") or res.get("text") or str(res)
+                    parts.append(response)
+        return "\n".join(parts)
+
     def extract_summary(self, stdout_tail: list[str]) -> str:
         # Prefer the final result event's text over the last arbitrary line.
         for line in reversed(stdout_tail):
@@ -62,6 +84,7 @@ class ClaudeAdapter(ProviderAdapter):
 
     def is_success_marker(self, text: str) -> bool:
         normalized = text.replace(" ", "")
-        return '"subtype":"success"' in normalized or (
-            '"type":"result"' in normalized and '"is_error":true' not in normalized
-        )
+        # A genuine success marker must NOT be accompanied by an explicit error flag.
+        if '"is_error":true' in normalized or '"error":' in normalized:
+            return False
+        return '"subtype":"success"' in normalized or '"type":"result"' in normalized

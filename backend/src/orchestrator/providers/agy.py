@@ -57,6 +57,31 @@ class AgyAdapter(ProviderAdapter):
             return str(res or f"[agy result: {event.get('subtype', '?')}]")
         return None
 
+    def extract_assistant_text(self, stdout_tail: list[str]) -> str:
+        """Reconstruct assistant response from AGY stream-json events."""
+        parts: list[str] = []
+        for line in stdout_tail:
+            event = extract_json_line(line)
+            if not event:
+                continue
+            etype = event.get("event") or event.get("type")
+            if etype == "step_update":
+                step = event.get("step_update", {})
+                if "text_delta" in step:
+                    parts.append(str(step["text_delta"]))
+            elif etype == "assistant":
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+            elif etype == "result":
+                res = event.get("result")
+                if isinstance(res, dict):
+                    response = res.get("response") or res.get("text") or str(res)
+                    parts.append(response)
+                elif isinstance(res, str):
+                    parts.append(res)
+        return "\n".join(parts)
+
     def extract_summary(self, stdout_tail: list[str]) -> str:
         for line in reversed(stdout_tail):
             event = extract_json_line(line)
@@ -72,9 +97,12 @@ class AgyAdapter(ProviderAdapter):
 
     def is_success_marker(self, text: str) -> bool:
         normalized = text.replace(" ", "")
+        # Reject if an explicit error flag or ERROR status is present
+        if '"is_error":true' in normalized or '"status":"ERROR"' in normalized or '"error":' in normalized:
+            return False
         return (
-            ('"type":"result"' in normalized and '"is_error":true' not in normalized)
-            or ('"event":"result"' in normalized and '"is_error":true' not in normalized)
+            '"type":"result"' in normalized
+            or '"event":"result"' in normalized
             or '"status":"SUCCESS"' in text
             or '"type":"turn_complete"' in normalized
         )

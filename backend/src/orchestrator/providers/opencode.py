@@ -53,6 +53,18 @@ class OpencodeAdapter(ProviderAdapter):
             return f"[opencode error] {event}"
         return None
 
+    def extract_assistant_text(self, stdout_tail: list[str]) -> str:
+        """Reconstruct assistant response from OpenCode JSON events."""
+        parts: list[str] = []
+        for line in stdout_tail:
+            event = extract_json_line(line)
+            if not event:
+                continue
+            part = event.get("part", {})
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                parts.append(str(part["text"]))
+        return "\n".join(parts)
+
     def extract_summary(self, stdout_tail: list[str]) -> str:
         texts: list[str] = []
         for line in stdout_tail:

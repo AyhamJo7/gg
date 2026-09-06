@@ -50,6 +50,21 @@ class CodexAdapter(ProviderAdapter):
             return f"[codex error] {event.get('msg', event)}"
         return None
 
+    def extract_assistant_text(self, stdout_tail: list[str]) -> str:
+        """Reconstruct assistant response from Codex JSONL events."""
+        parts: list[str] = []
+        for line in stdout_tail:
+            event = extract_json_line(line)
+            if not event:
+                continue
+            etype = event.get("type") or event.get("msg", {}).get("type")
+            if etype in ("agent_message", "item.completed"):
+                item = event.get("item") or event.get("msg") or event
+                text = item.get("text") or item.get("message")
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts)
+
     def extract_summary(self, stdout_tail: list[str]) -> str:
         for line in reversed(stdout_tail):
             event = extract_json_line(line)

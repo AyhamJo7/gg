@@ -191,6 +191,11 @@ class MissionEngine:
         return Path(project["path"])
 
     # -- checkpoint -----------------------------------------------------------
+    def _checkpoint_failure_count(self) -> int:
+        """Durable consecutive-failure count derived from the missions table."""
+        row = self.db.get("missions", self.mission_id)
+        return int(row.get("checkpoint_failures", 0)) if row else 0
+
     async def _checkpoint(self, message: str) -> str | None:
         if self.project_path is None:
             raise RuntimeError("engine project path not initialized")
@@ -203,23 +208,29 @@ class MissionEngine:
                 ensure_gitignore_protections(self.project_path)
                 max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
                 sha = await git_ops.checkpoint(self.project_path, message, max_file_mb=max_mb)
-                self._checkpoint_failures = 0
+                # Success resets consecutive failure count durably
+                self.db.update("missions", self.mission_id, {"checkpoint_failures": 0, "updated_at": utcnow()})
             except git_ops.GitError as exc:
                 logger.warning("checkpoint failed: %s", exc)
-                self._checkpoint_failures = getattr(self, "_checkpoint_failures", 0) + 1
+                failures = self._checkpoint_failure_count() + 1
+                self.db.update(
+                    "missions",
+                    self.mission_id,
+                    {"checkpoint_failures": failures, "updated_at": utcnow()},
+                )
                 self.events.publish(EventType.GIT_CHECKPOINT_FAILED, self.mission_id, error=str(exc), message=message)
                 max_ckpt_failures = int(self.config.get("git.max_checkpoint_failures", 2))
-                if self._checkpoint_failures >= max_ckpt_failures:
+                if failures >= max_ckpt_failures:
                     self.db.update(
                         "missions",
                         self.mission_id,
                         {
-                            "blocking_issue": f"git checkpoint failed repeatedly ({self._checkpoint_failures}x): {exc}",
+                            "blocking_issue": f"git checkpoint failed repeatedly ({failures}x): {exc}",
                             "updated_at": utcnow(),
                         },
                     )
                     raise git_ops.GitCheckpointError(
-                        f"git checkpoint failed repeatedly ({self._checkpoint_failures}x): {exc}"
+                        f"git checkpoint failed repeatedly ({failures}x): {exc}"
                     ) from exc
                 return None
         if sha:
@@ -821,7 +832,8 @@ class MissionEngine:
             result = await self._run_provider_phase(Role.REVIEW)
             if result is None:
                 return False
-            parsed_ok, findings = persist_findings(self.db, self.mission_id, result.raw_tail + "\n" + result.summary)
+            review_input = result.assistant_text + "\n" + result.summary
+            parsed_ok, findings = persist_findings(self.db, self.mission_id, review_input)
             self._record_review_provenance(review_parsed=parsed_ok)
             for f in findings:
                 self.events.publish(
@@ -871,8 +883,9 @@ class MissionEngine:
     async def _phase_final_validation(self) -> bool:
         if self.project_path is None:
             raise RuntimeError("engine project path not initialized")
-        if self.workspace is None:
-            self.workspace = await inspect_workspace(self.project_path, self.config.allowed_roots())
+        # Re-inspect workspace: the provider may have created new project files
+        # (pyproject.toml, package.json, etc.) since the initial analysis phase.
+        self.workspace = await inspect_workspace(self.project_path, self.config.allowed_roots())
         report = await run_verification(self.workspace, self.db, self.events, self.mission_id, self.project_path)
         self._tests_run.extend(r.command for r in report.results)
         if not report.attempted:

@@ -1,0 +1,1 @@
+ALTER TABLE missions ADD COLUMN checkpoint_failures INTEGER NOT NULL DEFAULT 0;

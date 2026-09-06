@@ -81,8 +81,10 @@ class FakeAdapter(ProviderAdapter):
         if behavior == "ratelimit":
             on_output("Error: rate limit exceeded — try again later")
         raw_tail = f"fake output {behavior}"
+        assistant_text = raw_tail
         if request.role == "review" and behavior in ("ok", "work"):
             raw_tail += "\nREVIEW_FINDINGS_JSON: []"
+            assistant_text = raw_tail
         return ExecutionResult(
             state=state,
             failure_class=failure,
@@ -92,6 +94,7 @@ class FakeAdapter(ProviderAdapter):
             stdout_path=Path(request.log_dir / f"{request.run_id}.stdout.log"),
             stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
             raw_tail=raw_tail,
+            assistant_text=assistant_text,
         )
 
 
