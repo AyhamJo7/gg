@@ -18,5 +18,5 @@ def test_parse_garbage():
 
 
 def test_parse_skips_malformed_items():
-    out = 'REVIEW_FINDINGS_JSON: [{"description": "ok"}, {"no_description": true}]'
+    out = 'REVIEW_FINDINGS_JSON: [{"severity": "LOW", "description": "ok"}, {"no_description": true}]'
     assert len(parse_findings(out)) == 1

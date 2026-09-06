@@ -21,11 +21,35 @@ def test_auth_patterns():
 
 def test_human_input_patterns_f22():
     # F-22: relax regex to match question mark and other real prompt shapes
-    assert classify_output(0, "Do you want to proceed? [y/N]", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
-    assert classify_output(0, "Do you want to continue? [y/n]", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
-    assert classify_output(0, "Overwrite existing file? (y/n)", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
-    assert classify_output(0, "Press any key to continue...", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
-    assert classify_output(0, "waiting for user input", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    assert classify_output(1, "Do you want to proceed? [y/N]", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    assert classify_output(1, "Do you want to continue? [y/n]", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    assert classify_output(1, "Overwrite existing file? (y/n)", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    assert classify_output(1, "Press any key to continue...", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    assert classify_output(None, "waiting for user input", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+
+
+def test_n05_exit_zero_source_code_not_human_input():
+    """N-05: Exit 0 + source code containing human-input patterns must not be HUMAN_INPUT."""
+    source_code_outputs = [
+        'def prompt():\n    answer = input("Continue? (y/n)")\n    return answer',
+        'def confirm():\n    choice = input("[y/N]")\n    if choice.lower() == "y":\n        proceed()',
+        '# Enter password: placeholder for docs\nprint("Enter password: ")',
+        'CONFIRM_TEXT = "Confirm:"\nbutton = Button(text=CONFIRM_TEXT)',
+        'PROMPT = "Do you want to proceed? [y/N]"\nprint(PROMPT)',
+        '"""Press any key to continue..."""\ndef wait_for_key(): pass',
+    ]
+    for output in source_code_outputs:
+        result = classify_output(0, output, timed_out=False, cancelled=False)
+        assert result == FailureClass.NONE, f"Exit 0 source code misclassified as {result}: {output[:60]}"
+
+
+def test_n05_genuine_human_input_still_detected():
+    """N-05: Non-zero exit or timeout with human-input patterns still classified correctly."""
+    # Non-zero exit with human input pattern
+    assert classify_output(1, "Do you want to proceed? [y/N]", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    # Exit None (process didn't finish) with human input pattern  
+    assert classify_output(None, "Press any key to continue...", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    assert classify_output(None, "(y/n)", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
 
 
 def test_timeout_and_cancel():

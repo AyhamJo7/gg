@@ -175,6 +175,14 @@ class MissionEngine:
         self._set_status(MissionStatus.FAILED, blocking_issue=reason, current_provider=None)
         self.events.publish(EventType.MISSION_FAILED, self.mission_id, reason=reason)
 
+    def _fail_checkpoint_exhaustion(self, error: str) -> None:
+        """Transition mission to UNVERIFIED due to fatal checkpoint exhaustion."""
+        self._set_status(
+            MissionStatus.UNVERIFIED,
+            blocking_issue=f"git checkpoint exhausted: {error}",
+            current_provider=None,
+        )
+
     def _project_path(self) -> Path:
         mission = self._mission()
         project = self.db.get("projects", mission.project_id)
@@ -193,7 +201,8 @@ class MissionEngine:
         async with self.locks.git():
             try:
                 ensure_gitignore_protections(self.project_path)
-                sha = await git_ops.checkpoint(self.project_path, message)
+                max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
+                sha = await git_ops.checkpoint(self.project_path, message, max_file_mb=max_mb)
                 self._checkpoint_failures = 0
             except git_ops.GitError as exc:
                 logger.warning("checkpoint failed: %s", exc)
@@ -209,6 +218,9 @@ class MissionEngine:
                             "updated_at": utcnow(),
                         },
                     )
+                    raise git_ops.GitCheckpointError(
+                        f"git checkpoint failed repeatedly ({self._checkpoint_failures}x): {exc}"
+                    ) from exc
                 return None
         if sha:
             self.db.insert(
@@ -456,7 +468,11 @@ class MissionEngine:
                     "tasks", task.id, {"status": "completed", "summary": result.summary, "finished_at": utcnow()}
                 )
                 self.events.publish(EventType.TASK_COMPLETED, self.mission_id, task_id=task.id, provider=provider_name)
-                await self._checkpoint(f"agent({provider_name}): {role.value} checkpoint")
+                try:
+                    await self._checkpoint(f"agent({provider_name}): {role.value} checkpoint")
+                except git_ops.GitCheckpointError as exc:
+                    self._fail_checkpoint_exhaustion(str(exc))
+                    return None
                 self._completed_work.append(f"[{role.value}] {provider_name}: {result.summary[:200]}")
                 return result
 
@@ -508,7 +524,11 @@ class MissionEngine:
                 return None
 
             if self.config.get("orchestration.checkpoint_before_provider_switch", True):
-                await self._checkpoint(f"orchestrator: checkpoint before provider switch ({role.value})")
+                try:
+                    await self._checkpoint(f"orchestrator: checkpoint before provider switch ({role.value})")
+                except git_ops.GitCheckpointError as exc:
+                    self._fail_checkpoint_exhaustion(str(exc))
+                    return None
             last_provider = provider_name
             attempt += 1
 
@@ -658,7 +678,11 @@ class MissionEngine:
             self.events.publish(EventType.PHASE_COMPLETED, self.mission_id, phase=phase.value)
 
         # all phases done
-        await self._checkpoint("orchestrator: final verified state")
+        try:
+            await self._checkpoint("orchestrator: final verified state")
+        except git_ops.GitCheckpointError as exc:
+            self._fail_checkpoint_exhaustion(str(exc))
+            return
         head = await git_ops.head_sha(self.project_path) if self.workspace and self.workspace.is_git_repo else None
         self._set_status(MissionStatus.COMPLETED, current_provider=None, git_head=head)
         self.events.publish(EventType.MISSION_COMPLETED, self.mission_id)
@@ -670,7 +694,11 @@ class MissionEngine:
         if not self.workspace.is_git_repo:
             await git_ops.init_repo(project_path)
             self.workspace.is_git_repo = True
-            await self._checkpoint("orchestrator: initial repository checkpoint")
+            try:
+                await self._checkpoint("orchestrator: initial repository checkpoint")
+            except git_ops.GitCheckpointError as exc:
+                self._fail_checkpoint_exhaustion(str(exc))
+                return False
         else:
             st = await git_ops.status(project_path)
             if not st.branch:
@@ -680,7 +708,11 @@ class MissionEngine:
                 await git_ops._git(project_path, "checkout", "-b", mission_branch)
                 st = await git_ops.status(project_path)
             if not st.is_clean:
-                await self._checkpoint("orchestrator: checkpoint before mission start (pre-existing changes)")
+                try:
+                    await self._checkpoint("orchestrator: checkpoint before mission start (pre-existing changes)")
+                except git_ops.GitCheckpointError as exc:
+                    self._fail_checkpoint_exhaustion(str(exc))
+                    return False
         self.db.update("projects", self._mission().project_id, {"detected_type": self.workspace.project_type})
         return True
 
@@ -772,11 +804,18 @@ class MissionEngine:
             degradation_reason=reason,
         )
 
+    def _unparseable_review_count(self) -> int:
+        """Count unparseable reviews from persisted state (survives restart)."""
+        rows = self.db.query(
+            "SELECT COUNT(*) as cnt FROM reviews WHERE mission_id=? AND review_parsed=0",
+            (self.mission_id,),
+        )
+        return rows[0]["cnt"] if rows else 0
+
     async def _phase_review_loop(self) -> bool:
         if not self.config.get("orchestration.review_required", True):
             return True
         max_cycles = int(self.config.get("orchestration.max_repair_cycles", 3))
-        unparseable_attempts = 0
         max_unparseable_attempts = int(self.config.get("orchestration.max_unparseable_review_attempts", 2))
         while True:
             result = await self._run_provider_phase(Role.REVIEW)
@@ -792,8 +831,8 @@ class MissionEngine:
                     description=f.description[:200],
                 )
             if not parsed_ok:
-                unparseable_attempts += 1
-                if unparseable_attempts >= max_unparseable_attempts:
+                unparseable_count = self._unparseable_review_count()
+                if unparseable_count >= max_unparseable_attempts:
                     self._set_status(
                         MissionStatus.UNVERIFIED,
                         blocking_issue="reviewer output unparseable after retries — cannot verify code review",

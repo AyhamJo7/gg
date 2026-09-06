@@ -30,6 +30,19 @@ If everything is acceptable, output: {MARKER} []
 """.strip()
 
 
+def _is_valid_finding(item: Any) -> bool:
+    """Validate that a finding dict has required schema fields."""
+    if not isinstance(item, dict):
+        return False
+    desc = item.get("description")
+    if not desc or not isinstance(desc, str):
+        return False
+    severity = str(item.get("severity", "")).upper()
+    if severity not in {"BLOCKER", "HIGH", "MEDIUM", "LOW"}:
+        return False
+    return True
+
+
 def parse_review_output(raw_output: str) -> tuple[bool, list[dict[str, Any]]]:
     for line in raw_output.splitlines():
         stripped = line.strip()
@@ -50,9 +63,11 @@ def parse_review_output(raw_output: str) -> tuple[bool, list[dict[str, Any]]]:
         if isinstance(data, list):
             findings: list[dict[str, Any]] = []
             for item in data:
-                if isinstance(item, dict) and item.get("description"):
+                if _is_valid_finding(item):
                     findings.append(item)
-            return True, findings
+            if not data or findings:
+                return True, findings
+            continue
 
     # No structured review block found: synthesize finding (F-08)
     unstructured_finding = {
@@ -84,9 +99,11 @@ def parse_findings(raw_output: str) -> list[dict[str, Any]]:
         if isinstance(data, list):
             findings: list[dict[str, Any]] = []
             for item in data:
-                if isinstance(item, dict) and item.get("description"):
+                if _is_valid_finding(item):
                     findings.append(item)
-            return findings
+            if not data or findings:
+                return findings
+            continue
     return []
 
 

@@ -213,10 +213,10 @@ async def test_f15_priority_persisted_to_settings(client: httpx.AsyncClient):
     orch = client.orchestrator  # type: ignore[attr-defined]
     resp = await client.post(
         "/api/settings/priority",
-        json={"role": "planning", "providers": ["fake-b", "fake-a"]},
+        json={"role": "planning", "providers": ["fake-a"]},
     )
     assert resp.status_code == 200
     row = orch.db.get("settings", "priority.planning", key="key")
     assert row is not None
-    assert json.loads(row["value"]) == ["fake-b", "fake-a"]
+    assert json.loads(row["value"]) == ["fake-a"]
 

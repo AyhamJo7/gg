@@ -278,7 +278,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
 
     @app.post("/api/missions/{mission_id}/gates/{gate_id}/resolve")
     async def resolve_gate(mission_id: str, gate_id: str, req: GateResolutionRequest) -> dict[str, str]:
-        orchestrator.resolve_gate(gate_id, req.resolution)
+        try:
+            orchestrator.resolve_gate(gate_id, req.resolution)
+        except IllegalMissionTransitionError as exc:
+            raise HTTPException(409, str(exc)) from exc
         return {"status": "resolved"}
 
     # ---------------- git ----------------
@@ -340,6 +343,21 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
 
     @app.post("/api/settings/priority")
     async def set_priority(req: PriorityUpdateRequest) -> dict[str, list[str]]:
+        # Validate role
+        valid_roles = {"planning", "implementation", "testing", "review", "repair"}
+        if req.role not in valid_roles:
+            raise HTTPException(422, f"Unknown role '{req.role}'. Must be one of: {sorted(valid_roles)}")
+        # Validate providers
+        known_providers = set(orchestrator.registry.adapters.keys())
+        unknown = set(req.providers) - known_providers
+        if unknown:
+            raise HTTPException(422, f"Unknown provider(s): {sorted(unknown)}. Known: {sorted(known_providers)}")
+        # Check for duplicates
+        if len(req.providers) != len(set(req.providers)):
+            raise HTTPException(422, "Duplicate providers in priority list")
+        # Check non-empty
+        if not req.providers:
+            raise HTTPException(422, "Priority list must not be empty")
         orchestrator.config.set_priority(req.role, req.providers)
         orchestrator.db.execute(
             "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",

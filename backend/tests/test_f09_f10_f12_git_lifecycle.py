@@ -131,7 +131,7 @@ def test_f09_repeated_checkpoint_failures_emit_event_and_record_blocking_issue(t
         # Make checkpoint fail by mocking or breaking git
         original_checkpoint = git_ops.checkpoint
         try:
-            async def broken_checkpoint(root, msg):
+            async def broken_checkpoint(root, msg, **kwargs):
                 raise git_ops.GitError("simulated nested repo submodule failure")
 
             git_ops.checkpoint = broken_checkpoint
@@ -141,9 +141,10 @@ def test_f09_repeated_checkpoint_failures_emit_event_and_record_blocking_issue(t
             assert res1 is None
             assert any(e.type == EventType.GIT_CHECKPOINT_FAILED.value for e in events_received)
 
-            # 2nd failure (should trigger blocking_issue)
-            res2 = await engine._checkpoint("attempt 2")
-            assert res2 is None
+            # 2nd failure (should trigger blocking_issue and raise GitCheckpointError)
+            import pytest
+            with pytest.raises(git_ops.GitCheckpointError):
+                await engine._checkpoint("attempt 2")
 
             row = orch.db.get("missions", mission_id)
             assert "git checkpoint failed repeatedly" in (row.get("blocking_issue") or "")

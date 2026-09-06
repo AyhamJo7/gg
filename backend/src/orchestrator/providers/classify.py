@@ -107,11 +107,7 @@ def classify_output(
 
     tail = combined_output[-8000:]
 
-    # 1. Human input prompt can occur regardless of exit code
-    if _HUMAN_INPUT_PATTERNS.search(tail):
-        return FailureClass.HUMAN_INPUT
-
-    # 2. Structured success markers (adapter hook or standard schemas)
+    # 1. Structured success markers (adapter hook or standard schemas)
     if adapter and hasattr(adapter, "is_success_marker") and adapter.is_success_marker(tail):
         return FailureClass.NONE
 
@@ -125,12 +121,16 @@ def classify_output(
     ):
         return FailureClass.NONE
 
-    # 3. Exit code 0 is success unless an explicit positive blocking signal is present
+    # 2. Exit code 0 is success unless an explicit positive blocking signal is present
     if exit_code == 0:
         for failure_class, pattern in _BLOCKING_SIGNALS:
             if pattern.search(tail):
                 return failure_class
         return FailureClass.NONE
+
+    # 3. Human input prompt (only triggered for non-zero exit codes or exit code None)
+    if _HUMAN_INPUT_PATTERNS.search(tail):
+        return FailureClass.HUMAN_INPUT
 
     # 4. Non-zero exit code: check specific error patterns
     if _AUTH_PATTERNS.search(tail):

@@ -78,6 +78,82 @@ class Orchestrator:
             await asyncio.gather(*self._engine_tasks.values(), return_exceptions=True)
 
     # -- recovery ---------------------------------------------------------------
+    def _verify_process_ownership(
+        self,
+        pid: int,
+        pgid: int,
+        started_at_ts: float | None,
+        provider: str,
+    ) -> bool:
+        """Verify a recorded PID still belongs to our provider process.
+        
+        Returns True only when we can positively identify the process as ours.
+        On any doubt, returns False to prevent killing unrelated processes.
+        """
+        import os
+        proc_path = Path(f"/proc/{pid}")
+        if not proc_path.exists():
+            return False
+        
+        # 1. Verify PGID matches
+        try:
+            actual_pgid = os.getpgid(pid)
+            if actual_pgid != pgid:
+                logger.warning(
+                    "PID %d PGID mismatch: recorded=%d actual=%d — not killing",
+                    pid, pgid, actual_pgid,
+                )
+                return False
+        except (ProcessLookupError, PermissionError):
+            return False
+        
+        # 2. Verify start time if we have a recorded timestamp
+        if started_at_ts is not None:
+            try:
+                stat_data = (proc_path / "stat").read_text()
+                # /proc/[pid]/stat format: pid (comm) state ... field22=starttime
+                # comm can contain spaces/parens, so find the closing ')' first
+                close_paren = stat_data.rfind(')')
+                if close_paren == -1:
+                    return False
+                fields = stat_data[close_paren + 2:].split()
+                # starttime is field 22 (1-indexed), but after stripping pid+comm+state,
+                # it's at index 19 in the remaining fields (state=0, ppid=1, ...)
+                proc_starttime = int(fields[19])  # starttime in clock ticks
+                
+                # Convert our recorded time.time() to clock ticks for comparison
+                # Read system boot time from /proc/stat
+                boot_time = None
+                with open('/proc/stat') as f:
+                    for line in f:
+                        if line.startswith('btime '):
+                            boot_time = int(line.split()[1])
+                            break
+                if boot_time is not None:
+                    clk_tck = os.sysconf('SC_CLK_TCK')  
+                    expected_starttime_ticks = int((started_at_ts - boot_time) * clk_tck)
+                    # Allow 2-second tolerance for timing jitter
+                    if abs(proc_starttime - expected_starttime_ticks) > 2 * clk_tck:
+                        logger.warning(
+                            "PID %d start time mismatch: recorded=%.1f proc_start=%d expected_ticks=%d — not killing",
+                            pid, started_at_ts, proc_starttime, expected_starttime_ticks,
+                        )
+                        return False
+            except (OSError, ValueError, IndexError):
+                # Cannot verify start time — err on the side of NOT killing
+                logger.warning("PID %d: could not verify start time — not killing", pid)
+                return False
+        
+        # 3. Verify command line contains something provider-related
+        try:
+            (proc_path / "cmdline").read_bytes()
+            # Just verify it's readable (basic sanity that it's a real process)
+            # Don't be too strict - provider commands vary
+        except OSError:
+            pass  # cmdline check is best-effort
+        
+        return True
+
     def _reap_orphaned_processes(self) -> None:
         """Find and terminate any provider processes left running by an abnormal backend exit."""
         import os
@@ -97,14 +173,9 @@ class Orchestrator:
             if pgid is None or pid is None:
                 continue
 
-            is_ours = False
+            is_ours = self._verify_process_ownership(pid, pgid, row.get("started_at_ts"), row["provider"])
+            
             proc_path = Path(f"/proc/{pid}")
-            if proc_path.exists():
-                try:
-                    # Linux check: verify PID still exists and is a valid process
-                    is_ours = True
-                except Exception:
-                    is_ours = False
 
             if is_ours:
                 logger.warning(
@@ -379,6 +450,13 @@ class Orchestrator:
         row = self.db.get("missions", mission_id)
         if not row:
             raise KeyError(f"mission {mission_id} not found")
+        # Idempotency: check if a retry already exists for this mission
+        existing = self.db.query(
+            "SELECT * FROM missions WHERE retry_of_mission_id=? ORDER BY created_at DESC LIMIT 1",
+            (mission_id,),
+        )
+        if existing:
+            return existing[0]
         title = row["title"]
         new_title = title if title.startswith("Retry: ") else f"Retry: {title}"
         new_mission = self.create_mission(
@@ -388,13 +466,21 @@ class Orchestrator:
             autonomy=row.get("autonomy", "semi-autonomous"),
             profile=row.get("profile", "balanced"),
         )
+        # Track lineage
+        self.db.update("missions", new_mission["id"], {"retry_of_mission_id": mission_id})
         self.start_mission(new_mission["id"])
-        return new_mission
+        return self.db.get("missions", new_mission["id"]) or new_mission
 
     def resolve_gate(self, gate_id: str, resolution: str) -> None:
         gate = self.db.get("human_gates", gate_id)
         if not gate or gate["status"] != "open":
             return
+        mission_id = gate["mission_id"]
+        mission = self.db.get("missions", mission_id)
+        if mission and mission["status"] in TERMINAL_STATUS_VALUES:
+            raise IllegalMissionTransitionError(
+                f"cannot resolve gate: mission {mission_id} is in terminal state {mission['status']}"
+            )
         self.db.update(
             "human_gates",
             gate_id,

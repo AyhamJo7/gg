@@ -27,13 +27,19 @@ class GitStatus:
     added: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     untracked: list[str] = field(default_factory=list)
+    renamed: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
-        return not (self.modified or self.added or self.deleted or self.untracked)
+        return not (self.modified or self.added or self.deleted or self.untracked or self.renamed)
 
 
 class GitError(RuntimeError):
+    pass
+
+
+class GitCheckpointError(GitError):
+    """Fatal: checkpoint retry limit exhausted — mission must not reach COMPLETED."""
     pass
 
 
@@ -109,20 +115,43 @@ async def status(root: Path) -> GitStatus:
     branch = await _git(root, "branch", "--show-current", check=False)
     head = await head_sha(root)
     result = GitStatus(is_repo=True, branch=branch, head=head)
-    raw = await _git(root, "status", "--porcelain=v1", "-z")
-    entries = [e for e in raw.split("\x00") if e]
-    for entry in entries:
-        code, path = entry[:2], entry[3:]
+    
+    res = await _spawn_git(root, "status", "--porcelain=v1", "-z")
+    if res.returncode != 0:
+        raise GitError(f"git status failed: {res.err_text[:400]}")
+    
+    raw = res.stdout.decode(errors="replace")
+    parts = raw.split("\x00")
+    
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if not part:
+            i += 1
+            continue
+            
+        code = part[:2]
+        path = part[3:]
         x, y = code[0], code[1]
-        if code == "??":
-            result.untracked.append(path)
+        
+        if x in "RC" or y in "RC":
+            new_path = path
+            i += 1
+            if i < len(parts):
+                old_path = parts[i]
+                result.renamed.append((old_path, new_path))
         else:
-            if x in "M" or y == "M":
-                result.modified.append(path)
-            if x in "A" or y == "A":
-                result.added.append(path)
-            if x in "D" or y == "D":
-                result.deleted.append(path)
+            if code == "??":
+                result.untracked.append(path)
+            elif code != "!!":
+                if x == "M" or y == "M":
+                    result.modified.append(path)
+                if x == "A" or y == "A":
+                    result.added.append(path)
+                if x == "D" or y == "D":
+                    result.deleted.append(path)
+        i += 1
+        
     return result
 
 
@@ -138,7 +167,7 @@ async def recent_commits(root: Path, count: int = 10) -> list[str]:
     return [line for line in raw.splitlines() if line]
 
 
-async def checkpoint(root: Path, message: str) -> str | None:
+async def checkpoint(root: Path, message: str, max_file_mb: int = 5) -> str | None:
     """Commit all non-sensitive changes. Returns commit SHA or None if nothing to commit.
 
     Sensitive files and internal logs (.orchestrator/) are never staged — they are
@@ -180,8 +209,12 @@ async def checkpoint(root: Path, message: str) -> str | None:
         else:
             try:
                 fp = root / path
-                if fp.is_file() and fp.stat().st_size > 5 * 1024 * 1024:
-                    logger.warning("Staged file exceeds 5MB threshold: %s (%d bytes)", path, fp.stat().st_size)
+                if fp.is_file() and fp.stat().st_size > max_file_mb * 1024 * 1024:
+                    logger.warning(
+                        "Excluding large file from auto-checkpoint: %s (%d bytes, limit %dMB)",
+                        path, fp.stat().st_size, max_file_mb,
+                    )
+                    await _git(root, "reset", "-q", "--", path, check=False)
             except OSError:
                 pass
 

@@ -87,8 +87,8 @@ async def test_f20_large_file_checkpoint_warning(tmp_path: Path, caplog: pytest.
 
     with caplog.at_level(logging.WARNING):
         sha = await checkpoint(tmp_path, "add large file")
-        assert sha is not None
-        assert any("exceeds 5MB threshold" in record.message for record in caplog.records)
+        assert sha is None
+        assert any("Excluding large file from auto-checkpoint" in record.message for record in caplog.records)
 
 
 @pytest.mark.asyncio
