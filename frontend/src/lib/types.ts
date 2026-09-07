@@ -23,6 +23,7 @@ export interface Mission {
   repair_cycles: number;
   blocking_issue: string | null;
   git_head: string | null;
+  scheduling_mode: string;
   created_at: string;
   updated_at: string;
   finished_at: string | null;
@@ -47,16 +48,96 @@ export interface MissionDetail extends Mission {
   latest_review: ReviewRecord | null;
   degraded_review: boolean;
   latest_handoff: string | null;
+  integrations: IntegrationRecord[];
 }
 
 export interface TaskRecord {
   id: string;
+  mission_id: string;
   role: string;
   status: string;
+  prompt: string;
   summary: string;
   attempts: number;
   created_at: string;
   finished_at: string | null;
+  title: string;
+  task_type: string;
+  description: string;
+  preferred_providers: string;
+  assigned_provider: string | null;
+  workspace_scope: string;
+  resource_locks: string;
+  max_attempts: number;
+  priority: number;
+  ready_at: string | null;
+  started_at: string | null;
+  provider_run_id: string | null;
+  checkpoint_before: string | null;
+  checkpoint_after: string | null;
+  result: string;
+  blocking_issue: string | null;
+  dag_revision: number;
+}
+
+export interface TaskDependency {
+  from_task_id: string;
+  to_task_id: string;
+  created_at: string;
+}
+
+export interface TaskBranch {
+  id: string;
+  task_id: string;
+  branch_name: string;
+  base_commit: string;
+  worktree_path: string;
+  created_at: string;
+  removed_at: string | null;
+}
+
+export interface ProviderReservation {
+  id: string;
+  task_id: string;
+  provider: string;
+  reserved_at: string;
+  released_at: string | null;
+  run_id: string | null;
+  title?: string;
+}
+
+export interface TaskLock {
+  id: string;
+  task_id: string;
+  lock_type: string;
+  resource_key: string;
+  acquired_at: string;
+  released_at: string | null;
+  title?: string;
+}
+
+export interface MissionDag {
+  mission_id: string;
+  scheduling_mode: string;
+  tasks: TaskRecord[];
+  dependencies: TaskDependency[];
+  branches: TaskBranch[];
+  reservations: ProviderReservation[];
+  locks: TaskLock[];
+}
+
+export interface IntegrationRecord {
+  id: string;
+  mission_id: string;
+  status: string;
+  branch_names: string;
+  conflict_files: string;
+  merged_commit: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  provider: string | null;
+  summary: string;
+  created_at: string;
 }
 
 export interface HumanGate {
@@ -71,12 +152,14 @@ export interface HumanGate {
 
 export interface ReviewFinding {
   id: string;
+  mission_id: string;
   severity: string;
   category: string;
   file: string | null;
   description: string;
   recommended_fix: string;
   status: string;
+  created_at: string;
 }
 
 export interface ProviderRun {
@@ -141,3 +224,19 @@ export interface Analytics {
 }
 
 export type PriorityMatrix = Record<string, string[]>;
+
+export interface DagTaskInput {
+  id: string;
+  role: string;
+  title: string;
+  description: string;
+  preferred_providers: string;
+  workspace_scope: string;
+  priority?: number;
+  max_attempts?: number;
+}
+
+export interface DagDependencyInput {
+  from_task_id: string;
+  to_task_id: string;
+}

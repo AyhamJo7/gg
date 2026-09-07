@@ -37,6 +37,11 @@ class CreateMissionRequest(BaseModel):
     start: bool = True
 
 
+class DagUpdateRequest(BaseModel):
+    tasks: list[dict[str, Any]] = Field(default_factory=list)
+    dependencies: list[dict[str, str]] = Field(default_factory=list)
+
+
 class GateResolutionRequest(BaseModel):
     resolution: str
 
@@ -200,8 +205,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             raise HTTPException(404, "mission not found")
         mission = _jsonable(mission)
         mission["tasks"] = orchestrator.db.query(
-            "SELECT id, role, status, summary, attempts, created_at, finished_at "
-            "FROM tasks WHERE mission_id=? ORDER BY created_at",
+            "SELECT * FROM tasks WHERE mission_id=? ORDER BY created_at",
             (mission_id,),
         )
         mission["gates"] = [
@@ -228,6 +232,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             "SELECT * FROM handoffs WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,)
         )
         mission["latest_handoff"] = latest_handoff[0]["content"] if latest_handoff else None
+        mission["integrations"] = orchestrator.db.query(
+            "SELECT * FROM task_integrations WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,)
+        )
         return mission
 
     @app.post("/api/missions/{mission_id}/start")
@@ -324,6 +331,22 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             "reservations": [_jsonable(r) for r in reservations],
             "locks": [_jsonable(lock) for lock in locks],
         }
+
+    @app.post("/api/missions/{mission_id}/dag")
+    async def update_mission_dag(mission_id: str, req: DagUpdateRequest) -> dict[str, str]:
+        mission = orchestrator.db.get("missions", mission_id)
+        if not mission:
+            raise HTTPException(404, "mission not found")
+        if mission["status"] != "CREATED":
+            raise HTTPException(409, "can only modify DAG before mission is started")
+        for t in req.tasks:
+            t["mission_id"] = mission_id
+            t["created_at"] = utcnow().isoformat()
+            orchestrator.db.insert("tasks", t)
+        for d in req.dependencies:
+            d["created_at"] = utcnow().isoformat()
+            orchestrator.db.insert("task_dependencies", d)
+        return {"status": "dag updated"}
 
     @app.get("/api/missions/{mission_id}/active-tasks")
     def get_active_tasks(mission_id: str) -> list[dict[str, Any]]:
