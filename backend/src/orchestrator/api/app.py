@@ -15,9 +15,9 @@ from pydantic import BaseModel, Field
 from .. import git_ops
 from ..config import Config
 from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
-from ..models import Role, TaskGraphTask, TaskStatus, utcnow
+from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
-from ..security import validate_workspace_path
+from ..security import redact, validate_workspace_path
 from ..workspace import inspect_workspace
 
 logger = logging.getLogger(__name__)
@@ -351,9 +351,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         # Strict validation: same DAG rules as planner-produced graphs.
         try:
             known_ids = {raw.get("id") for raw in req.tasks}
-            for dep in req.dependencies:
-                if dep.get("from_task_id") not in known_ids or dep.get("to_task_id") not in known_ids:
-                    raise DagValidationError(f"dependency references unknown task: {dep}")
+            for dep_ref in req.dependencies:
+                if dep_ref.get("from_task_id") not in known_ids or dep_ref.get("to_task_id") not in known_ids:
+                    raise DagValidationError(f"dependency references unknown task: {dep_ref}")
             tasks: list[TaskGraphTask] = []
             for raw in req.tasks:
                 tid = raw.get("id")
@@ -412,10 +412,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
                     "dag_revision": 1,
                 },
             )
-            for dep in task.dependencies:
+            for dep_id in task.dependencies:
                 orchestrator.db.insert(
                     "task_dependencies",
-                    {"from_task_id": dep, "to_task_id": task.id, "created_at": now},
+                    {"from_task_id": dep_id, "to_task_id": task.id, "created_at": now},
                 )
         return {"status": "dag updated"}
 
@@ -438,10 +438,18 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         task = orchestrator.db.get("tasks", task_id)
         if not task or task["mission_id"] != mission_id:
             raise HTTPException(404, "task not found")
+        mission = orchestrator.db.get("missions", mission_id)
+        if mission and MissionStatus(mission["status"]) in TERMINAL_STATUSES:
+            raise HTTPException(409, f"cannot retry task: mission is {mission['status']}")
         orchestrator.db.update(
             "tasks",
             task_id,
-            {"status": "PENDING", "blocking_issue": "manual retry", "attempt": 0, "finished_at": None},
+            {
+                "status": TaskStatus.PENDING.value,
+                "blocking_issue": "manual retry",
+                "attempts": 0,
+                "finished_at": None,
+            },
         )
         engine = orchestrator._engines.get(mission_id)
         if engine:
@@ -478,24 +486,36 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         if not run:
             return {"stdout": "", "stderr": "", "run": None}
         run_row = run[0]
-        stdout_path = run_row.get("stdout_path")
-        stderr_path = run_row.get("stderr_path")
-        stdout_text = ""
-        stderr_text = ""
-        if stdout_path and Path(stdout_path).exists():
+        # Containment: only serve files inside this project's log directory,
+        # so a manipulated DB path can never expose arbitrary files.
+        log_dir: Path | None = None
+        mission = orchestrator.db.get("missions", mission_id)
+        if mission and mission.get("project_id"):
+            project = orchestrator.db.get("projects", mission["project_id"])
+            if project and project.get("path"):
+                log_dir = Path(project["path"]) / ".orchestrator" / "logs"
+
+        def _read_log(raw_path: Any) -> str:
+            if not raw_path or not isinstance(raw_path, str) or log_dir is None:
+                return ""
             try:
-                stdout_text = Path(stdout_path).read_text(encoding="utf-8", errors="replace")
+                resolved = Path(raw_path).resolve()
+                if log_dir.resolve() not in resolved.parents:
+                    logger.warning("refusing log path outside project log dir: %s", raw_path)
+                    return ""
+                if not resolved.is_file():
+                    return ""
+                return redact(resolved.read_text(encoding="utf-8", errors="replace"))
             except OSError:
-                pass
-        if stderr_path and Path(stderr_path).exists():
-            try:
-                stderr_text = Path(stderr_path).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                pass
+                return ""
+
+        safe_run = _jsonable(run_row)
+        if isinstance(safe_run.get("summary"), str):
+            safe_run["summary"] = redact(safe_run["summary"])
         return {
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-            "run": _jsonable(run_row),
+            "stdout": _read_log(run_row.get("stdout_path")),
+            "stderr": _read_log(run_row.get("stderr_path")),
+            "run": safe_run,
         }
 
     # ---------------- git ----------------

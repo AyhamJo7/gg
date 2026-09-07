@@ -784,79 +784,153 @@ class ParallelMissionEngine:
     # ------------------------------------------------------------------
 
     async def _run_planning_phase(self) -> bool:
-        """Run the planning provider and convert output to a persisted DAG."""
+        """Run the planning provider and convert output to a persisted DAG.
+
+        Failover mirrors the certified v1 phase loop: each execution counts as
+        one attempt bounded by max_phase_attempts; a failed planner is recorded
+        (failure classification + cooldown) and the next eligible planner is
+        selected. Returns True once a valid DAG is persisted.
+        """
+
+        import time
 
         project_path = self._require_project_path()
 
         role = Role.PLANNING
-        provider_name = self._select_provider(role)
-        if not provider_name:
-            self._set_mission_status(MissionStatus.FAILED, blocking_issue="no provider available for planning")
-            return False
-
-        adapter = self.registry.get_adapter(provider_name)
-        if not adapter:
-            self._set_mission_status(MissionStatus.FAILED, blocking_issue=f"adapter missing for {provider_name}")
-            return False
-
+        max_attempts = int(self.config.get("orchestration.max_phase_attempts", 4))
+        max_wait_s = float(self.config.get("orchestration.max_provider_wait_seconds", 7200))
         prompt = self._build_planning_prompt()
-        run_id = f"run-{utcnow().timestamp()}".replace(".", "")
         log_dir = project_path / ".orchestrator" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        request = ExecutionRequest(
-            prompt=prompt,
-            workdir=project_path,
-            role=role.value,
-            timeout_s=self.config.provider_timeout_s(provider_name),
-            run_id=run_id,
-            log_dir=log_dir,
-        )
+        attempt = 0
+        wait_started: float | None = None
+        result: ExecutionResult | None = None
+        while attempt < max_attempts:
+            if self._cancel.is_set():
+                self._set_mission_status(MissionStatus.CANCELLED)
+                return False
+            if self._pause.is_set():
+                self._set_mission_status(MissionStatus.PAUSED)
+                return False
+            provider_name = self._select_provider(role)
+            if provider_name is None:
+                if not self.registry.has_potentially_available():
+                    self._set_mission_status(
+                        MissionStatus.FAILED, blocking_issue="no provider available for planning"
+                    )
+                    return False
+                if wait_started is None:
+                    wait_started = time.monotonic()
+                    self._set_mission_status(
+                        MissionStatus.WAITING_FOR_PROVIDER,
+                        blocking_issue="all planning providers cooling down",
+                    )
+                elif time.monotonic() - wait_started > max_wait_s:
+                    self._set_mission_status(
+                        MissionStatus.FAILED,
+                        blocking_issue=f"no eligible planning provider within {int(max_wait_s)}s",
+                    )
+                    return False
+                await self._wait_tick()
+                continue
+            wait_started = None
 
-        self.db.insert(
-            "provider_runs",
-            {
-                "id": run_id,
-                "mission_id": self.mission_id,
-                "provider": provider_name,
-                "role": role.value,
-                "command": [redact(provider_name)],
-                "cwd": str(project_path),
-                "started_at": utcnow().isoformat(),
-                "failure_class": "RUNNING",
-                "provider_state": "RUNNING",
-            },
-        )
-        self.registry.mark_busy(provider_name)
+            adapter = self.registry.get_adapter(provider_name)
+            if not adapter:
+                attempt += 1
+                continue
 
-        try:
-            result = await adapter.execute(request, lambda line: None)
-        except Exception as exc:
-            logger.exception("planning provider crashed")
-            result = ExecutionResult(
-                state=ProviderState.CRASHED,
-                failure_class=FailureClass.CRASH,
-                exit_code=None,
-                duration_s=0.0,
-                summary="",
-                raw_tail=str(exc),
+            run_id = f"run-{utcnow().timestamp()}".replace(".", "")
+            request = ExecutionRequest(
+                prompt=prompt,
+                workdir=project_path,
+                role=role.value,
+                timeout_s=self.config.provider_timeout_s(provider_name),
+                run_id=run_id,
+                log_dir=log_dir,
             )
 
-        self.registry.record_failure(provider_name, result.failure_class, result.duration_s, result.raw_tail[:300])
-        self.db.update(
-            "provider_runs",
-            run_id,
-            {
-                "finished_at": utcnow().isoformat(),
-                "exit_code": result.exit_code,
-                "failure_class": result.failure_class.value,
-                "provider_state": result.state.value,
-                "summary": result.summary[:500],
-            },
-        )
+            self.db.insert(
+                "provider_runs",
+                {
+                    "id": run_id,
+                    "mission_id": self.mission_id,
+                    "provider": provider_name,
+                    "role": role.value,
+                    "command": [redact(provider_name)],
+                    "cwd": str(project_path),
+                    "started_at": utcnow().isoformat(),
+                    "failure_class": "RUNNING",
+                    "provider_state": "RUNNING",
+                },
+            )
+            self.registry.mark_busy(provider_name)
+            self.events.publish(
+                EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value
+            )
 
-        if not result.ok:
-            self._set_mission_status(MissionStatus.FAILED, blocking_issue=f"planning failed: {result.raw_tail[:300]}")
+            try:
+                result = await adapter.execute(request, lambda line: None)
+            except Exception as exc:
+                logger.exception("planning provider crashed")
+                result = ExecutionResult(
+                    state=ProviderState.CRASHED,
+                    failure_class=FailureClass.CRASH,
+                    exit_code=None,
+                    duration_s=0.0,
+                    summary="",
+                    raw_tail=str(exc),
+                )
+
+            self.db.update(
+                "provider_runs",
+                run_id,
+                {
+                    "finished_at": utcnow().isoformat(),
+                    "exit_code": result.exit_code,
+                    "failure_class": result.failure_class.value,
+                    "provider_state": result.state.value,
+                    "summary": result.summary[:500],
+                },
+            )
+
+            if result.ok:
+                self.registry.record_success(provider_name, result.duration_s)
+                used = set(json.loads(self._mission().get("providers_used") or "[]"))
+                if provider_name not in used:
+                    self.db.update(
+                        "missions",
+                        self.mission_id,
+                        {"providers_used": sorted(used | {provider_name}), "updated_at": utcnow()},
+                    )
+                break
+
+            state = self.registry.record_failure(
+                provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
+            )
+            failed = set(json.loads(self._mission().get("providers_failed") or "[]"))
+            failed.add(provider_name)
+            self.db.update(
+                "missions", self.mission_id, {"providers_failed": sorted(failed), "updated_at": utcnow()}
+            )
+            self.events.publish(
+                EventType.PROVIDER_RATE_LIMITED
+                if result.failure_class in (FailureClass.RATE_LIMIT, FailureClass.QUOTA_EXHAUSTED)
+                else EventType.PROVIDER_FAILED,
+                self.mission_id,
+                provider=provider_name,
+                failure=result.failure_class.value,
+                state=state.value,
+                role=role.value,
+            )
+            attempt += 1
+
+        if result is None or not result.ok:
+            self._set_mission_status(
+                MissionStatus.FAILED,
+                blocking_issue=f"planning exhausted after {attempt} attempt(s)",
+            )
             return False
 
         # Parse structured DAG from result

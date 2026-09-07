@@ -22,7 +22,7 @@ class FakeAdapter(ProviderAdapter):
     def __init__(self, name: str, script: list[str] | None = None):
         super().__init__(executable="true")
         self.name = name
-        # script behaviors: ok, ratelimit, crash, slow, auth, work
+        # script behaviors: ok, ratelimit, quota, crash, explode, slow, auth, work
         self.script = script or ["ok"]
         self.calls = 0
         self.flood_lines = 0  # when >0, execute() emits this many output lines
@@ -70,10 +70,13 @@ class FakeAdapter(ProviderAdapter):
         if request.role == "review" and behavior in ("ok", "work"):
             on_output("REVIEW_FINDINGS_JSON: []")
 
+        if behavior == "explode":
+            raise RuntimeError(f"fake {self.name} exploded")
         result_map = {
             "ok": (ProviderState.COMPLETED, FailureClass.NONE, 0),
             "work": (ProviderState.COMPLETED, FailureClass.NONE, 0),
             "ratelimit": (ProviderState.RATE_LIMITED, FailureClass.RATE_LIMIT, 1),
+            "quota": (ProviderState.RATE_LIMITED, FailureClass.QUOTA_EXHAUSTED, 1),
             "crash": (ProviderState.CRASHED, FailureClass.CRASH, 2),
             "auth": (ProviderState.AUTH_REQUIRED, FailureClass.AUTH, 1),
         }
