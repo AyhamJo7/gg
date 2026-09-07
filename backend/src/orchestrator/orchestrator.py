@@ -25,9 +25,11 @@ from .models import (
     FailureClass,
     MissionStatus,
     ProviderState,
+    SchedulingMode,
     utcnow,
 )
 from .notifications import Notifier, default_notifier
+from .parallel_engine import ParallelMissionEngine
 from .providers.base import ProviderAdapter
 from .providers.registry import ProviderRegistry
 
@@ -56,7 +58,7 @@ class Orchestrator:
         self.registry = ProviderRegistry(db, adapters, config)
         self.locks = ResourceLocks()
         self.notifier = notifier or default_notifier()
-        self._engines: dict[str, MissionEngine] = {}
+        self._engines: dict[str, MissionEngine | ParallelMissionEngine] = {}
         self._engine_tasks: dict[str, asyncio.Task[None]] = {}
         self._scheduler_task: asyncio.Task[None] | None = None
         self._shutdown = asyncio.Event()
@@ -312,7 +314,14 @@ class Orchestrator:
             MissionStatus.WAITING_FOR_WORKSPACE.value,
         ):
             self.db.update("missions", mission_id, {"status": MissionStatus.RECOVERING.value, "updated_at": utcnow()})
-        engine = MissionEngine(mission_id, self.db, self.events, self.registry, self.config, self.locks)
+
+        mode = row.get("scheduling_mode", SchedulingMode.SEQUENTIAL.value) if row else SchedulingMode.SEQUENTIAL.value
+        if mode == SchedulingMode.PARALLEL_SAFE.value:
+            engine: MissionEngine | ParallelMissionEngine = ParallelMissionEngine(
+                mission_id, self.db, self.events, self.registry, self.config
+            )
+        else:
+            engine = MissionEngine(mission_id, self.db, self.events, self.registry, self.config, self.locks)
         self._engines[mission_id] = engine
 
         async def runner() -> None:

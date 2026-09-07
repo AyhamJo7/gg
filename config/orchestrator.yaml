@@ -33,6 +33,14 @@ orchestration:
   max_provider_wait_seconds: 7200
   scheduler_tick_seconds: 2
 
+scheduler:
+  max_parallel_tasks: 3
+  max_parallel_per_provider:
+    claude: 1
+    codex: 1
+    agy: 1
+    opencode: 1
+
 # Role-specific provider priority (top = most preferred). Editable via UI/API.
 priority:
   planning:    [claude, codex, agy, opencode]

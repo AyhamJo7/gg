@@ -33,6 +33,7 @@ class CreateMissionRequest(BaseModel):
     task: str
     autonomy: str = Field(default="BALANCED", pattern="^(SAFE|BALANCED|AUTONOMOUS)$")
     profile: str = "balanced"
+    scheduling_mode: str = Field(default="SEQUENTIAL", pattern="^(SEQUENTIAL|PARALLEL_SAFE)$")
     start: bool = True
 
 
@@ -185,6 +186,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         if not orchestrator.db.get("projects", req.project_id):
             raise HTTPException(404, "project not found")
         mission = orchestrator.create_mission(req.project_id, req.title, req.task, req.autonomy, req.profile)
+        if req.scheduling_mode:
+            orchestrator.db.update("missions", mission["id"], {"scheduling_mode": req.scheduling_mode})
+            mission["scheduling_mode"] = req.scheduling_mode
         if req.start:
             orchestrator.start_mission(mission["id"])
         return _jsonable(mission)
@@ -283,6 +287,82 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         except IllegalMissionTransitionError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"status": "resolved"}
+
+    # ---------------- DAG / parallel task endpoints ----------------
+    @app.get("/api/missions/{mission_id}/dag")
+    def get_mission_dag(mission_id: str) -> dict[str, Any]:
+        mission = orchestrator.db.get("missions", mission_id)
+        if not mission:
+            raise HTTPException(404, "mission not found")
+        tasks = orchestrator.db.query("SELECT * FROM tasks WHERE mission_id=?", (mission_id,))
+        deps = orchestrator.db.query("SELECT * FROM task_dependencies WHERE from_task_id IN (SELECT id FROM tasks WHERE mission_id=?)", (mission_id,))
+        branches = orchestrator.db.query("SELECT * FROM task_branches WHERE task_id IN (SELECT id FROM tasks WHERE mission_id=?)", (mission_id,))
+        reservations = orchestrator.db.query(
+            """SELECT pr.*, t.title FROM provider_reservations pr
+               JOIN tasks t ON pr.task_id = t.id
+               WHERE t.mission_id=? AND pr.released_at IS NULL""",
+            (mission_id,),
+        )
+        locks = orchestrator.db.query(
+            """SELECT tl.*, t.title FROM task_locks tl
+               JOIN tasks t ON tl.task_id = t.id
+               WHERE t.mission_id=? AND tl.released_at IS NULL""",
+            (mission_id,),
+        )
+        return {
+            "mission_id": mission_id,
+            "scheduling_mode": mission.get("scheduling_mode", "SEQUENTIAL"),
+            "tasks": [_jsonable(t) for t in tasks],
+            "dependencies": [_jsonable(d) for d in deps],
+            "branches": [_jsonable(b) for b in branches],
+            "reservations": [_jsonable(r) for r in reservations],
+            "locks": [_jsonable(l) for l in locks],
+        }
+
+    @app.get("/api/missions/{mission_id}/active-tasks")
+    def get_active_tasks(mission_id: str) -> list[dict[str, Any]]:
+        mission = orchestrator.db.get("missions", mission_id)
+        if not mission:
+            raise HTTPException(404, "mission not found")
+        rows = orchestrator.db.query(
+            """SELECT t.*, pr.provider, pr.started_at as provider_started
+               FROM tasks t
+               LEFT JOIN provider_runs pr ON t.provider_run_id = pr.id
+               WHERE t.mission_id=? AND t.status IN ('CLAIMED','RUNNING','WAITING_FOR_PROVIDER')""",
+            (mission_id,),
+        )
+        return [_jsonable(r) for r in rows]
+
+    @app.post("/api/missions/{mission_id}/tasks/{task_id}/retry")
+    async def retry_task(mission_id: str, task_id: str) -> dict[str, str]:
+        task = orchestrator.db.get("tasks", task_id)
+        if not task or task["mission_id"] != mission_id:
+            raise HTTPException(404, "task not found")
+        orchestrator.db.update(
+            "tasks",
+            task_id,
+            {"status": "PENDING", "blocking_issue": "manual retry", "attempt": 0, "finished_at": None},
+        )
+        engine = orchestrator._engines.get(mission_id)
+        if engine:
+            engine.wake()
+        return {"status": "retry queued"}
+
+    @app.post("/api/missions/{mission_id}/tasks/{task_id}/cancel")
+    async def cancel_task(mission_id: str, task_id: str) -> dict[str, str]:
+        task = orchestrator.db.get("tasks", task_id)
+        if not task or task["mission_id"] != mission_id:
+            raise HTTPException(404, "task not found")
+        orchestrator.db.update(
+            "tasks",
+            task_id,
+            {"status": "CANCELLED", "finished_at": utcnow().isoformat()},
+        )
+        # Release any reservation/locks
+        from .. import task_locks as tl_module, reservations as res_module
+        res_module.release_provider_reservation(orchestrator.db, orchestrator.events, task_id)
+        tl_module.release_locks_for_task(orchestrator.db, orchestrator.events, task_id)
+        return {"status": "task cancelled"}
 
     # ---------------- git ----------------
     @app.get("/api/projects/{project_id}/git")
