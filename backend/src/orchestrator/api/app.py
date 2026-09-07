@@ -295,8 +295,14 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         if not mission:
             raise HTTPException(404, "mission not found")
         tasks = orchestrator.db.query("SELECT * FROM tasks WHERE mission_id=?", (mission_id,))
-        deps = orchestrator.db.query("SELECT * FROM task_dependencies WHERE from_task_id IN (SELECT id FROM tasks WHERE mission_id=?)", (mission_id,))
-        branches = orchestrator.db.query("SELECT * FROM task_branches WHERE task_id IN (SELECT id FROM tasks WHERE mission_id=?)", (mission_id,))
+        deps = orchestrator.db.query(
+            "SELECT * FROM task_dependencies WHERE from_task_id IN (SELECT id FROM tasks WHERE mission_id=?)",
+            (mission_id,),
+        )
+        branches = orchestrator.db.query(
+            "SELECT * FROM task_branches WHERE task_id IN (SELECT id FROM tasks WHERE mission_id=?)",
+            (mission_id,),
+        )
         reservations = orchestrator.db.query(
             """SELECT pr.*, t.title FROM provider_reservations pr
                JOIN tasks t ON pr.task_id = t.id
@@ -316,7 +322,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             "dependencies": [_jsonable(d) for d in deps],
             "branches": [_jsonable(b) for b in branches],
             "reservations": [_jsonable(r) for r in reservations],
-            "locks": [_jsonable(l) for l in locks],
+            "locks": [_jsonable(lock) for lock in locks],
         }
 
     @app.get("/api/missions/{mission_id}/active-tasks")
@@ -359,7 +365,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             {"status": "CANCELLED", "finished_at": utcnow().isoformat()},
         )
         # Release any reservation/locks
-        from .. import task_locks as tl_module, reservations as res_module
+        from .. import reservations as res_module
+        from .. import task_locks as tl_module
+
         res_module.release_provider_reservation(orchestrator.db, orchestrator.events, task_id)
         tl_module.release_locks_for_task(orchestrator.db, orchestrator.events, task_id)
         return {"status": "task cancelled"}

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .models import EventType, ProviderState, TaskStatus, utcnow
 
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _provider_concurrency_limits(config: dict) -> dict[str, int]:
+def _provider_concurrency_limits(config: dict[str, Any]) -> dict[str, int]:
     """Extract per-provider max concurrency from config."""
     defaults: dict[str, int] = {
         "claude": 1,
@@ -36,17 +36,17 @@ def _provider_concurrency_limits(config: dict) -> dict[str, int]:
     return defaults
 
 
-def _global_max_parallel(config: dict) -> int:
+def _global_max_parallel(config: dict[str, Any]) -> int:
     return int(config.get("scheduler", {}).get("max_parallel_tasks", 3))
 
 
 def provider_score(
     provider: str,
     task_role: str,
-    config: dict,
+    config: dict[str, Any],
     db: Database,
     independence_bonus: float = 0.0,
-) -> float:
+) -> tuple[float, list[str]]:
     """Calculate an arbitration score for assigning a provider to a task.
 
     Higher is better.  The score is observable, deterministic, and explainable.
@@ -107,7 +107,7 @@ def try_reserve_provider(
     events: EventBus,
     task_id: str,
     provider: str,
-    config: dict,
+    config: dict[str, Any],
 ) -> bool:
     """Atomically reserve a provider for a task.
 
@@ -196,7 +196,7 @@ def active_reservations_for_provider(db: Database, provider: str) -> int:
     return rows[0]["cnt"] if rows else 0
 
 
-def active_reservations(db: Database) -> list[dict]:
+def active_reservations(db: Database) -> list[dict[str, Any]]:
     return db.query(
         """SELECT pr.*, t.mission_id, t.title, t.status as task_status
            FROM provider_reservations pr

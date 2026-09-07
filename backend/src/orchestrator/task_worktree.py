@@ -11,7 +11,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import git_ops
 from .models import EventType, TaskBranch, utcnow
@@ -184,13 +184,13 @@ async def checkpoint_in_worktree(
     return await git_ops.checkpoint(wt_path, message, max_file_mb=max_file_mb)
 
 
-async def list_gg_worktrees(project_path: Path) -> list[dict]:
+async def list_gg_worktrees(project_path: Path) -> list[dict[str, Any]]:
     """List all worktrees managed by GG (namespaced branches)."""
     res = await git_ops._spawn_git(project_path, "worktree", "list", "--porcelain")
     if res.returncode != 0:
         return []
-    worktrees: list[dict] = []
-    current: dict = {}
+    worktrees: list[dict[str, Any]] = []
+    current: dict[str, Any] = {}
     for line in res.stdout.decode(errors="replace").splitlines():
         if line.startswith("worktree "):
             if current:

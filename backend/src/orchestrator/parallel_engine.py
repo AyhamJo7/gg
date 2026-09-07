@@ -16,15 +16,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import git_ops, integration, task_locks, task_worktree
 from .dag import DagValidationError, validate_planner_payload
 from .events import EventBus
+from .handoff import persist_handoff, render_handoff
 from .models import (
     EventType,
     FailureClass,
+    IntegrationStatus,
+    Mission,
     MissionStatus,
     ProviderState,
     Role,
@@ -34,11 +38,20 @@ from .models import (
 from .providers.base import ExecutionRequest, ExecutionResult
 from .readiness import compute_ready_tasks
 from .reservations import (
+    active_reservations_for_provider,
     provider_score,
     release_provider_reservation,
     try_reserve_provider,
 )
+from .review import (
+    REVIEW_INSTRUCTIONS,
+    mark_findings_repair_attempted,
+    open_blockers,
+    persist_findings,
+    resolve_repaired_findings,
+)
 from .security import redact
+from .workspace import inspect_workspace
 
 if TYPE_CHECKING:
     from .config import Config
@@ -97,11 +110,17 @@ class ParallelMissionEngine:
     def wake(self) -> None:
         self._wake.set()
 
-    def _mission(self) -> dict:
+    def _mission(self) -> dict[str, Any]:
         row = self.db.get("missions", self.mission_id)
         if not row:
             raise RuntimeError(f"mission {self.mission_id} vanished")
         return row
+
+    def _mission_model(self) -> Mission:
+        row = self._mission()
+        row["providers_used"] = json.loads(row.get("providers_used") or "[]")
+        row["providers_failed"] = json.loads(row.get("providers_failed") or "[]")
+        return Mission(**{k: v for k, v in row.items() if k in Mission.model_fields})
 
     def _set_mission_status(self, status: MissionStatus, **extra: Any) -> None:
         from .models import TERMINAL_STATUSES
@@ -125,6 +144,146 @@ class ParallelMissionEngine:
             raise RuntimeError("project vanished")
         return Path(project["path"])
 
+    def _require_project_path(self) -> Path:
+        if self.project_path is None:
+            raise RuntimeError("engine project path not initialized")
+        return self.project_path
+
+    def _on_spawn_handler(self, run_id: str) -> Any:
+        def handler(pid: int, pgid: int, ts: float) -> None:
+            self.db.update(
+                "provider_runs", run_id, {"pid": pid, "pgid": pgid, "started_at_ts": ts}
+            )
+        return handler
+
+    # ------------------------------------------------------------------
+    # Recovery
+    # ------------------------------------------------------------------
+
+    async def _reconcile_running_tasks(self) -> None:
+        """On startup, reconcile tasks that were RUNNING/CLAIMED before crash."""
+        running = self.db.query(
+            "SELECT * FROM tasks WHERE mission_id=? AND status IN ('RUNNING','CLAIMED')",
+            (self.mission_id,),
+        )
+        for task in running:
+            tid = task["id"]
+            runs = self.db.query(
+                "SELECT * FROM provider_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1",
+                (tid,),
+            )
+            if runs:
+                run = runs[0]
+                pid = run.get("pid")
+                if pid is not None:
+                    proc_path = f"/proc/{pid}"
+                    if not await asyncio.to_thread(os.path.exists, proc_path):
+                        # Process is gone — mark run crashed and reset task
+                        self.db.update(
+                            "provider_runs",
+                            run["id"],
+                            {
+                                "failure_class": FailureClass.CRASH.value,
+                                "provider_state": ProviderState.CRASHED.value,
+                                "finished_at": utcnow().isoformat(),
+                            },
+                        )
+                        release_provider_reservation(self.db, self.events, tid)
+                        task_locks.release_locks_for_task(self.db, self.events, tid)
+
+                        attempt = int(task.get("attempts", 0)) + 1
+                        max_attempts = int(task.get("max_attempts", 3))
+                        self.db.update("tasks", tid, {"attempts": attempt})
+                        if attempt < max_attempts:
+                            self.db.update(
+                                "tasks",
+                                tid,
+                                {
+                                    "status": TaskStatus.PENDING.value,
+                                    "blocking_issue": f"SIGKILL recovery: process {pid} vanished",
+                                },
+                            )
+                        else:
+                            self.db.update(
+                                "tasks",
+                                tid,
+                                {
+                                    "status": TaskStatus.FAILED.value,
+                                    "blocking_issue": f"SIGKILL recovery: process {pid} vanished, exhausted attempts",
+                                },
+                            )
+                        self.events.publish(
+                            EventType.TASK_FAILED,
+                            mission_id=self.mission_id,
+                            task_id=tid,
+                            reason="sigkill_recovery",
+                        )
+                        continue
+            else:
+                # No provider_run record — just clean up and reset
+                release_provider_reservation(self.db, self.events, tid)
+                task_locks.release_locks_for_task(self.db, self.events, tid)
+                self.db.update(
+                    "tasks",
+                    tid,
+                    {
+                        "status": TaskStatus.PENDING.value,
+                        "blocking_issue": "SIGKILL recovery: no active process record",
+                    },
+                )
+
+    # ------------------------------------------------------------------
+    # Blockage detection
+    # ------------------------------------------------------------------
+
+    def _detect_permanent_blockage(self) -> None:
+        """Fail tasks whose dependencies are permanently terminal."""
+        non_terminal = self.db.query(
+            "SELECT * FROM tasks WHERE mission_id=? AND status NOT IN ('COMPLETED','FAILED','CANCELLED','UNVERIFIED')",
+            (self.mission_id,),
+        )
+        for task in non_terminal:
+            tid = task["id"]
+            deps = self.db.query(
+                "SELECT from_task_id FROM task_dependencies WHERE to_task_id=?",
+                (tid,),
+            )
+            for dep in deps:
+                dep_task = self.db.get("tasks", dep["from_task_id"])
+                if dep_task and dep_task["status"] in (
+                    TaskStatus.FAILED.value,
+                    TaskStatus.CANCELLED.value,
+                ):
+                    self.db.update(
+                        "tasks",
+                        tid,
+                        {
+                            "status": TaskStatus.FAILED.value,
+                            "blocking_issue": f"permanently blocked: dependency {dep['from_task_id']} failed",
+                        },
+                    )
+                    self.events.publish(
+                        EventType.TASK_FAILED,
+                        mission_id=self.mission_id,
+                        task_id=tid,
+                        reason="permanent_blockage",
+                    )
+                    break
+
+    def _reset_waiting_without_reservation(self) -> None:
+        """Reset WAITING_FOR_PROVIDER tasks that lost their reservation."""
+        waiting = self.db.query(
+            "SELECT id FROM tasks WHERE mission_id=? AND status=?",
+            (self.mission_id, TaskStatus.WAITING_FOR_PROVIDER.value),
+        )
+        for w in waiting:
+            has_res = self.db.query(
+                "SELECT 1 FROM provider_reservations WHERE task_id=? AND released_at IS NULL",
+                (w["id"],),
+            )
+            if not has_res:
+                self.db.update("tasks", w["id"], {"status": TaskStatus.PENDING.value})
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
@@ -132,6 +291,9 @@ class ParallelMissionEngine:
     async def run(self) -> None:
         self.project_path = self._project_path()
         _ = self._mission()
+
+        # SIGKILL recovery
+        await self._reconcile_running_tasks()
 
         # Ensure we have a DAG
         tasks = self.db.query("SELECT * FROM tasks WHERE mission_id=?", (self.mission_id,))
@@ -162,6 +324,12 @@ class ParallelMissionEngine:
         while not self._shutdown:
             if self._check_pause_cancel():
                 return
+
+            # Wake up WAITING_FOR_PROVIDER tasks that lost their reservation
+            self._reset_waiting_without_reservation()
+
+            # Detect permanent blockage before terminal check
+            self._detect_permanent_blockage()
 
             # Check if all tasks are terminal
             if self._all_tasks_terminal():
@@ -233,10 +401,10 @@ class ParallelMissionEngine:
             "AND status NOT IN ('COMPLETED','FAILED','CANCELLED','UNVERIFIED')",
             (self.mission_id,),
         )
-        return rows[0]["cnt"] == 0
+        return int(rows[0]["cnt"]) == 0
 
     async def _on_all_tasks_terminal(self) -> None:
-        """When all tasks are terminal, run integration + verification."""
+        """When all tasks are terminal, run integration + review + verification."""
         mission = self._mission()
         if mission["status"] in (MissionStatus.CANCELLED.value, MissionStatus.FAILED.value):
             return
@@ -254,28 +422,44 @@ class ParallelMissionEngine:
             )
             return
 
-        # Integration
-        self._set_mission_status(MissionStatus.IMPLEMENTING)  # reuse status or add INTEGRATING?
-        result = await integration.run_integration(self.db, self.events, self.project_path, self.mission_id)
+        project_path = self._require_project_path()
 
-        if result["status"] == integration.IntegrationStatus.MERGE_CONFLICT.value:
-            self._set_mission_status(
-                MissionStatus.WAITING_FOR_HUMAN,
-                blocking_issue=f"merge conflict: {', '.join(result['conflict_files'])}",
-            )
-            return
-        if result["status"] == integration.IntegrationStatus.FAILED.value:
-            self._set_mission_status(MissionStatus.FAILED, blocking_issue=f"integration failed: {result['summary']}")
+        # Integration idempotency
+        completed_integrations = self.db.query(
+            "SELECT * FROM task_integrations WHERE mission_id=? AND status=? ORDER BY created_at DESC LIMIT 1",
+            (self.mission_id, IntegrationStatus.COMPLETED.value),
+        )
+        if completed_integrations:
+            merged_commit = completed_integrations[0].get("merged_commit")
+            logger.info("integration already completed for mission %s at %s", self.mission_id, merged_commit)
+        else:
+            self._set_mission_status(MissionStatus.IMPLEMENTING)
+            result = await integration.run_integration(self.db, self.events, project_path, self.mission_id)
+
+            if result["status"] == IntegrationStatus.MERGE_CONFLICT.value:
+                self._set_mission_status(
+                    MissionStatus.WAITING_FOR_HUMAN,
+                    blocking_issue=f"merge conflict: {', '.join(result['conflict_files'])}",
+                )
+                return
+            if result["status"] == IntegrationStatus.FAILED.value:
+                self._set_mission_status(
+                    MissionStatus.FAILED,
+                    blocking_issue=f"integration failed: {result['summary']}",
+                )
+                return
+
+        # Certified review pipeline
+        review_ok = await self._phase_review_loop()
+        if not review_ok:
             return
 
-        # Review + verification (reuse v1 engine logic via direct calls)
-        # For Phase 2A, run final validation directly
+        # Final validation
         from .verify import run_verification
-        from .workspace import inspect_workspace
 
         self._set_mission_status(MissionStatus.FINAL_VALIDATION)
-        workspace = await inspect_workspace(self.project_path, self.config.allowed_roots())
-        report = await run_verification(workspace, self.db, self.events, self.mission_id, self.project_path)
+        workspace = await inspect_workspace(project_path, self.config.allowed_roots())
+        report = await run_verification(workspace, self.db, self.events, self.mission_id, project_path)
 
         if not report.attempted:
             self._set_mission_status(
@@ -292,12 +476,308 @@ class ParallelMissionEngine:
             )
             return
 
-        head = await git_ops.head_sha(self.project_path)
+        head = await git_ops.head_sha(project_path)
         self._set_mission_status(MissionStatus.COMPLETED, current_provider=None, git_head=head)
         self.events.publish(
             EventType.MISSION_COMPLETED,
             self.mission_id,
         )
+
+    # ------------------------------------------------------------------
+    # Review pipeline (mirrors v1 MissionEngine)
+    # ------------------------------------------------------------------
+
+    async def _phase_review_loop(self) -> bool:
+        if not self.config.get("orchestration.review_required", True):
+            return True
+        max_cycles = int(self.config.get("orchestration.max_repair_cycles", 3))
+        max_unparseable_attempts = int(self.config.get("orchestration.max_unparseable_review_attempts", 2))
+        while True:
+            result = await self._run_provider_phase_for_role(Role.REVIEW)
+            if result is None:
+                return False
+            review_input = result.assistant_text + "\n" + result.summary
+            parsed_ok, findings = persist_findings(self.db, self.mission_id, review_input)
+            self._record_review_provenance(review_parsed=parsed_ok)
+            for f in findings:
+                self.events.publish(
+                    EventType.REVIEW_FINDING_CREATED,
+                    self.mission_id,
+                    severity=f.severity.value,
+                    description=f.description[:200],
+                )
+            if not parsed_ok:
+                unparseable_count = self._unparseable_review_count()
+                if unparseable_count >= max_unparseable_attempts:
+                    self._set_mission_status(
+                        MissionStatus.UNVERIFIED,
+                        blocking_issue="reviewer output unparseable after retries — cannot verify code review",
+                        current_provider=None,
+                    )
+                    return False
+                continue
+
+            blockers = open_blockers(self.db, self.mission_id)
+            if not blockers:
+                resolve_repaired_findings(self.db, self.mission_id)
+                return True
+            cycles = int(self._mission().get("repair_cycles", 0))
+            if cycles >= max_cycles:
+                self._set_mission_status(
+                    MissionStatus.UNVERIFIED,
+                    blocking_issue=f"{len(blockers)} blocker/high findings remain after {cycles} repair cycles",
+                    current_provider=None,
+                )
+                return False
+            self.db.update(
+                "missions",
+                self.mission_id,
+                {"repair_cycles": cycles + 1, "updated_at": utcnow().isoformat()},
+            )
+            self._set_mission_status(MissionStatus.REPAIRING)
+            findings_text = "\n".join(
+                f"- [{f['severity']}] {f['file'] or ''}: {f['description']} → {f['recommended_fix']}" for f in blockers
+            )
+            repair = await self._run_provider_phase_for_role(
+                Role.REPAIR, extra_context=f"## Open findings to fix\n{findings_text}"
+            )
+            if repair is None:
+                return False
+            mark_findings_repair_attempted(self.db, self.mission_id)
+            self._set_mission_status(MissionStatus.REVIEWING)
+
+    async def _run_provider_phase_for_role(self, role: Role, extra_context: str = "") -> ExecutionResult | None:
+        provider_name = self._select_provider_for_role(role)
+        if not provider_name:
+            return None
+
+        adapter = self.registry.get_adapter(provider_name)
+        if not adapter:
+            return None
+
+        project_path = self._require_project_path()
+
+        run_id = f"run-{utcnow().timestamp()}".replace(".", "")
+        log_dir = project_path / ".orchestrator" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        handoff_content = await self._make_handoff(role, None, provider_name, f"Run {role.value} phase")
+        prompt = self._build_prompt(role, handoff_content, extra_context)
+
+        request = ExecutionRequest(
+            prompt=prompt,
+            workdir=project_path,
+            role=role.value,
+            timeout_s=self.config.provider_timeout_s(provider_name),
+            run_id=run_id,
+            log_dir=log_dir,
+            on_spawn=self._on_spawn_handler(run_id),
+        )
+
+        commit_before = await git_ops.head_sha(project_path)
+        self.db.insert(
+            "provider_runs",
+            {
+                "id": run_id,
+                "mission_id": self.mission_id,
+                "provider": provider_name,
+                "role": role.value,
+                "command": [redact(provider_name)],
+                "cwd": str(project_path),
+                "started_at": utcnow().isoformat(),
+                "failure_class": "RUNNING",
+                "provider_state": "RUNNING",
+                "stdout_path": str(log_dir / f"{run_id}.stdout.log"),
+                "stderr_path": str(log_dir / f"{run_id}.stderr.log"),
+                "git_commit_before": commit_before,
+            },
+        )
+        self.registry.mark_busy(provider_name)
+
+        try:
+            result = await adapter.execute(request, lambda line: None)
+        except Exception as exc:
+            logger.exception("provider %s crashed for role %s", provider_name, role.value)
+            result = ExecutionResult(
+                state=ProviderState.CRASHED,
+                failure_class=FailureClass.CRASH,
+                exit_code=None,
+                duration_s=0.0,
+                summary="",
+                raw_tail=str(exc),
+            )
+
+        commit_after = await git_ops.head_sha(project_path)
+        self._record_run(run_id, provider_name, role, result, commit_before, commit_after)
+
+        if result.ok:
+            self.registry.record_success(provider_name, result.duration_s)
+        else:
+            self.registry.record_failure(
+                provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
+            )
+
+        return result
+
+    async def _make_handoff(
+        self,
+        role: Role,
+        from_provider: str | None,
+        to_provider: str | None,
+        next_action: str,
+    ) -> str:
+        mission = self._mission_model()
+        findings = [f"[{f['severity']}] {f['description']}" for f in open_blockers(self.db, mission.id)]
+        completed_rows = self.db.query(
+            "SELECT summary FROM tasks WHERE mission_id=? AND status='COMPLETED' ORDER BY finished_at ASC",
+            (self.mission_id,),
+        )
+        completed_work = [r["summary"][:200] for r in completed_rows if r.get("summary")]
+
+        project_path = self._require_project_path()
+        workspace = await inspect_workspace(project_path, self.config.allowed_roots())
+
+        content = render_handoff(
+            mission=mission,
+            role=role.value,
+            from_provider=from_provider,
+            to_provider=to_provider,
+            workspace_summary=workspace.summary() if workspace else "unknown",
+            completed_work=completed_work[-15:],
+            tests=[],
+            review_findings=findings,
+            next_action=next_action,
+            git_head=mission.git_head,
+        )
+        handoff = persist_handoff(
+            self.db, project_path, mission, role.value, content, from_provider, to_provider, mission.git_head
+        )
+        self.events.publish(EventType.HANDOFF_CREATED, self.mission_id, handoff_id=handoff.id, role=role.value)
+        return content
+
+    def _build_prompt(self, role: Role, handoff_content: str, extra_context: str) -> str:
+        role_prompts: dict[Role, str] = {
+            Role.REVIEW: REVIEW_INSTRUCTIONS,
+            Role.REPAIR: "Fix the open review findings listed below. Verify your fixes by running relevant tests.",
+        }
+        sections = [
+            f"You are working as the **{role.value}** engineer in a multi-provider orchestrated mission.",
+            "",
+            handoff_content,
+            "",
+            f"## Your instructions for this phase\n{role_prompts.get(role, 'Work autonomously.')}",
+        ]
+        if extra_context:
+            sections.append(f"## Additional context\n{extra_context}")
+        sections.append(
+            "\n## Output contract\nWork autonomously in the current directory. "
+            "Do not ask questions; make reasonable decisions and document them. "
+            "When finished, end with a one-paragraph summary of what you did."
+        )
+        return "\n".join(sections)
+
+    def _record_run(
+        self,
+        run_id: str,
+        provider: str,
+        role: Role,
+        result: ExecutionResult,
+        before: str | None,
+        after: str | None,
+    ) -> None:
+        self.db.update(
+            "provider_runs",
+            run_id,
+            {
+                "command": [redact(a if len(a) < 300 else f"<prompt {len(a)} chars>") for a in result.argv],
+                "started_at": result.started_at,
+                "finished_at": result.finished_at,
+                "exit_code": result.exit_code,
+                "failure_class": result.failure_class.value,
+                "provider_state": result.state.value,
+                "stdout_path": str(result.stdout_path) if result.stdout_path else None,
+                "stderr_path": str(result.stderr_path) if result.stderr_path else None,
+                "git_commit_before": before,
+                "git_commit_after": after,
+                "summary": result.summary[:500],
+                "pid": result.pid,
+                "pgid": result.pgid,
+            },
+        )
+
+    def _record_review_provenance(self, review_parsed: bool = True) -> None:
+        implementer = self._last_provider_for(Role.IMPLEMENTATION)
+        rows = self.db.query(
+            "SELECT provider FROM provider_runs WHERE mission_id=? AND role='review' AND failure_class='NONE' "
+            "ORDER BY started_at DESC LIMIT 1",
+            (self.mission_id,),
+        )
+        if not rows:
+            return
+        reviewer = rows[0]["provider"]
+        if implementer is None:
+            independent = False
+            reason = "implementation provider unknown (cannot prove independence)"
+        elif reviewer == implementer:
+            independent = False
+            reason = "no alternative provider eligible; reviewer is the implementer (self-review)"
+        else:
+            independent = True
+            reason = None
+        self.db.insert(
+            "reviews",
+            {
+                "id": f"rev-{utcnow().timestamp()}".replace(".", ""),
+                "mission_id": self.mission_id,
+                "implementation_provider": implementer,
+                "review_provider": reviewer,
+                "independent": int(independent),
+                "degradation_reason": reason,
+                "review_parsed": int(review_parsed),
+                "created_at": utcnow().isoformat(),
+            },
+        )
+        self.events.publish(
+            EventType.REVIEW_RECORDED,
+            self.mission_id,
+            review_provider=reviewer,
+            implementation_provider=implementer,
+            independent=independent,
+            degradation_reason=reason,
+        )
+
+    def _unparseable_review_count(self) -> int:
+        rows = self.db.query(
+            "SELECT COUNT(*) as cnt FROM reviews WHERE mission_id=? AND review_parsed=0",
+            (self.mission_id,),
+        )
+        return rows[0]["cnt"] if rows else 0
+
+    def _last_provider_for(self, role: Role) -> str | None:
+        rows = self.db.query(
+            """SELECT provider FROM provider_runs WHERE mission_id=? AND role=? AND failure_class='NONE'
+               ORDER BY started_at DESC LIMIT 1""",
+            (self.mission_id, role.value),
+        )
+        return rows[0]["provider"] if rows else None
+
+    def _select_provider_for_role(self, role: Role) -> str | None:
+        priorities: list[str] = self.config.priority_for(role.value)
+        if not priorities:
+            priorities = list(self.registry.adapters.keys())
+        eligible = [p for p in priorities if self.registry.is_eligible(p)]
+
+        if role == Role.REVIEW and len(eligible) > 1:
+            implementer = self._last_provider_for(Role.IMPLEMENTATION)
+            alternatives = [p for p in eligible if p != implementer]
+            if alternatives:
+                eligible = alternatives
+        if role == Role.REPAIR and len(eligible) > 1:
+            reviewer = self._last_provider_for(Role.REVIEW)
+            alternatives = [p for p in eligible if p != reviewer]
+            if alternatives:
+                eligible = alternatives
+        return eligible[0] if eligible else None
 
     # ------------------------------------------------------------------
     # Planning → DAG
@@ -306,9 +786,8 @@ class ParallelMissionEngine:
     async def _run_planning_phase(self) -> bool:
         """Run the planning provider and convert output to a persisted DAG."""
 
-        # Temporarily use the v1 engine for planning
-        # In a full implementation, we'd refactor to share planning logic.
-        # For Phase 2A, we run planning via a simplified inline flow.
+        project_path = self._require_project_path()
+
         role = Role.PLANNING
         provider_name = self._select_provider(role)
         if not provider_name:
@@ -322,12 +801,12 @@ class ParallelMissionEngine:
 
         prompt = self._build_planning_prompt()
         run_id = f"run-{utcnow().timestamp()}".replace(".", "")
-        log_dir = self.project_path / ".orchestrator" / "logs"
+        log_dir = project_path / ".orchestrator" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
 
         request = ExecutionRequest(
             prompt=prompt,
-            workdir=self.project_path,
+            workdir=project_path,
             role=role.value,
             timeout_s=self.config.provider_timeout_s(provider_name),
             run_id=run_id,
@@ -342,7 +821,7 @@ class ParallelMissionEngine:
                 "provider": provider_name,
                 "role": role.value,
                 "command": [redact(provider_name)],
-                "cwd": str(self.project_path),
+                "cwd": str(project_path),
                 "started_at": utcnow().isoformat(),
                 "failure_class": "RUNNING",
                 "provider_state": "RUNNING",
@@ -458,39 +937,35 @@ class ParallelMissionEngine:
             f"Use workspace_scope to declare which files each task will touch.\n"
         )
 
-    def _extract_dag_from_output(self, text: str) -> dict | None:
+    def _extract_dag_from_output(self, text: str) -> dict[str, Any] | None:
         """Extract JSON DAG from planner output."""
         import re
 
-        # Try to find JSON block
+        candidates: list[str] = []
         m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
         if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                pass
-        # Try raw JSON object
-        m = re.search(r"(\{[\s\S]*\"tasks\"\s*:\s*\[.*?\]\s*\})", text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                pass
-        # Fallback: look for any top-level object
+            candidates.append(m.group(1))
+        m2 = re.search(r"(\{[\s\S]*\"tasks\"\s*:\s*\[.*?\]\s*\})", text, re.DOTALL)
+        if m2:
+            candidates.append(m2.group(1))
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
+            candidates.append(text[start : end + 1])
+        for payload in candidates:
             try:
-                return json.loads(text[start : end + 1])
+                parsed = json.loads(payload)
+                if isinstance(parsed, dict):
+                    return parsed
             except json.JSONDecodeError:
-                pass
+                continue
         return None
 
     # ------------------------------------------------------------------
     # Task launch
     # ------------------------------------------------------------------
 
-    async def _launch_task(self, task: dict) -> bool:
+    async def _launch_task(self, task: dict[str, Any]) -> bool:
         tid = task["id"]
         # Check if already running
         if tid in self._running_tasks:
@@ -526,9 +1001,10 @@ class ParallelMissionEngine:
 
         # Create worktree
         mission = self._mission()
+        project_path = self._require_project_path()
         try:
             branch_record = await task_worktree.create_task_worktree(
-                self.db, self.events, self.project_path, mission["id"], tid
+                self.db, self.events, project_path, mission["id"], tid
             )
         except git_ops.GitError as exc:
             logger.warning("worktree creation failed for task %s: %s", tid, exc)
@@ -554,7 +1030,14 @@ class ParallelMissionEngine:
             provider=provider_name,
         )
 
-        coro = self._task_runner(tid, provider_name, branch_record.worktree_path)
+        wt_path = branch_record.worktree_path
+        if not wt_path:
+            logger.error("worktree path missing for task %s", tid)
+            release_provider_reservation(self.db, self.events, tid)
+            task_locks.release_locks_for_task(self.db, self.events, tid)
+            self.db.update("tasks", tid, {"status": TaskStatus.FAILED.value, "blocking_issue": "worktree path missing"})
+            return False
+        coro = self._task_runner(tid, provider_name, wt_path)
         self._running_tasks[tid] = asyncio.create_task(coro)
         return True
 
@@ -609,9 +1092,7 @@ class ParallelMissionEngine:
             timeout_s=self.config.provider_timeout_s(provider_name),
             run_id=run_id,
             log_dir=log_dir,
-            on_spawn=lambda pid, pgid, ts, rid=run_id: self.db.update(
-                "provider_runs", rid, {"pid": pid, "pgid": pgid, "started_at_ts": ts}
-            ),
+            on_spawn=self._on_spawn_handler(run_id),
         )
 
         commit_before = await git_ops.head_sha(Path(worktree_path))
@@ -668,6 +1149,34 @@ class ParallelMissionEngine:
 
         if result.ok:
             self.registry.record_success(provider_name, result.duration_s)
+
+            # Checkpoint before marking COMPLETED
+            try:
+                max_file_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
+                checkpoint_sha = await git_ops.checkpoint(
+                    Path(worktree_path),
+                    f"orchestrator: checkpoint task {task_id}",
+                    max_file_mb=max_file_mb,
+                )
+            except git_ops.GitCheckpointError as exc:
+                self.db.update(
+                    "tasks",
+                    task_id,
+                    {
+                        "status": TaskStatus.FAILED.value,
+                        "finished_at": utcnow().isoformat(),
+                        "blocking_issue": f"checkpoint failed: {exc}",
+                    },
+                )
+                self.events.publish(
+                    EventType.TASK_FAILED,
+                    mission_id=self.mission_id,
+                    task_id=task_id,
+                    provider=provider_name,
+                    failure=FailureClass.CRASH.value,
+                )
+                return
+
             self.db.update(
                 "tasks",
                 task_id,
@@ -676,7 +1185,7 @@ class ParallelMissionEngine:
                     "finished_at": utcnow().isoformat(),
                     "summary": result.summary,
                     "provider_run_id": run_id,
-                    "checkpoint_after": commit_after,
+                    "checkpoint_after": checkpoint_sha,
                 },
             )
             self.events.publish(
@@ -724,7 +1233,7 @@ class ParallelMissionEngine:
                 failure=result.failure_class.value,
             )
 
-    def _build_task_prompt(self, task: dict, provider_name: str) -> str:
+    def _build_task_prompt(self, task: dict[str, Any], provider_name: str) -> str:
         role = task.get("role", "implementation")
         title = task.get("title", "")
         description = task.get("description", "")
@@ -737,16 +1246,25 @@ class ParallelMissionEngine:
             f"When finished, end with a one-paragraph summary of what you did."
         )
 
-    def _arbitrate_provider(self, task: dict, role: Role, preferred: list[str]) -> str | None:
-        """Select best provider for a task."""
+    def _arbitrate_provider(self, task: dict[str, Any], role: Role, preferred: list[str]) -> str | None:
+        """Select best provider for a task, respecting concurrency limits."""
+
+        def _is_candidate(provider: str) -> bool:
+            if self.registry.is_eligible(provider):
+                return True
+            row = self.db.get("providers", provider, key="name")
+            if row and row.get("state") == ProviderState.BUSY.value and self._provider_has_capacity(provider):
+                return True
+            return False
+
         candidates: list[str] = []
         if preferred:
-            candidates = [p for p in preferred if self.registry.is_eligible(p)]
+            candidates = [p for p in preferred if _is_candidate(p)]
         if not candidates:
             priorities = self.config.priority_for(role.value)
-            candidates = [p for p in priorities if self.registry.is_eligible(p)]
+            candidates = [p for p in priorities if _is_candidate(p)]
         if not candidates:
-            candidates = [p for p in self.registry.adapters if self.registry.is_eligible(p)]
+            candidates = [p for p in self.registry.adapters if _is_candidate(p)]
         if not candidates:
             return None
 
@@ -759,6 +1277,22 @@ class ParallelMissionEngine:
                 best_score = score
                 best = provider
         return best
+
+    def _provider_has_capacity(self, provider: str) -> bool:
+        limits: dict[str, int] = {
+            "claude": 1,
+            "codex": 1,
+            "agy": 1,
+            "opencode": 1,
+        }
+        overrides = self.config.raw.get("scheduler", {}).get("max_parallel_per_provider", {})
+        if isinstance(overrides, dict):
+            for k, v in overrides.items():
+                if isinstance(v, int):
+                    limits[k] = v
+        max_for_provider = limits.get(provider, 1)
+        active = active_reservations_for_provider(self.db, provider)
+        return active < max_for_provider
 
     def _select_provider(self, role: Role) -> str | None:
         """Simple provider selection for planning phase."""

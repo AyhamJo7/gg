@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .models import EventType, LockType, utcnow
 
@@ -97,14 +97,14 @@ def release_locks_for_task(
         )
 
 
-def locks_for_task(db: Database, task_id: str) -> list[dict]:
+def locks_for_task(db: Database, task_id: str) -> list[dict[str, Any]]:
     return db.query(
         "SELECT * FROM task_locks WHERE task_id=? AND released_at IS NULL ORDER BY acquired_at",
         (task_id,),
     )
 
 
-def compute_task_locks(task_row: dict) -> list[tuple[LockType, str]]:
+def compute_task_locks(task_row: dict[str, Any]) -> list[tuple[LockType, str]]:
     """Derive the lock set a task needs from its workspace_scope."""
     scope_raw = task_row.get("workspace_scope") or "[]"
     if isinstance(scope_raw, str):

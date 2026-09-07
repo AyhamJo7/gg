@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .models import MissionStatus, TaskStatus
 
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _task_rows(db: Database, mission_id: str) -> list[dict]:
+def _task_rows(db: Database, mission_id: str) -> list[dict[str, Any]]:
     return db.query("SELECT * FROM tasks WHERE mission_id=? ORDER BY priority DESC, created_at ASC", (mission_id,))
 
 
@@ -29,14 +29,14 @@ def _deps_for(db: Database, task_id: str) -> list[str]:
     return [r["from_task_id"] for r in rows]
 
 
-def _active_locks(db: Database, resource_key: str) -> list[dict]:
+def _active_locks(db: Database, resource_key: str) -> list[dict[str, Any]]:
     return db.query(
         "SELECT * FROM task_locks WHERE resource_key=? AND released_at IS NULL",
         (resource_key,),
     )
 
 
-def _open_gates_for_mission(db: Database, mission_id: str) -> list[dict]:
+def _open_gates_for_mission(db: Database, mission_id: str) -> list[dict[str, Any]]:
     return db.query(
         "SELECT * FROM human_gates WHERE mission_id=? AND status='open'",
         (mission_id,),
@@ -92,7 +92,7 @@ def _scopes_conflict(a: str, b: str) -> bool:
     return False
 
 
-def _task_has_resource_conflict(db: Database, task_row: dict, ready_task_ids: set[str]) -> tuple[bool, str]:
+def _task_has_resource_conflict(db: Database, task_row: dict[str, Any], ready_task_ids: set[str]) -> tuple[bool, str]:
     """Return (conflict, reason) for the task against currently running/claimed tasks."""
     scope_raw = task_row.get("workspace_scope") or "[]"
     if isinstance(scope_raw, str):
@@ -147,7 +147,32 @@ def _task_has_resource_conflict(db: Database, task_row: dict, ready_task_ids: se
     return False, ""
 
 
-def compute_ready_tasks(db: Database, mission_id: str) -> list[dict]:
+def detect_permanent_blockage(db: Database, mission_id: str) -> list[str]:
+    """Return task IDs that are permanently blocked due to failed/cancelled dependencies."""
+    rows = _task_rows(db, mission_id)
+    status_map: dict[str, str] = {r["id"]: r["status"] for r in rows}
+    permanently_blocked: list[str] = []
+    for task in rows:
+        tid = task["id"]
+        status = status_map.get(tid, TaskStatus.PENDING.value)
+        terminal = (
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+            TaskStatus.UNVERIFIED.value,
+        )
+        if status in terminal:
+            continue
+        deps = _deps_for(db, tid)
+        for dep in deps:
+            dep_status = status_map.get(dep, TaskStatus.PENDING.value)
+            if dep_status in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
+                permanently_blocked.append(tid)
+                break
+    return permanently_blocked
+
+
+def compute_ready_tasks(db: Database, mission_id: str) -> list[dict[str, Any]]:
     """Idempotent computation of tasks that are READY.
 
     A task is READY when:
@@ -178,14 +203,19 @@ def compute_ready_tasks(db: Database, mission_id: str) -> list[dict]:
     if open_gates:
         return []
 
-    ready: list[dict] = []
+    ready: list[dict[str, Any]] = []
     ready_ids: set[str] = set()
 
     for task in rows:
         tid = task["id"]
         status = status_map.get(tid, TaskStatus.PENDING.value)
 
-        if status not in (TaskStatus.PENDING.value, TaskStatus.BLOCKED.value):
+        # WAITING_FOR_PROVIDER is eligible for re-evaluation
+        if status not in (
+            TaskStatus.PENDING.value,
+            TaskStatus.BLOCKED.value,
+            TaskStatus.WAITING_FOR_PROVIDER.value,
+        ):
             continue
 
         deps = _deps_for(db, tid)

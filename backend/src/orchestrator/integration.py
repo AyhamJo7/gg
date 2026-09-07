@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import git_ops
 from .models import EventType, IntegrationStatus, TaskStatus, utcnow
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_completed_branches(db: Database, mission_id: str) -> list[dict]:
+def _get_completed_branches(db: Database, mission_id: str) -> list[dict[str, Any]]:
     """Return task branches for tasks that are COMPLETED."""
     return db.query(
         """SELECT tb.*, t.id as task_id, t.title, t.assigned_provider, t.checkpoint_after
@@ -45,7 +45,7 @@ async def run_integration(
     project_path: Path,
     mission_id: str,
     target_branch: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Integrate all completed task branches into the main branch.
 
     Returns a dict with:
@@ -95,59 +95,73 @@ async def run_integration(
             branch = branch_info["branch_name"]
             task_id = branch_info["task_id"]
 
+            # Idempotency: skip if this branch is already merged into HEAD
+            already_merged = await git_ops._spawn_git(
+                project_path, "branch", "--merged", "HEAD", "--list", branch
+            )
+            if already_merged.stdout.strip():
+                summary_parts.append(f"already merged {branch}")
+                continue
+
             # Attempt merge
             merge_res = await git_ops._spawn_git(project_path, "merge", "--no-commit", "--no-ff", branch)
 
             if merge_res.returncode != 0:
-                # Check if it's a real conflict or just nothing to merge
-                status = await git_ops.status(project_path)
-                if status.modified or status.added or status.deleted or status.renamed:
-                    # Check for conflict markers in index
-                    diff_res = await git_ops._spawn_git(project_path, "diff", "--name-only", "--diff-filter=U")
-                    conflict_files_raw = diff_res.stdout.decode(errors="replace").strip().splitlines()
-                    conflict_files = [f for f in conflict_files_raw if f]
+                # Detect real merge conflicts using unmerged index entries
+                ls_files_res = await git_ops._spawn_git(project_path, "ls-files", "-u")
+                unmerged_raw = ls_files_res.stdout.decode(errors="replace").strip().splitlines()
+                conflict_files = sorted({line.split()[-1] for line in unmerged_raw if line})
 
-                    if conflict_files:
-                        # Abort merge, record conflict
-                        await git_ops._git(project_path, "merge", "--abort", check=False)
-                        db.update(
-                            "task_integrations",
-                            integration_id,
-                            {
-                                "status": IntegrationStatus.MERGE_CONFLICT.value,
-                                "conflict_files": json.dumps(conflict_files),
-                                "finished_at": utcnow().isoformat(),
-                            },
-                        )
-                        events.publish(
-                            EventType.MERGE_CONFLICT,
-                            mission_id=mission_id,
-                            branch=branch,
-                            files=conflict_files,
-                        )
-                        return {
-                            "status": IntegrationStatus.MERGE_CONFLICT.value,
-                            "merged_commit": None,
-                            "conflict_files": conflict_files,
-                            "summary": f"merge conflict integrating {branch}: {', '.join(conflict_files)}",
-                        }
-
-                    # No conflict markers — maybe just untracked files or similar
-                    # Commit what we have
-                    await git_ops._git(project_path, "add", "-A")
-                    await git_ops._git(
-                        project_path,
-                        "commit",
-                        "-m",
-                        f"orchestrator: integrate {branch} (task {task_id})",
-                        check=False,
-                    )
-                else:
-                    # Nothing to merge, already up to date
+                if conflict_files:
+                    # Abort merge, record conflict, preserve branches
                     await git_ops._git(project_path, "merge", "--abort", check=False)
-            else:
-                # Merge succeeded — commit
-                await git_ops._git(project_path, "commit", "-m", f"orchestrator: integrate {branch} (task {task_id})")
+                    db.update(
+                        "task_integrations",
+                        integration_id,
+                        {
+                            "status": IntegrationStatus.MERGE_CONFLICT.value,
+                            "conflict_files": json.dumps(conflict_files),
+                            "finished_at": utcnow().isoformat(),
+                        },
+                    )
+                    events.publish(
+                        EventType.MERGE_CONFLICT,
+                        mission_id=mission_id,
+                        branch=branch,
+                        files=conflict_files,
+                    )
+                    return {
+                        "status": IntegrationStatus.MERGE_CONFLICT.value,
+                        "merged_commit": None,
+                        "conflict_files": conflict_files,
+                        "summary": f"merge conflict integrating {branch}: {', '.join(conflict_files)}",
+                    }
+
+                # No unmerged entries but merge failed — treat as failure
+                await git_ops._git(project_path, "merge", "--abort", check=False)
+                db.update(
+                    "task_integrations",
+                    integration_id,
+                    {
+                        "status": IntegrationStatus.FAILED.value,
+                        "finished_at": utcnow().isoformat(),
+                        "summary": f"merge failed for {branch}: {merge_res.stderr.decode(errors='replace')[:400]}",
+                    },
+                )
+                return {
+                    "status": IntegrationStatus.FAILED.value,
+                    "merged_commit": None,
+                    "conflict_files": [],
+                    "summary": f"merge failed for {branch}",
+                }
+
+            # Merge succeeded cleanly — commit
+            await git_ops._git(
+                project_path,
+                "commit",
+                "-m",
+                f"orchestrator: integrate {branch} (task {task_id})",
+            )
 
             merged_commit = await git_ops.head_sha(project_path)
             summary_parts.append(f"integrated {branch}")
@@ -199,7 +213,7 @@ async def run_integration(
     }
 
 
-def get_latest_integration(db: Database, mission_id: str) -> dict | None:
+def get_latest_integration(db: Database, mission_id: str) -> dict[str, Any] | None:
     rows = db.query(
         "SELECT * FROM task_integrations WHERE mission_id=? ORDER BY created_at DESC LIMIT 1",
         (mission_id,),
