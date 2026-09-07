@@ -1,209 +1,213 @@
 #!/usr/bin/env node
 /**
  * Phase 2B completion dogfood: manual + auto-planned missions through the UI.
+ * Reuses already-running backend (:8787) and frontend (:5173). Never spawns
+ * or kills servers. All API calls are timeout-bounded; results.json is always
+ * written. Real browser UI drives project + mission creation.
  */
 const { chromium } = require("playwright");
-const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-const REPO = "/tmp/gg-ui-dogfood-" + Date.now();
-const DB = "/tmp/gg-ui-dogfood.db";
-const SCREENSHOTS = "/tmp/gg-ui-dogfood-shots";
-const BASE = "/home/adam/projects/gg";
+const API = "http://127.0.0.1:8787";
+const UI = "http://127.0.0.1:5173";
+const REPO = process.env.REPO_PATH || process.argv[2];
+const RUN_TAG = process.env.RUN_TAG || String(Date.now());
+const SCREENSHOTS = process.env.SHOTS || "/tmp/gg-phase2b-shots";
+const MANUAL_TITLE = `Manual DAG ${RUN_TAG}`;
+const AUTO_TITLE = `Auto-Plan ${RUN_TAG}`;
+const TERMINAL = ["COMPLETED", "FAILED", "CANCELLED", "UNVERIFIED", "WAITING_FOR_HUMAN"];
 
-function waitForServer(url, timeout = 30000) {
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    const check = () => {
-      fetch(url).then((r) => { if (r.ok) resolve(); else setTimeout(check, 500); }).catch(() => {
-        if (Date.now() - start > timeout) reject(new Error("timeout"));
-        else setTimeout(check, 500);
-      });
-    };
-    check();
-  });
+if (!REPO) {
+  console.error("Usage: REPO_PATH=/tmp/repo node scripts/e2e-dogfood.js");
+  process.exit(2);
 }
 
-async function setupRepo() {
-  fs.mkdirSync(REPO, { recursive: true });
-  fs.writeFileSync(path.join(REPO, ".gitignore"), ".venv/\n__pycache__/\n*.pyc\n");
-  fs.mkdirSync(path.join(REPO, "src"), { recursive: true });
-  fs.mkdirSync(path.join(REPO, "tests"), { recursive: true });
-  fs.writeFileSync(path.join(REPO, "pyproject.toml"), `[project]\nname = "dogfood"\nversion = "0.1.0"\nrequires-python = ">=3.10"\ndependencies = ["pytest"]\n\n[tool.pytest.ini_options]\ntestpaths = ["tests"]\npythonpath = ["."]\n`);
-  fs.writeFileSync(path.join(REPO, "src/__init__.py"), "");
-  fs.writeFileSync(path.join(REPO, "tests/test_dogfood.py"), `from src.greeting import greet\nfrom src.farewell import farewell\n\ndef test_greet() -> None:\n    assert greet() == "hello"\n\ndef test_farewell() -> None:\n    assert farewell() == "goodbye"\n`);
-  const { execSync } = require("child_process");
-  execSync("git init && git config user.email 'dogfood@gg.local' && git config user.name 'Dogfood' && git add . && git commit -m 'initial'", { cwd: REPO });
-  execSync("uv sync", { cwd: REPO });
-  execSync("git add uv.lock && git commit -m 'add uv.lock'", { cwd: REPO });
+async function api(p, opts = {}, timeoutMs = 15000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const r = await fetch(`${API}${p}`, { ...opts, signal: ctl.signal });
+    if (!r.ok) throw new Error(`${r.status} ${p}: ${(await r.text()).slice(0, 200)}`);
+    return r.json();
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 async function takeScreenshot(page, name) {
   const p = path.join(SCREENSHOTS, `${name}.png`);
   await page.screenshot({ path: p, fullPage: true });
-  console.log("Screenshot:", p);
+  console.log("shot:", p);
 }
 
-async function getMissionState(missionId) {
-  const r = await fetch(`http://127.0.0.1:8787/api/missions/${missionId}`);
-  return r.json();
+async function newestByTitle(title) {
+  const missions = await api("/api/missions");
+  const matches = missions.filter((m) => m.title === title)
+    .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+  return matches[0] || null;
+}
+
+async function pollMission(page, id, label, maxPolls = 90, pollMs = 10000) {
+  for (let i = 0; i < maxPolls; i++) {
+    await page.waitForTimeout(pollMs);
+    let m = null;
+    try {
+      m = await api(`/api/missions/${id}`);
+    } catch (e) {
+      console.log(`${label} poll ${i}: api error: ${e.message}`);
+      continue;
+    }
+    if (i % 6 === 0 || TERMINAL.includes(m.status)) {
+      try {
+        await page.reload();
+        await page.waitForTimeout(1500);
+        await takeScreenshot(page, `${label}-${String(i).padStart(2, "0")}-${m.status}`);
+      } catch (e) {
+        console.log(`${label} screenshot failed: ${e.message}`);
+      }
+    }
+    console.log(`${label} poll ${i}: ${m.status}`);
+    if (TERMINAL.includes(m.status)) return m;
+  }
+  return api(`/api/missions/${id}`).catch((e) => ({ status: `POLL_ERROR: ${e.message}` }));
 }
 
 async function main() {
   fs.mkdirSync(SCREENSHOTS, { recursive: true });
-  await setupRepo();
-  fs.rmSync(DB, { force: true });
+  await api("/api/health");
+  console.log("backend ok; repo:", REPO, "tag:", RUN_TAG);
 
-  // Start backend
-  const backend = spawn("uv", ["run", "--directory", `${BASE}/backend`, "python", "-m", "orchestrator.server"], {
-    env: { ...process.env, PYTHONPATH: `${BASE}/backend/src` },
-    stdio: "pipe",
-  });
-
-  // Start frontend
-  const frontend = spawn("npm", ["run", "dev", "--", "--port", "5173"], {
-    cwd: `${BASE}/frontend`,
-    stdio: "pipe",
-  });
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const out = { repo: REPO, runTag: RUN_TAG };
 
   try {
-    await waitForServer("http://127.0.0.1:8787/api/health");
-    await waitForServer("http://127.0.0.1:5173");
-
-    const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 1440, height: 900 });
-
-    // === 1. Create project via UI ===
-    console.log("\n=== Creating project via UI ===");
-    await page.goto("http://127.0.0.1:5173/#/projects");
-    await page.waitForTimeout(1000);
+    // === 1. Project via UI ===
+    console.log("\n=== project via UI ===");
+    await page.goto(`${UI}/#/projects`);
+    await page.waitForTimeout(1200);
     await page.fill('input[placeholder*="path"]', REPO);
     await page.click('button:has-text("Add Project")');
     await page.waitForTimeout(1500);
     await takeScreenshot(page, "01-project-created");
-
-    // Get project ID from API
-    const projects = await (await fetch("http://127.0.0.1:8787/api/projects")).json();
+    const projects = await api("/api/projects");
     const project = projects.find((p) => p.path === REPO);
-    if (!project) throw new Error("Project not created");
-    console.log("Project ID:", project.id);
+    if (!project) throw new Error("project not created via UI");
+    console.log("project:", project.id);
 
-    // === 2. Manual DAG mission ===
-    console.log("\n=== Creating manual DAG mission ===");
-    await page.goto("http://127.0.0.1:5173/#/new");
-    await page.waitForTimeout(1000);
-
+    // === 2. Manual DAG mission via UI ===
+    console.log("\n=== manual DAG via UI ===");
+    await page.goto(`${UI}/#/new`);
+    await page.waitForTimeout(1200);
     await page.selectOption('select[data-testid="project-select"]', project.id);
-    await page.fill('input[placeholder="Build invoice management SaaS"]', "Manual DAG Mission");
+    await page.fill('input[placeholder="Build invoice management SaaS"]', MANUAL_TITLE);
     await page.fill('textarea[data-testid="task-input"]', "Create greeting and farewell modules in parallel");
     await page.selectOption('select[data-testid="scheduling-mode"]', "PARALLEL_SAFE");
-    await page.click('text=Manual DAG');
-    await page.waitForTimeout(500);
+    await page.click("text=Manual DAG");
+    await page.waitForTimeout(600);
 
-    // Fill task 1
-    const tasks = await page.locator('.card:has-text("Task 1")').all();
-    await tasks[0].locator('input').first().fill("task-a");
-    await tasks[0].locator('input').nth(1).fill("Create greeting");
-    await tasks[0].locator('input').nth(2).fill("Create src/greeting.py with greet()");
-    await tasks[0].locator('input').nth(4).fill("agy");
-    await tasks[0].locator('input').nth(5).fill("src/greeting.py");
-
-    // Fill task 2
-    const tasks2 = await page.locator('.card:has-text("Task 2")').all();
-    await tasks2[0].locator('input').first().fill("task-b");
-    await tasks2[0].locator('input').nth(1).fill("Create farewell");
-    await tasks2[0].locator('input').nth(2).fill("Create src/farewell.py with farewell()");
-    await tasks2[0].locator('input').nth(4).fill("opencode");
-    await tasks2[0].locator('input').nth(5).fill("src/farewell.py");
-
+    const task1 = page.locator('[data-testid="dag-task-0"]');
+    await task1.locator("input").nth(0).fill("task-a");
+    await task1.locator("input").nth(1).fill("Create greeting");
+    await task1.locator("input").nth(2).fill("Create src/greeting.py with greet() greeting function");
+    await task1.locator("input").nth(4).fill("agy");
+    await task1.locator("input").nth(5).fill("src/greeting.py");
+    const task2 = page.locator('[data-testid="dag-task-1"]');
+    await task2.locator("input").nth(0).fill("task-b");
+    await task2.locator("input").nth(1).fill("Create farewell");
+    await task2.locator("input").nth(2).fill("Create src/farewell.py with farewell() farewell function");
+    await task2.locator("input").nth(4).fill("opencode");
+    await task2.locator("input").nth(5).fill("src/farewell.py");
     await takeScreenshot(page, "02-manual-dag-filled");
     await page.click('button[data-testid="launch-mission"]');
-    await page.waitForURL(/#\/$/, { timeout: 10000 });
-    await page.waitForTimeout(2000);
+    await page.waitForURL(/#\/$/, { timeout: 15000 });
+    await page.waitForTimeout(2500);
     await takeScreenshot(page, "03-manual-mission-started");
 
-    // Wait for manual mission to complete (or fail)
-    let manualMissionId = null;
-    for (let i = 0; i < 40; i++) {
-      await page.waitForTimeout(5000);
-      await page.reload();
-      await page.waitForTimeout(1000);
-      await takeScreenshot(page, `04-manual-${String(i).padStart(2, "0")}`);
-
-      const missions = await (await fetch("http://127.0.0.1:8787/api/missions")).json();
-      const manual = missions.find((m) => m.title === "Manual DAG Mission");
-      if (manual) {
-        manualMissionId = manual.id;
-        if (["COMPLETED", "FAILED", "CANCELLED", "UNVERIFIED", "WAITING_FOR_HUMAN"].includes(manual.status)) {
-          console.log("Manual mission final:", manual.status);
-          break;
-        }
-      }
+    const manual = await newestByTitle(MANUAL_TITLE);
+    if (!manual) throw new Error("manual mission not found after UI launch");
+    out.manualMissionId = manual.id;
+    console.log("manual mission:", manual.id);
+    const manualFinal = await pollMission(page, manual.id, "04-manual");
+    out.manualStatus = manualFinal.status;
+    out.manualBlockingIssue = manualFinal.blocking_issue || null;
+    try {
+      out.manualDetail = await api(`/api/missions/${manual.id}`);
+    } catch (e) {
+      out.manualDetailError = e.message;
     }
 
-    // === 3. Auto-planned mission ===
-    console.log("\n=== Creating auto-planned mission ===");
-    await page.goto("http://127.0.0.1:5173/#/new");
-    await page.waitForTimeout(1000);
+    // Per-task log panel evidence: click DAG node for the first task (dynamic id)
+    try {
+      const detail = await api(`/api/missions/${manual.id}`);
+      const firstTaskId = detail.tasks?.[0]?.id;
+      out.manualFirstTaskId = firstTaskId || null;
+      await page.reload();
+      await page.waitForTimeout(1500);
+      if (firstTaskId) {
+        const node = page.locator(`[data-testid="dag-node-${firstTaskId}"]`);
+        if (await node.count()) {
+          await node.first().click();
+          await page.waitForTimeout(1500);
+          await takeScreenshot(page, "05-manual-task-logs");
+          out.taskLogShot = true;
+        }
+        try {
+          out.taskALogs = await api(`/api/missions/${manual.id}/tasks/${firstTaskId}/logs`);
+          out.taskALogStdoutChars = (out.taskALogs.stdout || "").length;
+          out.taskALogProvider = out.taskALogs.run?.provider || null;
+        } catch (e) {
+          out.taskALogsError = e.message;
+        }
+      }
+    } catch (e) {
+      out.taskLogShotError = e.message;
+    }
 
+    // === 3. Auto-planned mission via UI ===
+    console.log("\n=== auto-plan via UI ===");
+    await page.goto(`${UI}/#/new`);
+    await page.waitForTimeout(1200);
     await page.selectOption('select[data-testid="project-select"]', project.id);
-    await page.fill('input[placeholder="Build invoice management SaaS"]', "Auto-Plan Mission");
+    await page.fill('input[placeholder="Build invoice management SaaS"]', AUTO_TITLE);
     await page.fill('textarea[data-testid="task-input"]', "Create greeting and farewell modules");
     await page.selectOption('select[data-testid="scheduling-mode"]', "PARALLEL_SAFE");
-    // Auto-plan is default
-    await takeScreenshot(page, "05-auto-plan-filled");
+    await takeScreenshot(page, "06-auto-plan-filled");
     await page.click('button[data-testid="launch-mission"]');
-    await page.waitForURL(/#\/$/, { timeout: 10000 });
-    await page.waitForTimeout(2000);
-    await takeScreenshot(page, "06-auto-plan-started");
+    await page.waitForURL(/#\/$/, { timeout: 15000 });
+    await page.waitForTimeout(2500);
+    await takeScreenshot(page, "07-auto-plan-started");
 
-    let autoMissionId = null;
-    for (let i = 0; i < 40; i++) {
-      await page.waitForTimeout(5000);
-      await page.reload();
-      await page.waitForTimeout(1000);
-      await takeScreenshot(page, `07-auto-${String(i).padStart(2, "0")}`);
-
-      const missions = await (await fetch("http://127.0.0.1:8787/api/missions")).json();
-      const auto = missions.find((m) => m.title === "Auto-Plan Mission");
-      if (auto) {
-        autoMissionId = auto.id;
-        if (["COMPLETED", "FAILED", "CANCELLED", "UNVERIFIED", "WAITING_FOR_HUMAN"].includes(auto.status)) {
-          console.log("Auto mission final:", auto.status);
-          break;
-        }
-      }
+    const auto = await newestByTitle(AUTO_TITLE);
+    if (!auto) throw new Error("auto mission not found after UI launch");
+    out.autoMissionId = auto.id;
+    console.log("auto mission:", auto.id);
+    const autoFinal = await pollMission(page, auto.id, "08-auto");
+    out.autoStatus = autoFinal.status;
+    out.autoBlockingIssue = autoFinal.blocking_issue || null;
+    try {
+      out.autoDetail = await api(`/api/missions/${auto.id}`);
+    } catch (e) {
+      out.autoDetailError = e.message;
     }
 
-    // Final state
-    const manualState = manualMissionId ? await getMissionState(manualMissionId) : null;
-    const autoState = autoMissionId ? await getMissionState(autoMissionId) : null;
-
     console.log("\n=== RESULTS ===");
-    console.log("Manual mission:", manualMissionId, manualState?.status, manualState?.blocking_issue);
-    console.log("Auto mission:", autoMissionId, autoState?.status, autoState?.blocking_issue);
-
-    fs.writeFileSync(path.join(SCREENSHOTS, "results.json"), JSON.stringify({
-      repo: REPO,
-      manualMissionId,
-      manualStatus: manualState?.status,
-      manualBlockingIssue: manualState?.blocking_issue,
-      autoMissionId,
-      autoStatus: autoState?.status,
-      autoBlockingIssue: autoState?.blocking_issue,
-      screenshots: fs.readdirSync(SCREENSHOTS).filter((f) => f.endsWith(".png")),
-    }, null, 2));
-
-    await browser.close();
+    console.log("manual:", out.manualMissionId, out.manualStatus, out.manualBlockingIssue);
+    console.log("auto:", out.autoMissionId, out.autoStatus, out.autoBlockingIssue);
+  } catch (e) {
+    out.scriptError = e.message;
+    console.error("SCRIPT ERROR:", e);
   } finally {
-    backend.kill();
-    frontend.kill();
+    try {
+      out.screenshots = fs.readdirSync(SCREENSHOTS).filter((f) => f.endsWith(".png"));
+    } catch { /* ignore */ }
+    fs.writeFileSync(path.join(SCREENSHOTS, "results.json"), JSON.stringify(out, null, 2));
+    console.log("results.json written");
+    await browser.close().catch(() => {});
   }
+  if (out.scriptError) process.exit(1);
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main();

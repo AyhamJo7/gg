@@ -68,6 +68,23 @@ def validate_task_graph(tasks: list[TaskGraphTask]) -> None:
                 raise DagValidationError(f"task {task.id} has invalid workspace scope: {scope!r}")
 
 
+def namespace_dag_ids(mission_id: str, tasks: list[TaskGraphTask]) -> dict[str, str]:
+    """Prefix task IDs with the mission short ID so task rows are globally unique.
+
+    Planner and UI clients reuse friendly logical IDs ("task-a"); tasks.id is a
+    global primary key, so two missions using the same logical IDs would collide
+    on insert. Rewrites task.id, task.dependencies and task.dependents in place.
+    Returns the logical -> namespaced mapping.
+    """
+    prefix = mission_id[:8]
+    mapping = {t.id: f"{prefix}-{t.id}" for t in tasks}
+    for task in tasks:
+        task.dependencies = [mapping.get(d, d) for d in task.dependencies]
+        task.dependents = [mapping.get(d, d) for d in task.dependents]
+        task.id = mapping[task.id]
+    return mapping
+
+
 def validate_planner_payload(payload: dict[str, Any]) -> list[TaskGraphTask]:
     """Convert and validate a planner JSON payload into TaskGraphTask objects.
 

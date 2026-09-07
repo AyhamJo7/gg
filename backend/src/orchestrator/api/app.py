@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field
 
 from .. import git_ops
 from ..config import Config
-from ..models import utcnow
+from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
+from ..models import Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
 from ..security import validate_workspace_path
 from ..workspace import inspect_workspace
@@ -339,13 +340,83 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             raise HTTPException(404, "mission not found")
         if mission["status"] != "CREATED":
             raise HTTPException(409, "can only modify DAG before mission is started")
-        for t in req.tasks:
-            t["mission_id"] = mission_id
-            t["created_at"] = utcnow().isoformat()
-            orchestrator.db.insert("tasks", t)
-        for d in req.dependencies:
-            d["created_at"] = utcnow().isoformat()
-            orchestrator.db.insert("task_dependencies", d)
+        if not req.tasks:
+            raise HTTPException(400, "DAG must contain at least one task")
+
+        def _as_list(value: Any) -> list[str]:
+            if isinstance(value, str):
+                return [str(v) for v in json.loads(value or "[]")]
+            return [str(v) for v in (value or [])]
+
+        # Strict validation: same DAG rules as planner-produced graphs.
+        try:
+            known_ids = {raw.get("id") for raw in req.tasks}
+            for dep in req.dependencies:
+                if dep.get("from_task_id") not in known_ids or dep.get("to_task_id") not in known_ids:
+                    raise DagValidationError(f"dependency references unknown task: {dep}")
+            tasks: list[TaskGraphTask] = []
+            for raw in req.tasks:
+                tid = raw.get("id")
+                if not tid or not isinstance(tid, str):
+                    raise DagValidationError("each task needs a string 'id'")
+                tasks.append(
+                    TaskGraphTask(
+                        id=tid,
+                        mission_id=mission_id,
+                        title=str(raw.get("title", tid)),
+                        description=str(raw.get("description", "")),
+                        role=Role(str(raw.get("role", "implementation"))),
+                        dependencies=[
+                            str(d["from_task_id"])
+                            for d in req.dependencies
+                            if d.get("to_task_id") == tid and d.get("from_task_id")
+                        ],
+                        workspace_scope=_as_list(raw.get("workspace_scope")),
+                        preferred_providers=_as_list(raw.get("preferred_providers")),
+                        priority=int(raw.get("priority", 0)),
+                        max_attempts=int(raw.get("max_attempts", 3)),
+                    )
+                )
+            validate_task_graph(tasks)
+        except DagValidationError as exc:
+            raise HTTPException(400, f"DAG invalid: {exc}") from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, f"DAG invalid: {exc}") from exc
+
+        # Namespace IDs: tasks.id is a global primary key, so logical IDs
+        # ("task-a") must not collide across missions. Resubmit replaces
+        # this mission's draft rows (idempotent retry after a failed submit).
+        namespace_dag_ids(mission_id, tasks)
+        orchestrator.db.execute(
+            "DELETE FROM task_dependencies WHERE to_task_id IN (SELECT id FROM tasks WHERE mission_id=?)",
+            (mission_id,),
+        )
+        orchestrator.db.execute("DELETE FROM tasks WHERE mission_id=?", (mission_id,))
+        now = utcnow().isoformat()
+        for task in tasks:
+            orchestrator.db.insert(
+                "tasks",
+                {
+                    "id": task.id,
+                    "mission_id": mission_id,
+                    "role": task.role.value,
+                    "status": TaskStatus.PENDING.value,
+                    "task_type": task.task_type,
+                    "title": task.title,
+                    "description": task.description,
+                    "preferred_providers": json.dumps(task.preferred_providers),
+                    "workspace_scope": json.dumps(task.workspace_scope),
+                    "max_attempts": task.max_attempts,
+                    "priority": task.priority,
+                    "created_at": now,
+                    "dag_revision": 1,
+                },
+            )
+            for dep in task.dependencies:
+                orchestrator.db.insert(
+                    "task_dependencies",
+                    {"from_task_id": dep, "to_task_id": task.id, "created_at": now},
+                )
         return {"status": "dag updated"}
 
     @app.get("/api/missions/{mission_id}/active-tasks")

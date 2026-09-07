@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import git_ops, integration, task_locks, task_worktree
-from .dag import DagValidationError, validate_planner_payload
+from .dag import DagValidationError, namespace_dag_ids, validate_planner_payload
 from .events import EventBus
 from .handoff import persist_handoff, render_handoff
 from .models import (
@@ -872,9 +872,11 @@ class ParallelMissionEngine:
             self._set_mission_status(MissionStatus.FAILED, blocking_issue=f"planner DAG invalid: {exc}")
             return False
 
-        # Persist DAG
+        # Persist DAG (namespaced IDs: tasks.id is a global primary key)
         for task in tasks:
             task.mission_id = self.mission_id
+        namespace_dag_ids(self.mission_id, tasks)
+        for task in tasks:
             self.db.insert(
                 "tasks",
                 {

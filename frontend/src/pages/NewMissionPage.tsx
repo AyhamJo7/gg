@@ -244,7 +244,7 @@ export function NewMissionPage() {
             <h3>Task DAG Editor</h3>
             <div className="stack" style={{ gap: 10 }}>
               {dagTasks.map((t, i) => (
-                <div key={i} className="card" style={{ padding: 10 }}>
+                <div key={i} className="card" style={{ padding: 10 }} data-testid={`dag-task-${i}`}>
                   <div className="row spread" style={{ marginBottom: 8 }}>
                     <span className="mono faint">Task {i + 1}</span>
                     <button className="danger" style={{ padding: "2px 8px", fontSize: 11 }} onClick={() => removeTask(i)}>
