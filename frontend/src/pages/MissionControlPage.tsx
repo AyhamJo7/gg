@@ -10,6 +10,7 @@ import { GitPanel } from "../components/GitPanel";
 import { IntegrationPanel } from "../components/IntegrationPanel";
 import { ProviderStrip } from "../components/ProviderStrip";
 import { ReviewFindingsPanel } from "../components/ReviewFindingsPanel";
+import { TaskLogPanel } from "../components/TaskLogPanel";
 import { TaskPanel } from "../components/TaskPanel";
 import { Terminal } from "../components/Terminal";
 import { WorkflowTimeline } from "../components/WorkflowTimeline";
@@ -173,6 +174,9 @@ export function MissionControlPage() {
                   {detail.tasks.map((t) => (
                     <TaskPanel key={t.id} task={t} missionId={mission.id} onRefresh={refreshAll} />
                   ))}
+                  {selectedTaskId && (
+                    <TaskLogPanel missionId={mission.id} taskId={selectedTaskId} />
+                  )}
                 </>
               ) : (
                 <div className="card">

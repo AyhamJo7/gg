@@ -19,15 +19,16 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 import type {
   Analytics,
+  DagDependencyInput,
+  DagTaskInput,
   GitState,
   Mission,
-  MissionDetail,
   MissionDag,
+  MissionDetail,
   PriorityMatrix,
   Project,
   ProviderHealth,
-  DagTaskInput,
-  DagDependencyInput,
+  ProviderRun,
 } from "./types";
 
 export const api = {
@@ -77,6 +78,8 @@ export const api = {
       req<{ status: string }>(`/api/missions/${missionId}/tasks/${taskId}/retry`, { method: "POST" }),
     cancelTask: (missionId: string, taskId: string) =>
       req<{ status: string }>(`/api/missions/${missionId}/tasks/${taskId}/cancel`, { method: "POST" }),
+    taskLogs: (missionId: string, taskId: string) =>
+      req<{ stdout: string; stderr: string; run: ProviderRun | null }>(`/api/missions/${missionId}/tasks/${taskId}/logs`),
   },
   providers: {
     list: () => req<ProviderHealth[]>("/api/providers"),

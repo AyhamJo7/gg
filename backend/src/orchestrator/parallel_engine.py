@@ -937,25 +937,61 @@ class ParallelMissionEngine:
             f"Use workspace_scope to declare which files each task will touch.\n"
         )
 
-    def _extract_dag_from_output(self, text: str) -> dict[str, Any] | None:
-        """Extract JSON DAG from planner output."""
+    @staticmethod
+    def _find_balanced_brace(text: str, start: int) -> int | None:
+        """Find the index of the brace that balances the '{' at start."""
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return None
+
+    @classmethod
+    def _extract_dag_from_output(cls, text: str) -> dict[str, Any] | None:
+        """Extract JSON DAG from planner output.
+
+        Tries fenced code blocks first, then balanced brace scanning.
+        Only returns a dict that contains a 'tasks' array.
+        """
         import re
 
         candidates: list[str] = []
-        m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if m:
-            candidates.append(m.group(1))
-        m2 = re.search(r"(\{[\s\S]*\"tasks\"\s*:\s*\[.*?\]\s*\})", text, re.DOTALL)
-        if m2:
-            candidates.append(m2.group(1))
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidates.append(text[start : end + 1])
+
+        # 1. Fenced code blocks (```json ... ```)
+        for fence in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text):
+            candidates.append(fence.group(1).strip())
+
+        # 2. Balanced brace objects — scan each '{' position
+        for match in re.finditer(r"\{", text):
+            start = match.start()
+            end = cls._find_balanced_brace(text, start)
+            if end is not None:
+                candidates.append(text[start : end + 1])
+
         for payload in candidates:
             try:
                 parsed = json.loads(payload)
-                if isinstance(parsed, dict):
+                if isinstance(parsed, dict) and isinstance(parsed.get("tasks"), list):
                     return parsed
             except json.JSONDecodeError:
                 continue

@@ -395,6 +395,38 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         tl_module.release_locks_for_task(orchestrator.db, orchestrator.events, task_id)
         return {"status": "task cancelled"}
 
+    @app.get("/api/missions/{mission_id}/tasks/{task_id}/logs")
+    def get_task_logs(mission_id: str, task_id: str) -> dict[str, Any]:
+        task = orchestrator.db.get("tasks", task_id)
+        if not task or task["mission_id"] != mission_id:
+            raise HTTPException(404, "task not found")
+        run = orchestrator.db.query(
+            "SELECT * FROM provider_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1",
+            (task_id,),
+        )
+        if not run:
+            return {"stdout": "", "stderr": "", "run": None}
+        run_row = run[0]
+        stdout_path = run_row.get("stdout_path")
+        stderr_path = run_row.get("stderr_path")
+        stdout_text = ""
+        stderr_text = ""
+        if stdout_path and Path(stdout_path).exists():
+            try:
+                stdout_text = Path(stdout_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        if stderr_path and Path(stderr_path).exists():
+            try:
+                stderr_text = Path(stderr_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        return {
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "run": _jsonable(run_row),
+        }
+
     # ---------------- git ----------------
     @app.get("/api/projects/{project_id}/git")
     async def git_state(project_id: str) -> dict[str, Any]:
