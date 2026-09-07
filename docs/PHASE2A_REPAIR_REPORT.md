@@ -5,7 +5,7 @@
 | Item | Value |
 |------|-------|
 | Branch | `phase2/task-dag-parallelism` |
-| HEAD | `b31a173` |
+| HEAD | `ec16ca6` |
 | Status | clean (nothing to commit, working tree clean) |
 | Certified v1 tag | `v1.0-core-certified` @ `c74347de3f1537bfec7f558bb5062cd98e992001` (untouched) |
 
