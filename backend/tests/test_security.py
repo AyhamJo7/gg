@@ -183,3 +183,51 @@ def test_tail_large_log_bounded(tmp_path: Path):
     assert len(text.encode("utf-8")) <= 1024
     assert FAKE_TOKEN not in text
     assert elapsed < 5
+
+
+# ---------------------------------------------------------------------------
+# Redaction-context policy: bounds are declared, derived, and pinned.
+# Fake secrets only. "Unsupported" assertions pin the documented boundary;
+# they must never be read as permission to log real secrets that way.
+# ---------------------------------------------------------------------------
+
+from orchestrator.security import (  # noqa: E402
+    _GENERIC_ANCHOR_MAX,
+    _GENERIC_CONTEXT_MAX,
+    _GENERIC_LABEL_GAP_MAX,
+    _GENERIC_VALUE_GAP_MAX,
+    TAIL_OVERLAP_MAX,
+)
+
+
+def test_redaction_overlap_covers_policy():
+    """Invariant: the tail overlap always exceeds the worst-case backward
+    context any supported generic-secret match can need."""
+    required = _GENERIC_ANCHOR_MAX + _GENERIC_LABEL_GAP_MAX + 1 + _GENERIC_VALUE_GAP_MAX
+    assert _GENERIC_CONTEXT_MAX == required
+    assert TAIL_OVERLAP_MAX > required
+
+
+def test_generic_gap_bounds():
+    assert "[REDACTED]" in redact("password" + " " * 32 + "=fakemaxvalue1")
+    assert "[REDACTED]" in redact("password:" + " " * 256 + "fakemaxvalue2")
+    # one byte beyond each supported separation: explicitly unsupported
+    assert "fakemaxvalue3" in redact("password" + " " * 33 + "=fakemaxvalue3")
+    assert "fakemaxvalue4" in redact("password:" + " " * 257 + "fakemaxvalue4")
+
+
+def test_generic_multiline_gap_bounds():
+    assert "[REDACTED]" in redact("password:\n" + " " * 200 + "fakeyamlvalue1")
+    assert "fakeyamlvalue2" in redact("password:\n" + " " * 300 + "fakeyamlvalue2")
+
+
+def test_tail_boundary_at_max_gap(tmp_path: Path):
+    """Anchor/value at the maximum supported separation, straddling the
+    served cut: the overlap keeps the anchor in context, value redacted."""
+    gap = b" " * 256
+    blob = b"f" * 2000 + b"password:" + gap + b"faketailvalue1\n" + b"t\n" * 50
+    p = _write(tmp_path, "i.log", blob)
+    text, size, truncated = read_redacted_tail(p, 1024)
+    assert truncated
+    assert b"faketailvalue1" not in text.encode()
+    assert size == len(blob)

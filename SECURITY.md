@@ -25,6 +25,18 @@ operations, and workspace escape.
 ### Secret protection
 - Redaction patterns (API keys, JWTs, GitHub tokens, `key=value` secrets) applied
   to every streamed line, event payload, gate detail, and run record.
+- Generic-secret policy (explicit, bounded): a label (`api-key`/`api_key`/
+  `token`/`secret`/`password`, case-insensitive), a `:`/`=` separator, and a
+  value of 8+ non-space chars. At most 32 whitespace chars are accepted
+  between label and separator, at most 256 between separator and value
+  (newlines included, so YAML blocks are covered). Wider separations are
+  explicitly unsupported and will not link.
+- Task-log tail guarantee: the served tail keeps a 4 KB overlap for pattern
+  context (derived: worst-case backward context is 8 + 32 + 1 + 256 = 297
+  bytes), redacts the whole window together, and serves whole lines only
+  within the 1 KB–1 MB cap — truncation can never split a supported match.
+- Regex redaction is a safety net, not a substitute for keeping secrets out of
+  logs: prefer environment references over inline values in task text.
 - `.env*`, `*.pem`, `*.key`, `credentials.json`, `auth.json` are **force-excluded**
   from every checkpoint commit even if staged, and auto-appended to `.gitignore`.
 - Provider authentication lives entirely in the official CLIs' own stores

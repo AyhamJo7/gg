@@ -9,6 +9,26 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+# Generic-secret policy (explicit bounds, not convenience constants).
+#
+# Supported syntax: a credential label (api-key/api_key/token/secret/password,
+# case-insensitive), a `:` or `=` separator, and a value of 8+ non-space chars.
+# Whitespace — including newlines, so YAML blocks like `password:` followed by
+# an indented value are covered — is accepted between the label and the
+# separator (at most _GENERIC_LABEL_GAP_MAX chars) and between the separator
+# and the value (at most _GENERIC_VALUE_GAP_MAX chars). The bounds cover real
+# formats (`key=value`, `key = "value"`, newline + deep indentation, aligned
+# `=` columns) while keeping the required redaction context derivable. A label
+# separated from its value by MORE than these bounds is explicitly unsupported
+# and will not link.
+_GENERIC_LABEL_GAP_MAX = 32
+_GENERIC_VALUE_GAP_MAX = 256
+_GENERIC_ANCHOR_MAX = 8  # len("password"), longest label alternation literal
+
+# Worst-case backward context a generic-secret match can need, measured from
+# the value start: anchor + label gap + separator + value gap.
+_GENERIC_CONTEXT_MAX = _GENERIC_ANCHOR_MAX + _GENERIC_LABEL_GAP_MAX + 1 + _GENERIC_VALUE_GAP_MAX
+
 # Common secret shapes. Keep conservative: redact on suspicion.
 SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"), "[REDACTED_ANTHROPIC_KEY]"),
@@ -17,7 +37,14 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED_GH_PAT]"),
     (re.compile(r"AIza[0-9A-Za-z_\-]{20,}"), "[REDACTED_GOOGLE_KEY]"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"), "[REDACTED_JWT]"),
-    (re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^\s'\"]{8,}"), r"\1=[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)(api[_-]?key|token|secret|password)"
+            rf"\s{{0,{_GENERIC_LABEL_GAP_MAX}}}[:=]\s{{0,{_GENERIC_VALUE_GAP_MAX}}}"
+            r"['\"]?[^\s'\"]{8,}"
+        ),
+        r"\1=[REDACTED]",
+    ),
 ]
 
 # Filenames that must never be committed by the git ledger.
@@ -40,15 +67,14 @@ def redact(text: str) -> str:
     return text
 
 
-# Upper bound for the redaction context overlap (MED-01). When serving a
-# bounded tail of a log file, patterns whose anchor (e.g. a YAML key) sits
-# before the cut point would otherwise miss their value. We therefore read
-# up to TAIL_OVERLAP_MAX extra bytes, redact the whole window together, and
-# only then drop everything before the cut — so every served character
-# passed through redact() with its full surrounding context present.
-# Residual assumption (documented, bounded): an anchor separated from its
-# value by more than the overlap is out of context and will not link.
-TAIL_OVERLAP_MAX = 65536
+# Redaction context overlap, DERIVED from the generic-secret policy above
+# (not an arbitrary lookbehind): any supported match needs at most
+# _GENERIC_CONTEXT_MAX bytes of backward context from the value start, and
+# TAIL_OVERLAP_MAX exceeds that with wide margin. The invariant is enforced
+# by test_redaction_overlap_covers_policy in tests/test_security.py.
+# Formats outside the declared policy (anchor/value gap beyond the bounds)
+# are explicitly unsupported and will not link.
+TAIL_OVERLAP_MAX = 4096
 
 
 def read_redacted_tail(path: Path, cap_bytes: int) -> tuple[str, int, bool]:
