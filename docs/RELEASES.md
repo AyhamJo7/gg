@@ -1,5 +1,36 @@
 # Releases
 
+## v2.1-scale (promoted 2026-09-08)
+
+Scale increment: unattended 6-task mission proof plus audit repairs.
+
+| Item | Value |
+|------|-------|
+| Merge commit | `5faa89687918bba962aeb9af43954731ae17264a` |
+| Approved head | `869f06178dddae769abff13dac5fb8bf77e5a311` |
+| PR | `AyhamJo7/gg#2` (merge, lineage preserved, no squash) |
+| Release tag | `v2.1-scale` |
+| Audit verdict | READY (final checkpoint + leak-audit repairs reviewed) |
+
+Verification on the promoted merge commit (rerun, all exit 0):
+
+| Suite | Result |
+|-------|--------|
+| Backend `pytest` | 268 passed |
+| Frontend `vitest --run` | 41 passed |
+| `mypy --strict src` | clean (36 files) |
+| `ruff check src tests` | clean |
+| `tsc -b --noEmit` | clean |
+| `eslint` | 0 errors, 1 pre-existing warning |
+| `vite build` | successful |
+
+Scale evidence (preserved, not rewritten): mission `f81c7a9662c54965`
+(`textstats`, 6 tasks) in the mission database; target repo
+`/tmp/gg-scale-textstats` with recorded `git_head 26dd327` (pre-repair,
+historical) — repaired-engine behavior proven deterministically by
+`test_final_checkpoint.py`. Leak audit clean via `scripts/leak-audit.py`;
+driver in `scripts/e2e-scale-dogfood.js`, plan in `/tmp/gg-scale/plan.json`.
+
 ## v2.0-core (promoted 2026-09-08)
 
 First promoted baseline beyond the certified v1 core. Merges the independently
