@@ -476,12 +476,63 @@ class ParallelMissionEngine:
             )
             return
 
-        head = await git_ops.head_sha(project_path)
+        head = await self._final_checkpoint(project_path, "orchestrator: final verified state")
+        if head is None:
+            return
         self._set_mission_status(MissionStatus.COMPLETED, current_provider=None, git_head=head)
         self.events.publish(
             EventType.MISSION_COMPLETED,
             self.mission_id,
         )
+
+    async def _final_checkpoint(self, project_path: Path, message: str) -> str | None:
+        """Commit the final verified tree and return its SHA.
+
+        Mirrors the certified v1 checkpoint semantics: sensitive files,
+        `.orchestrator/` metadata, and oversized files are excluded by
+        `git_ops.checkpoint`; consecutive failures are counted durably and
+        exhaust into UNVERIFIED (never COMPLETED). A transient failure
+        leaves the mission in FINAL_VALIDATION so resume/restart retries
+        idempotently. Returns None when completion must not proceed.
+        """
+        if not self.config.get("git.auto_checkpoint", True):
+            return await git_ops.head_sha(project_path)
+        try:
+            max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
+            sha = await git_ops.checkpoint(project_path, message, max_file_mb=max_mb)
+        except git_ops.GitCheckpointError as exc:
+            logger.warning("final checkpoint failed: %s", exc)
+            row = self.db.get("missions", self.mission_id)
+            failures = int((row or {}).get("checkpoint_failures", 0)) + 1
+            self.db.update(
+                "missions", self.mission_id, {"checkpoint_failures": failures, "updated_at": utcnow()}
+            )
+            self.events.publish(EventType.GIT_CHECKPOINT_FAILED, self.mission_id, error=str(exc))
+            max_failures = int(self.config.get("git.max_checkpoint_failures", 2))
+            if failures >= max_failures:
+                self._set_mission_status(
+                    MissionStatus.UNVERIFIED,
+                    blocking_issue=f"final checkpoint failed repeatedly ({failures}x): {exc}",
+                    current_provider=None,
+                )
+            return None
+        self.db.update("missions", self.mission_id, {"checkpoint_failures": 0, "updated_at": utcnow()})
+        if sha:
+            mission = self._mission()
+            self.db.insert(
+                "checkpoints",
+                {
+                    "id": f"ckpt-{utcnow().timestamp()}",
+                    "mission_id": self.mission_id,
+                    "project_id": mission.get("project_id"),
+                    "commit_sha": sha,
+                    "message": message,
+                    "created_at": utcnow(),
+                },
+            )
+            self.events.publish(EventType.GIT_CHECKPOINT_CREATED, self.mission_id, sha=sha)
+            return sha
+        return await git_ops.head_sha(project_path)
 
     # ------------------------------------------------------------------
     # Review pipeline (mirrors v1 MissionEngine)
