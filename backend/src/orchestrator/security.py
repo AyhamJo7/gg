@@ -9,6 +9,26 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+# Generic-secret policy (explicit bounds, not convenience constants).
+#
+# Supported syntax: a credential label (api-key/api_key/token/secret/password,
+# case-insensitive), a `:` or `=` separator, and a value of 8+ non-space chars.
+# Whitespace — including newlines, so YAML blocks like `password:` followed by
+# an indented value are covered — is accepted between the label and the
+# separator (at most _GENERIC_LABEL_GAP_MAX chars) and between the separator
+# and the value (at most _GENERIC_VALUE_GAP_MAX chars). The bounds cover real
+# formats (`key=value`, `key = "value"`, newline + deep indentation, aligned
+# `=` columns) while keeping the required redaction context derivable. A label
+# separated from its value by MORE than these bounds is explicitly unsupported
+# and will not link.
+_GENERIC_LABEL_GAP_MAX = 32
+_GENERIC_VALUE_GAP_MAX = 256
+_GENERIC_ANCHOR_MAX = 8  # len("password"), longest label alternation literal
+
+# Worst-case backward context a generic-secret match can need, measured from
+# the value start: anchor + label gap + separator + value gap.
+_GENERIC_CONTEXT_MAX = _GENERIC_ANCHOR_MAX + _GENERIC_LABEL_GAP_MAX + 1 + _GENERIC_VALUE_GAP_MAX
+
 # Common secret shapes. Keep conservative: redact on suspicion.
 SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"), "[REDACTED_ANTHROPIC_KEY]"),
@@ -17,7 +37,14 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED_GH_PAT]"),
     (re.compile(r"AIza[0-9A-Za-z_\-]{20,}"), "[REDACTED_GOOGLE_KEY]"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"), "[REDACTED_JWT]"),
-    (re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^\s'\"]{8,}"), r"\1=[REDACTED]"),
+    (
+        re.compile(
+            r"(?i)(api[_-]?key|token|secret|password)"
+            rf"\s{{0,{_GENERIC_LABEL_GAP_MAX}}}[:=]\s{{0,{_GENERIC_VALUE_GAP_MAX}}}"
+            r"['\"]?[^\s'\"]{8,}"
+        ),
+        r"\1=[REDACTED]",
+    ),
 ]
 
 # Filenames that must never be committed by the git ledger.
@@ -38,6 +65,52 @@ def redact(text: str) -> str:
     for pattern, replacement in SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+# Redaction context overlap, DERIVED from the generic-secret policy above
+# (not an arbitrary lookbehind): any supported match needs at most
+# _GENERIC_CONTEXT_MAX bytes of backward context from the value start, and
+# TAIL_OVERLAP_MAX exceeds that with wide margin. The invariant is enforced
+# by test_redaction_overlap_covers_policy in tests/test_security.py.
+# Formats outside the declared policy (anchor/value gap beyond the bounds)
+# are explicitly unsupported and will not link.
+TAIL_OVERLAP_MAX = 4096
+
+
+def read_redacted_tail(path: Path, cap_bytes: int) -> tuple[str, int, bool]:
+    """Read at most cap_bytes from the end of path, redacted.
+
+    Returns (served_text, file_size_bytes, truncated). Served text consists
+    of whole redacted lines only — redacted lines are never split, so no
+    partial credential fragment can leak at a truncation boundary. Reads
+    are bounded to cap_bytes + overlap regardless of file size.
+    """
+    cap = max(1024, min(cap_bytes, 1048576))
+    size = path.stat().st_size
+    truncated = size > cap
+    overlap = min(cap, TAIL_OVERLAP_MAX)
+    start = max(0, size - cap - overlap) if truncated else 0
+    with path.open("rb") as fh:
+        fh.seek(start)
+        raw = fh.read()
+    text = raw.decode("utf-8", errors="replace")
+    redacted = redact(text)
+    if not truncated:
+        return redacted, size, False
+    lines = redacted.split("\n")
+    kept: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        total += len(line.encode("utf-8")) + 1
+        if total > cap and kept:
+            break
+        kept.append(line)
+    served = "\n".join(reversed(kept))
+    if len(served.encode("utf-8")) > cap:
+        # Pathological single line larger than the whole budget: keep tail
+        # semantics, never serve more than the cap.
+        served = served.encode("utf-8")[-cap:].decode("utf-8", errors="replace")
+    return served, size, True
 
 
 NEVER_SENSITIVE = {".env.example", ".env.sample", ".env.template"}

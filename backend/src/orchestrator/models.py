@@ -114,6 +114,48 @@ class Severity(StrValueEnum):
     LOW = "LOW"
 
 
+class SchedulingMode(StrValueEnum):
+    SEQUENTIAL = "SEQUENTIAL"
+    PARALLEL_SAFE = "PARALLEL_SAFE"
+
+
+class TaskStatus(StrValueEnum):
+    PENDING = "PENDING"
+    BLOCKED = "BLOCKED"
+    READY = "READY"
+    CLAIMED = "CLAIMED"
+    RUNNING = "RUNNING"
+    WAITING_FOR_PROVIDER = "WAITING_FOR_PROVIDER"
+    WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+    WAITING_FOR_INTEGRATION = "WAITING_FOR_INTEGRATION"
+    REVIEWING = "REVIEWING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    UNVERIFIED = "UNVERIFIED"
+
+
+TERMINAL_TASK_STATUSES = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.UNVERIFIED}
+)
+
+
+class LockType(StrValueEnum):
+    WORKSPACE_EXCLUSIVE = "WORKSPACE_EXCLUSIVE"
+    PATH_PREFIX = "PATH_PREFIX"
+    GIT = "GIT"
+    DATABASE = "DATABASE"
+    INTEGRATION = "INTEGRATION"
+
+
+class IntegrationStatus(StrValueEnum):
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    MERGE_CONFLICT = "MERGE_CONFLICT"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
 class EventType(StrValueEnum):
     MISSION_CREATED = "MISSION_CREATED"
     MISSION_STATUS_CHANGED = "MISSION_STATUS_CHANGED"
@@ -141,6 +183,25 @@ class EventType(StrValueEnum):
     MISSION_FAILED = "MISSION_FAILED"
     MISSION_PAUSED = "MISSION_PAUSED"
     MISSION_RESUMED = "MISSION_RESUMED"
+    # Phase 2A events
+    DAG_CREATED = "DAG_CREATED"
+    DAG_VALIDATED = "DAG_VALIDATED"
+    DAG_REVISED = "DAG_REVISED"
+    TASK_READY = "TASK_READY"
+    TASK_CLAIMED = "TASK_CLAIMED"
+    TASK_BLOCKED = "TASK_BLOCKED"
+    TASK_FAILED = "TASK_FAILED"
+    TASK_CANCELLED = "TASK_CANCELLED"
+    PROVIDER_RESERVED = "PROVIDER_RESERVED"
+    PROVIDER_RELEASED = "PROVIDER_RELEASED"
+    LOCK_ACQUIRED = "LOCK_ACQUIRED"
+    LOCK_RELEASED = "LOCK_RELEASED"
+    LOCK_CONFLICT = "LOCK_CONFLICT"
+    WORKTREE_CREATED = "WORKTREE_CREATED"
+    WORKTREE_REMOVED = "WORKTREE_REMOVED"
+    INTEGRATION_STARTED = "INTEGRATION_STARTED"
+    MERGE_CONFLICT = "MERGE_CONFLICT"
+    INTEGRATION_COMPLETED = "INTEGRATION_COMPLETED"
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +232,7 @@ class Mission(BaseModel):
     repair_cycles: int = 0
     blocking_issue: str | None = None
     git_head: str | None = None
+    scheduling_mode: SchedulingMode = SchedulingMode.SEQUENTIAL
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     finished_at: datetime | None = None
@@ -280,3 +342,100 @@ class ProviderHealth(BaseModel):
     @property
     def success_rate(self) -> float:
         return self.successful_runs / self.total_runs if self.total_runs else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A models
+# ---------------------------------------------------------------------------
+
+
+class TaskGraphTask(BaseModel):
+    """A node in the mission task DAG."""
+
+    id: str = Field(default_factory=new_id)
+    mission_id: str
+    title: str = ""
+    description: str = ""
+    task_type: str = "implementation"
+    role: Role = Role.IMPLEMENTATION
+    status: TaskStatus = TaskStatus.PENDING
+    dependencies: list[str] = Field(default_factory=list)
+    dependents: list[str] = Field(default_factory=list)
+    preferred_providers: list[str] = Field(default_factory=list)
+    assigned_provider: str | None = None
+    workspace_scope: list[str] = Field(default_factory=list)
+    resource_locks: list[str] = Field(default_factory=list)
+    attempts: int = 0
+    max_attempts: int = 3
+    priority: int = 0
+    created_at: datetime = Field(default_factory=utcnow)
+    ready_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    provider_run_id: str | None = None
+    checkpoint_before: str | None = None
+    checkpoint_after: str | None = None
+    result: dict[str, Any] = Field(default_factory=dict)
+    blocking_issue: str | None = None
+    dag_revision: int = 1
+
+
+class DagRevision(BaseModel):
+    id: str = Field(default_factory=new_id)
+    mission_id: str
+    revision: int
+    changed_by: str = "planner"
+    reason: str = ""
+    tasks_added: list[str] = Field(default_factory=list)
+    tasks_removed: list[str] = Field(default_factory=list)
+    deps_changed: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class ProviderReservation(BaseModel):
+    id: str = Field(default_factory=new_id)
+    task_id: str
+    provider: str
+    reserved_at: datetime = Field(default_factory=utcnow)
+    released_at: datetime | None = None
+    run_id: str | None = None
+
+
+class TaskLockRecord(BaseModel):
+    id: str = Field(default_factory=new_id)
+    task_id: str
+    lock_type: LockType
+    resource_key: str
+    acquired_at: datetime = Field(default_factory=utcnow)
+    released_at: datetime | None = None
+
+
+class TaskBranch(BaseModel):
+    id: str = Field(default_factory=new_id)
+    task_id: str
+    branch_name: str
+    base_commit: str
+    worktree_path: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+    removed_at: datetime | None = None
+
+
+class IntegrationRecord(BaseModel):
+    id: str = Field(default_factory=new_id)
+    mission_id: str
+    status: IntegrationStatus = IntegrationStatus.PENDING
+    branch_names: list[str] = Field(default_factory=list)
+    conflict_files: list[str] = Field(default_factory=list)
+    merged_commit: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    provider: str | None = None
+    summary: str = ""
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class ProviderProfile(BaseModel):
+    provider: str
+    capability_scores: dict[str, float] = Field(default_factory=dict)
+    average_duration: float = 0.0
+    updated_at: datetime = Field(default_factory=utcnow)

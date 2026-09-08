@@ -22,7 +22,7 @@ class FakeAdapter(ProviderAdapter):
     def __init__(self, name: str, script: list[str] | None = None):
         super().__init__(executable="true")
         self.name = name
-        # script behaviors: ok, ratelimit, crash, slow, auth, work
+        # script behaviors: ok, ratelimit, quota, crash, explode, slow, auth, work
         self.script = script or ["ok"]
         self.calls = 0
         self.flood_lines = 0  # when >0, execute() emits this many output lines
@@ -70,10 +70,13 @@ class FakeAdapter(ProviderAdapter):
         if request.role == "review" and behavior in ("ok", "work"):
             on_output("REVIEW_FINDINGS_JSON: []")
 
+        if behavior == "explode":
+            raise RuntimeError(f"fake {self.name} exploded")
         result_map = {
             "ok": (ProviderState.COMPLETED, FailureClass.NONE, 0),
             "work": (ProviderState.COMPLETED, FailureClass.NONE, 0),
             "ratelimit": (ProviderState.RATE_LIMITED, FailureClass.RATE_LIMIT, 1),
+            "quota": (ProviderState.RATE_LIMITED, FailureClass.QUOTA_EXHAUSTED, 1),
             "crash": (ProviderState.CRASHED, FailureClass.CRASH, 2),
             "auth": (ProviderState.AUTH_REQUIRED, FailureClass.AUTH, 1),
         }
@@ -116,3 +119,110 @@ def working_provider(name: str = "fake-worker") -> FakeAdapter:
 
 def flaky_provider(name: str = "fake-flaky", failures: int = 1) -> FakeAdapter:
     return FakeAdapter(name, ["ratelimit"] * failures + ["work"])
+
+
+class FastSuccessProvider(FakeAdapter):
+    """Completes immediately with success."""
+
+    def __init__(self, name: str = "fake-fast"):
+        super().__init__(name, ["ok"])
+
+
+class SlowSuccessProvider(FakeAdapter):
+    """Sleeps a configurable duration then succeeds."""
+
+    def __init__(self, name: str = "fake-slow", delay_s: float = 0.5):
+        super().__init__(name, ["ok"])
+        self.delay_s = delay_s
+
+    async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
+        await asyncio.sleep(self.delay_s)
+        return await super().execute(request, on_output)
+
+
+class WorkspaceWriterProvider(FakeAdapter):
+    """Writes to a specific file in the workspace then succeeds."""
+
+    def __init__(self, name: str = "fake-writer", filename: str = "output.txt", content: str = "test"):
+        super().__init__(name, ["ok"])
+        self.filename = filename
+        self.content = content
+
+    async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
+        target = request.workdir / self.filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.content)
+        on_output(f"[{self.name}] wrote {target}")
+        return ExecutionResult(
+            state=ProviderState.COMPLETED,
+            failure_class=FailureClass.NONE,
+            exit_code=0,
+            duration_s=0.01,
+            summary=f"wrote {self.filename}",
+            stdout_path=Path(request.log_dir / f"{request.run_id}.stdout.log"),
+            stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
+            raw_tail=f"wrote {self.filename}",
+            assistant_text=f"wrote {self.filename}",
+        )
+
+
+class ConflictProvider(FakeAdapter):
+    """Writes to the same file as another task to simulate merge conflicts."""
+
+    def __init__(self, name: str = "fake-conflict", filename: str = "shared.txt", content: str = "conflict-A"):
+        super().__init__(name, ["ok"])
+        self.filename = filename
+        self.content = content
+
+    async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
+        target = request.workdir / self.filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.content)
+        return ExecutionResult(
+            state=ProviderState.COMPLETED,
+            failure_class=FailureClass.NONE,
+            exit_code=0,
+            duration_s=0.01,
+            summary=f"wrote conflict {self.filename}",
+            stdout_path=Path(request.log_dir / f"{request.run_id}.stdout.log"),
+            stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
+            raw_tail=f"wrote conflict {self.filename}",
+            assistant_text=f"wrote conflict {self.filename}",
+        )
+
+
+class RateLimitAfterDelayProvider(FakeAdapter):
+    """Sleeps then rate-limits."""
+
+    def __init__(self, name: str = "fake-ratelimit-delay", delay_s: float = 0.2):
+        super().__init__(name, ["ratelimit"])
+        self.delay_s = delay_s
+
+    async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
+        await asyncio.sleep(self.delay_s)
+        return await super().execute(request, on_output)
+
+
+class CrashAfterWriteProvider(FakeAdapter):
+    """Writes a file then crashes."""
+
+    def __init__(self, name: str = "fake-crash-write", filename: str = "partial.txt"):
+        super().__init__(name, ["crash"])
+        self.filename = filename
+
+    async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
+        target = request.workdir / self.filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("partial data")
+        on_output(f"[{self.name}] wrote {target} then crashing")
+        return ExecutionResult(
+            state=ProviderState.CRASHED,
+            failure_class=FailureClass.CRASH,
+            exit_code=2,
+            duration_s=0.01,
+            summary=f"crashed after writing {self.filename}",
+            stdout_path=Path(request.log_dir / f"{request.run_id}.stdout.log"),
+            stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
+            raw_tail="crash after write",
+            assistant_text="crash after write",
+        )

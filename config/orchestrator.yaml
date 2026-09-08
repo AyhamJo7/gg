@@ -3,11 +3,11 @@
 
 providers:
   claude:
-    enabled: true
+    enabled: false
     executable: claude
     timeout_minutes: 60
   codex:
-    enabled: true
+    enabled: false
     executable: codex
     timeout_minutes: 60
   agy:
@@ -33,13 +33,21 @@ orchestration:
   max_provider_wait_seconds: 7200
   scheduler_tick_seconds: 2
 
+scheduler:
+  max_parallel_tasks: 3
+  max_parallel_per_provider:
+    claude: 1
+    codex: 1
+    agy: 1
+    opencode: 1
+
 # Role-specific provider priority (top = most preferred). Editable via UI/API.
 priority:
-  planning:    [claude, codex, agy, opencode]
-  implementation: [opencode, codex, agy, claude]
-  testing:     [codex, claude, opencode, agy]
-  review:      [claude, codex, agy, opencode]
-  repair:      [codex, opencode, claude, agy]
+  planning:    [agy, opencode]
+  implementation: [opencode, agy]
+  testing:     [agy, opencode]
+  review:      [agy, opencode]
+  repair:      [opencode, agy]
 
 git:
   auto_checkpoint: true

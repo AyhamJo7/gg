@@ -19,12 +19,16 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 import type {
   Analytics,
+  DagDependencyInput,
+  DagTaskInput,
   GitState,
   Mission,
+  MissionDag,
   MissionDetail,
   PriorityMatrix,
   Project,
   ProviderHealth,
+  TaskLogsResponse,
 } from "./types";
 
 export const api = {
@@ -50,6 +54,7 @@ export const api = {
       task: string;
       autonomy: string;
       profile: string;
+      scheduling_mode: string;
       start: boolean;
     }) => req<Mission>("/api/missions", { method: "POST", body: JSON.stringify(body) }),
     action: (id: string, action: "start" | "pause" | "resume" | "cancel") =>
@@ -61,6 +66,20 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ resolution }),
       }),
+    dag: (missionId: string) => req<MissionDag>(`/api/missions/${missionId}/dag`),
+    updateDag: (missionId: string, body: { tasks: DagTaskInput[]; dependencies: DagDependencyInput[] }) =>
+      req<{ status: string }>(`/api/missions/${missionId}/dag`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+    activeTasks: (missionId: string) =>
+      req<Array<Record<string, unknown>>>(`/api/missions/${missionId}/active-tasks`),
+    retryTask: (missionId: string, taskId: string) =>
+      req<{ status: string }>(`/api/missions/${missionId}/tasks/${taskId}/retry`, { method: "POST" }),
+    cancelTask: (missionId: string, taskId: string) =>
+      req<{ status: string }>(`/api/missions/${missionId}/tasks/${taskId}/cancel`, { method: "POST" }),
+    taskLogs: (missionId: string, taskId: string, tailBytes = 65536, signal?: AbortSignal) =>
+      req<TaskLogsResponse>(`/api/missions/${missionId}/tasks/${taskId}/logs?tail_bytes=${tailBytes}`, { signal }),
   },
   providers: {
     list: () => req<ProviderHealth[]>("/api/providers"),

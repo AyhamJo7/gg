@@ -14,9 +14,10 @@ from pydantic import BaseModel, Field
 
 from .. import git_ops
 from ..config import Config
-from ..models import utcnow
+from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
+from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
-from ..security import validate_workspace_path
+from ..security import read_redacted_tail, redact, validate_workspace_path
 from ..workspace import inspect_workspace
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,13 @@ class CreateMissionRequest(BaseModel):
     task: str
     autonomy: str = Field(default="BALANCED", pattern="^(SAFE|BALANCED|AUTONOMOUS)$")
     profile: str = "balanced"
+    scheduling_mode: str = Field(default="SEQUENTIAL", pattern="^(SEQUENTIAL|PARALLEL_SAFE)$")
     start: bool = True
+
+
+class DagUpdateRequest(BaseModel):
+    tasks: list[dict[str, Any]] = Field(default_factory=list)
+    dependencies: list[dict[str, str]] = Field(default_factory=list)
 
 
 class GateResolutionRequest(BaseModel):
@@ -185,6 +192,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         if not orchestrator.db.get("projects", req.project_id):
             raise HTTPException(404, "project not found")
         mission = orchestrator.create_mission(req.project_id, req.title, req.task, req.autonomy, req.profile)
+        if req.scheduling_mode:
+            orchestrator.db.update("missions", mission["id"], {"scheduling_mode": req.scheduling_mode})
+            mission["scheduling_mode"] = req.scheduling_mode
         if req.start:
             orchestrator.start_mission(mission["id"])
         return _jsonable(mission)
@@ -196,8 +206,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             raise HTTPException(404, "mission not found")
         mission = _jsonable(mission)
         mission["tasks"] = orchestrator.db.query(
-            "SELECT id, role, status, summary, attempts, created_at, finished_at "
-            "FROM tasks WHERE mission_id=? ORDER BY created_at",
+            "SELECT * FROM tasks WHERE mission_id=? ORDER BY created_at",
             (mission_id,),
         )
         mission["gates"] = [
@@ -224,6 +233,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             "SELECT * FROM handoffs WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,)
         )
         mission["latest_handoff"] = latest_handoff[0]["content"] if latest_handoff else None
+        mission["integrations"] = orchestrator.db.query(
+            "SELECT * FROM task_integrations WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,)
+        )
         return mission
 
     @app.post("/api/missions/{mission_id}/start")
@@ -283,6 +295,237 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         except IllegalMissionTransitionError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"status": "resolved"}
+
+    # ---------------- DAG / parallel task endpoints ----------------
+    @app.get("/api/missions/{mission_id}/dag")
+    def get_mission_dag(mission_id: str) -> dict[str, Any]:
+        mission = orchestrator.db.get("missions", mission_id)
+        if not mission:
+            raise HTTPException(404, "mission not found")
+        tasks = orchestrator.db.query("SELECT * FROM tasks WHERE mission_id=?", (mission_id,))
+        deps = orchestrator.db.query(
+            "SELECT * FROM task_dependencies WHERE from_task_id IN (SELECT id FROM tasks WHERE mission_id=?)",
+            (mission_id,),
+        )
+        branches = orchestrator.db.query(
+            "SELECT * FROM task_branches WHERE task_id IN (SELECT id FROM tasks WHERE mission_id=?)",
+            (mission_id,),
+        )
+        reservations = orchestrator.db.query(
+            """SELECT pr.*, t.title FROM provider_reservations pr
+               JOIN tasks t ON pr.task_id = t.id
+               WHERE t.mission_id=? AND pr.released_at IS NULL""",
+            (mission_id,),
+        )
+        locks = orchestrator.db.query(
+            """SELECT tl.*, t.title FROM task_locks tl
+               JOIN tasks t ON tl.task_id = t.id
+               WHERE t.mission_id=? AND tl.released_at IS NULL""",
+            (mission_id,),
+        )
+        return {
+            "mission_id": mission_id,
+            "scheduling_mode": mission.get("scheduling_mode", "SEQUENTIAL"),
+            "tasks": [_jsonable(t) for t in tasks],
+            "dependencies": [_jsonable(d) for d in deps],
+            "branches": [_jsonable(b) for b in branches],
+            "reservations": [_jsonable(r) for r in reservations],
+            "locks": [_jsonable(lock) for lock in locks],
+        }
+
+    @app.post("/api/missions/{mission_id}/dag")
+    async def update_mission_dag(mission_id: str, req: DagUpdateRequest) -> dict[str, str]:
+        mission = orchestrator.db.get("missions", mission_id)
+        if not mission:
+            raise HTTPException(404, "mission not found")
+        if mission["status"] != "CREATED":
+            raise HTTPException(409, "can only modify DAG before mission is started")
+        if not req.tasks:
+            raise HTTPException(400, "DAG must contain at least one task")
+
+        def _as_list(value: Any) -> list[str]:
+            if isinstance(value, str):
+                return [str(v) for v in json.loads(value or "[]")]
+            return [str(v) for v in (value or [])]
+
+        # Strict validation: same DAG rules as planner-produced graphs.
+        try:
+            known_ids = {raw.get("id") for raw in req.tasks}
+            for dep_ref in req.dependencies:
+                if dep_ref.get("from_task_id") not in known_ids or dep_ref.get("to_task_id") not in known_ids:
+                    raise DagValidationError(f"dependency references unknown task: {dep_ref}")
+            tasks: list[TaskGraphTask] = []
+            for raw in req.tasks:
+                tid = raw.get("id")
+                if not tid or not isinstance(tid, str):
+                    raise DagValidationError("each task needs a string 'id'")
+                tasks.append(
+                    TaskGraphTask(
+                        id=tid,
+                        mission_id=mission_id,
+                        title=str(raw.get("title", tid)),
+                        description=str(raw.get("description", "")),
+                        role=Role(str(raw.get("role", "implementation"))),
+                        dependencies=[
+                            str(d["from_task_id"])
+                            for d in req.dependencies
+                            if d.get("to_task_id") == tid and d.get("from_task_id")
+                        ],
+                        workspace_scope=_as_list(raw.get("workspace_scope")),
+                        preferred_providers=_as_list(raw.get("preferred_providers")),
+                        priority=int(raw.get("priority", 0)),
+                        max_attempts=int(raw.get("max_attempts", 3)),
+                    )
+                )
+            validate_task_graph(tasks)
+        except DagValidationError as exc:
+            raise HTTPException(400, f"DAG invalid: {exc}") from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, f"DAG invalid: {exc}") from exc
+
+        # Namespace IDs: tasks.id is a global primary key, so logical IDs
+        # ("task-a") must not collide across missions. Resubmit replaces
+        # this mission's draft rows (idempotent retry after a failed submit).
+        namespace_dag_ids(mission_id, tasks)
+        orchestrator.db.execute(
+            "DELETE FROM task_dependencies WHERE to_task_id IN (SELECT id FROM tasks WHERE mission_id=?)",
+            (mission_id,),
+        )
+        orchestrator.db.execute("DELETE FROM tasks WHERE mission_id=?", (mission_id,))
+        now = utcnow().isoformat()
+        for task in tasks:
+            orchestrator.db.insert(
+                "tasks",
+                {
+                    "id": task.id,
+                    "mission_id": mission_id,
+                    "role": task.role.value,
+                    "status": TaskStatus.PENDING.value,
+                    "task_type": task.task_type,
+                    "title": task.title,
+                    "description": task.description,
+                    "preferred_providers": json.dumps(task.preferred_providers),
+                    "workspace_scope": json.dumps(task.workspace_scope),
+                    "max_attempts": task.max_attempts,
+                    "priority": task.priority,
+                    "created_at": now,
+                    "dag_revision": 1,
+                },
+            )
+            for dep_id in task.dependencies:
+                orchestrator.db.insert(
+                    "task_dependencies",
+                    {"from_task_id": dep_id, "to_task_id": task.id, "created_at": now},
+                )
+        return {"status": "dag updated"}
+
+    @app.get("/api/missions/{mission_id}/active-tasks")
+    def get_active_tasks(mission_id: str) -> list[dict[str, Any]]:
+        mission = orchestrator.db.get("missions", mission_id)
+        if not mission:
+            raise HTTPException(404, "mission not found")
+        rows = orchestrator.db.query(
+            """SELECT t.*, pr.provider, pr.started_at as provider_started
+               FROM tasks t
+               LEFT JOIN provider_runs pr ON t.provider_run_id = pr.id
+               WHERE t.mission_id=? AND t.status IN ('CLAIMED','RUNNING','WAITING_FOR_PROVIDER')""",
+            (mission_id,),
+        )
+        return [_jsonable(r) for r in rows]
+
+    @app.post("/api/missions/{mission_id}/tasks/{task_id}/retry")
+    async def retry_task(mission_id: str, task_id: str) -> dict[str, str]:
+        task = orchestrator.db.get("tasks", task_id)
+        if not task or task["mission_id"] != mission_id:
+            raise HTTPException(404, "task not found")
+        mission = orchestrator.db.get("missions", mission_id)
+        if mission and MissionStatus(mission["status"]) in TERMINAL_STATUSES:
+            raise HTTPException(409, f"cannot retry task: mission is {mission['status']}")
+        orchestrator.db.update(
+            "tasks",
+            task_id,
+            {
+                "status": TaskStatus.PENDING.value,
+                "blocking_issue": "manual retry",
+                "attempts": 0,
+                "finished_at": None,
+            },
+        )
+        engine = orchestrator._engines.get(mission_id)
+        if engine:
+            engine.wake()
+        return {"status": "retry queued"}
+
+    @app.post("/api/missions/{mission_id}/tasks/{task_id}/cancel")
+    async def cancel_task(mission_id: str, task_id: str) -> dict[str, str]:
+        task = orchestrator.db.get("tasks", task_id)
+        if not task or task["mission_id"] != mission_id:
+            raise HTTPException(404, "task not found")
+        orchestrator.db.update(
+            "tasks",
+            task_id,
+            {"status": "CANCELLED", "finished_at": utcnow().isoformat()},
+        )
+        # Release any reservation/locks
+        from .. import reservations as res_module
+        from .. import task_locks as tl_module
+
+        res_module.release_provider_reservation(orchestrator.db, orchestrator.events, task_id)
+        tl_module.release_locks_for_task(orchestrator.db, orchestrator.events, task_id)
+        return {"status": "task cancelled"}
+
+    @app.get("/api/missions/{mission_id}/tasks/{task_id}/logs")
+    def get_task_logs(mission_id: str, task_id: str, tail_bytes: int = 262144) -> dict[str, Any]:
+        task = orchestrator.db.get("tasks", task_id)
+        if not task or task["mission_id"] != mission_id:
+            raise HTTPException(404, "task not found")
+        run = orchestrator.db.query(
+            "SELECT * FROM provider_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1",
+            (task_id,),
+        )
+        if not run:
+            return {"stdout": "", "stderr": "", "run": None}
+        run_row = run[0]
+        # Containment: only serve files inside this project's log directory,
+        # so a manipulated DB path can never expose arbitrary files.
+        log_dir: Path | None = None
+        mission = orchestrator.db.get("missions", mission_id)
+        if mission and mission.get("project_id"):
+            project = orchestrator.db.get("projects", mission["project_id"])
+            if project and project.get("path"):
+                log_dir = Path(project["path"]) / ".orchestrator" / "logs"
+
+        # Bounded tail read with redaction-safe truncation (MED-01):
+        # read_redacted_tail keeps a bounded overlap for pattern context,
+        # redacts the whole window together, then serves whole lines only.
+        def _read_log(raw_path: Any) -> tuple[str, int, bool]:
+            if not raw_path or not isinstance(raw_path, str) or log_dir is None:
+                return "", 0, False
+            try:
+                resolved = Path(raw_path).resolve()
+                if log_dir.resolve() not in resolved.parents:
+                    logger.warning("refusing log path outside project log dir: %s", raw_path)
+                    return "", 0, False
+                if not resolved.is_file():
+                    return "", 0, False
+                return read_redacted_tail(resolved, tail_bytes)
+            except OSError:
+                return "", 0, False
+
+        safe_run = _jsonable(run_row)
+        if isinstance(safe_run.get("summary"), str):
+            safe_run["summary"] = redact(safe_run["summary"])
+        stdout_text, stdout_size, stdout_truncated = _read_log(run_row.get("stdout_path"))
+        stderr_text, stderr_size, stderr_truncated = _read_log(run_row.get("stderr_path"))
+        return {
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "run": safe_run,
+            "stdout_size": stdout_size,
+            "stderr_size": stderr_size,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+        }
 
     # ---------------- git ----------------
     @app.get("/api/projects/{project_id}/git")
