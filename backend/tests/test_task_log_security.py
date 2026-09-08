@@ -131,6 +131,84 @@ async def test_log_tail_is_bounded_and_line_aligned(
     assert resp.json()["stdout_size"] == len(lines.encode())
 
 
+async def test_log_symlink_escape_not_served(client: httpx.AsyncClient, workspace: Path):
+    mid, tid, _ = await _seed(client, workspace, "logs-symlink", "hello\n")
+    db = client.orchestrator.db
+    secret = workspace / "real-secret.txt"
+    secret.write_text("sk-ant-FAKEFAKEFAKE1234567890abcdef\n")
+    link = workspace / ".orchestrator" / "logs" / "evil.stdout.log"
+    link.symlink_to(secret)
+    db.update("provider_runs", "run-1", {"stdout_path": str(link)})
+    resp = await client.get(f"/api/missions/{mid}/tasks/{tid}/logs")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["stdout"] == ""
+    assert "FAKEFAKEFAKE" not in resp.text
+
+
+async def test_log_yaml_value_at_boundary_redacted(client: httpx.AsyncClient, workspace: Path):
+    """End-to-end MED-01 repro: anchor pushed out of the served region."""
+    project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
+    mission = (
+        await client.post(
+            "/api/missions",
+            json={
+                "project_id": project["id"],
+                "title": "logs-yaml",
+                "task": "do it",
+                "autonomy": "AUTONOMOUS",
+                "scheduling_mode": "PARALLEL_SAFE",
+                "start": False,
+            },
+        )
+    ).json()
+    dag = {
+        "tasks": [
+            {
+                "id": "task-a",
+                "role": "implementation",
+                "title": "task-a",
+                "description": "do a",
+                "preferred_providers": '["fake-a"]',
+                "workspace_scope": '["src/a.py"]',
+                "priority": 0,
+            }
+        ],
+        "dependencies": [],
+    }
+    assert (await client.post(f"/api/missions/{mission['id']}/dag", json=dag)).status_code == 200
+    tid = f"{mission['id'][:8]}-task-a"
+    log_dir = workspace / ".orchestrator" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "run-yaml.stdout.log"
+    log_file.write_bytes(b"f" * 2000 + b"password:\n  fakepassvalue123\n" + b"t\n" * 50)
+    db = client.orchestrator.db
+    db.insert(
+        "provider_runs",
+        {
+            "id": "run-yaml",
+            "mission_id": mission["id"],
+            "task_id": tid,
+            "provider": "fake-a",
+            "role": "implementation",
+            "command": ["fake-a"],
+            "cwd": str(workspace),
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "finished_at": "2026-01-01T00:00:01+00:00",
+            "exit_code": 0,
+            "failure_class": "NONE",
+            "provider_state": "COMPLETED",
+            "stdout_path": str(log_file),
+            "stderr_path": None,
+            "summary": "",
+        },
+    )
+    resp = await client.get(f"/api/missions/{mission['id']}/tasks/{tid}/logs?tail_bytes=1024")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stdout_truncated"] is True
+    assert "fakepassvalue123" not in body["stdout"]
+
+
 async def test_log_mismatched_ids_404(client: httpx.AsyncClient, workspace: Path):
     mid, tid, _ = await _seed(client, workspace, "logs-owner", "hello\n")
     other = (

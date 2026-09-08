@@ -40,6 +40,53 @@ def redact(text: str) -> str:
     return text
 
 
+# Upper bound for the redaction context overlap (MED-01). When serving a
+# bounded tail of a log file, patterns whose anchor (e.g. a YAML key) sits
+# before the cut point would otherwise miss their value. We therefore read
+# up to TAIL_OVERLAP_MAX extra bytes, redact the whole window together, and
+# only then drop everything before the cut — so every served character
+# passed through redact() with its full surrounding context present.
+# Residual assumption (documented, bounded): an anchor separated from its
+# value by more than the overlap is out of context and will not link.
+TAIL_OVERLAP_MAX = 65536
+
+
+def read_redacted_tail(path: Path, cap_bytes: int) -> tuple[str, int, bool]:
+    """Read at most cap_bytes from the end of path, redacted.
+
+    Returns (served_text, file_size_bytes, truncated). Served text consists
+    of whole redacted lines only — redacted lines are never split, so no
+    partial credential fragment can leak at a truncation boundary. Reads
+    are bounded to cap_bytes + overlap regardless of file size.
+    """
+    cap = max(1024, min(cap_bytes, 1048576))
+    size = path.stat().st_size
+    truncated = size > cap
+    overlap = min(cap, TAIL_OVERLAP_MAX)
+    start = max(0, size - cap - overlap) if truncated else 0
+    with path.open("rb") as fh:
+        fh.seek(start)
+        raw = fh.read()
+    text = raw.decode("utf-8", errors="replace")
+    redacted = redact(text)
+    if not truncated:
+        return redacted, size, False
+    lines = redacted.split("\n")
+    kept: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        total += len(line.encode("utf-8")) + 1
+        if total > cap and kept:
+            break
+        kept.append(line)
+    served = "\n".join(reversed(kept))
+    if len(served.encode("utf-8")) > cap:
+        # Pathological single line larger than the whole budget: keep tail
+        # semantics, never serve more than the cap.
+        served = served.encode("utf-8")[-cap:].decode("utf-8", errors="replace")
+    return served, size, True
+
+
 NEVER_SENSITIVE = {".env.example", ".env.sample", ".env.template"}
 
 

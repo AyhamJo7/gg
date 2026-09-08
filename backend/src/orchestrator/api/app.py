@@ -17,7 +17,7 @@ from ..config import Config
 from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
 from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
-from ..security import redact, validate_workspace_path
+from ..security import read_redacted_tail, redact, validate_workspace_path
 from ..workspace import inspect_workspace
 
 logger = logging.getLogger(__name__)
@@ -495,11 +495,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             if project and project.get("path"):
                 log_dir = Path(project["path"]) / ".orchestrator" / "logs"
 
-        # Bounded tail read: serve at most tail_bytes from the end, starting
-        # at the next newline so no line (and no secret pattern) is split
-        # before redaction.
-        tail_cap = max(1024, min(tail_bytes, 1048576))
-
+        # Bounded tail read with redaction-safe truncation (MED-01):
+        # read_redacted_tail keeps a bounded overlap for pattern context,
+        # redacts the whole window together, then serves whole lines only.
         def _read_log(raw_path: Any) -> tuple[str, int, bool]:
             if not raw_path or not isinstance(raw_path, str) or log_dir is None:
                 return "", 0, False
@@ -510,13 +508,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
                     return "", 0, False
                 if not resolved.is_file():
                     return "", 0, False
-                size = resolved.stat().st_size
-                with resolved.open("rb") as fh:
-                    if size > tail_cap:
-                        fh.seek(size - tail_cap)
-                        fh.readline()  # drop partial first line
-                    content = fh.read().decode("utf-8", errors="replace")
-                return redact(content), size, size > tail_cap
+                return read_redacted_tail(resolved, tail_bytes)
             except OSError:
                 return "", 0, False
 

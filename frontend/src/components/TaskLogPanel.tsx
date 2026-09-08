@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type { TaskLogsResponse } from "../lib/types";
 
@@ -24,32 +24,50 @@ export function TaskLogPanel({
 }) {
   const [logs, setLogs] = useState<TaskLogsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Generation token: identifies the current (mission, task) selection so
+  // late responses from a previous task can never overwrite current logs.
+  const genRef = useRef(0);
 
   useEffect(() => {
-    let cancelled = false;
+    const gen = ++genRef.current;
     setLogs(null);
     setError(null);
-    const load = () => {
-      api.missions
-        .taskLogs(missionId, taskId, TAIL_BYTES)
-        .then((data) => {
-          if (!cancelled) {
-            setLogs(data);
-            setError(null);
-          }
-        })
-        .catch((e) => {
-          if (!cancelled) setError((e as Error).message);
-        });
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let controller: AbortController | null = null;
+    let disposed = false;
+
+    const fresh = () => !disposed && genRef.current === gen;
+
+    const load = async () => {
+      controller?.abort();
+      controller = new AbortController();
+      try {
+        const data = await api.missions.taskLogs(missionId, taskId, TAIL_BYTES, controller.signal);
+        if (!fresh()) return;
+        setLogs(data);
+        setError(null);
+      } catch (e) {
+        if (!fresh()) return;
+        if (e instanceof DOMException && e.name === "AbortError") return;
+        setError((e as Error).message);
+      }
+      // Chain the next poll only after this one settles: at most one
+      // in-flight request per selected task, no timer accumulation, and a
+      // slow response can never overlap its successor. Errors also
+      // reschedule while active, so transient failures reconnect.
+      if (fresh() && active) {
+        timer = setTimeout(() => {
+          timer = null;
+          void load();
+        }, pollMs);
+      }
     };
-    load();
-    if (!active) return () => {
-      cancelled = true;
-    };
-    const id = setInterval(load, pollMs);
+
+    void load();
     return () => {
-      cancelled = true;
-      clearInterval(id);
+      disposed = true;
+      controller?.abort();
+      if (timer) clearTimeout(timer);
     };
   }, [missionId, taskId, active, pollMs]);
 
