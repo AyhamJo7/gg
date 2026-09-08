@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -161,7 +160,17 @@ class ParallelMissionEngine:
     # ------------------------------------------------------------------
 
     async def _reconcile_running_tasks(self) -> None:
-        """On startup, reconcile tasks that were RUNNING/CLAIMED before crash."""
+        """On startup, reconcile tasks that were RUNNING/CLAIMED before crash.
+
+        Invariants: no task is left without a runner; reservations and locks
+        held by dead tasks are released; attempts are durably counted; a
+        still-alive but unverifiable process is never killed and never
+        requeued blindly (loud FAILED instead of silent stuck or duplicate
+        writers); stale reservations/locks on non-running tasks are dropped
+        (no runner exists at engine start to own them).
+        """
+        from .orphans import kill_process_tree, process_alive, verify_process_ownership
+
         running = self.db.query(
             "SELECT * FROM tasks WHERE mission_id=? AND status IN ('RUNNING','CLAIMED')",
             (self.mission_id,),
@@ -172,54 +181,7 @@ class ParallelMissionEngine:
                 "SELECT * FROM provider_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1",
                 (tid,),
             )
-            if runs:
-                run = runs[0]
-                pid = run.get("pid")
-                if pid is not None:
-                    proc_path = f"/proc/{pid}"
-                    if not await asyncio.to_thread(os.path.exists, proc_path):
-                        # Process is gone — mark run crashed and reset task
-                        self.db.update(
-                            "provider_runs",
-                            run["id"],
-                            {
-                                "failure_class": FailureClass.CRASH.value,
-                                "provider_state": ProviderState.CRASHED.value,
-                                "finished_at": utcnow().isoformat(),
-                            },
-                        )
-                        release_provider_reservation(self.db, self.events, tid)
-                        task_locks.release_locks_for_task(self.db, self.events, tid)
-
-                        attempt = int(task.get("attempts", 0)) + 1
-                        max_attempts = int(task.get("max_attempts", 3))
-                        self.db.update("tasks", tid, {"attempts": attempt})
-                        if attempt < max_attempts:
-                            self.db.update(
-                                "tasks",
-                                tid,
-                                {
-                                    "status": TaskStatus.PENDING.value,
-                                    "blocking_issue": f"SIGKILL recovery: process {pid} vanished",
-                                },
-                            )
-                        else:
-                            self.db.update(
-                                "tasks",
-                                tid,
-                                {
-                                    "status": TaskStatus.FAILED.value,
-                                    "blocking_issue": f"SIGKILL recovery: process {pid} vanished, exhausted attempts",
-                                },
-                            )
-                        self.events.publish(
-                            EventType.TASK_FAILED,
-                            mission_id=self.mission_id,
-                            task_id=tid,
-                            reason="sigkill_recovery",
-                        )
-                        continue
-            else:
+            if not runs:
                 # No provider_run record — just clean up and reset
                 release_provider_reservation(self.db, self.events, tid)
                 task_locks.release_locks_for_task(self.db, self.events, tid)
@@ -231,6 +193,100 @@ class ParallelMissionEngine:
                         "blocking_issue": "SIGKILL recovery: no active process record",
                     },
                 )
+                continue
+            run = runs[0]
+            pid = run.get("pid")
+            if pid is None or not process_alive(pid):
+                # Never spawned, or process is gone — safe to retry
+                self._reset_interrupted_task(task, run["id"], f"SIGKILL recovery: process {pid} vanished")
+                continue
+            provider = run.get("provider") or ""
+            pgid = run.get("pgid")
+            verified = (
+                pgid is not None
+                and await asyncio.to_thread(verify_process_ownership, pid, pgid, run.get("started_at_ts"), provider)
+            )
+            if verified and pgid is not None:
+                # Positively ours: terminate the orphan, then retry like vanished
+                logger.warning("reaping verified orphan provider process pid=%s pgid=%s task=%s", pid, pgid, tid)
+                await asyncio.to_thread(kill_process_tree, pgid)
+                self._reset_interrupted_task(task, run["id"], f"SIGKILL recovery: orphaned process {pid} reaped")
+                continue
+            # Alive but not verifiable as ours: never kill, never requeue.
+            # Fail loudly with evidence instead of stuck-forever or duplicates.
+            self.db.update(
+                "provider_runs",
+                run["id"],
+                {
+                    "failure_class": FailureClass.CRASH.value,
+                    "provider_state": ProviderState.CRASHED.value,
+                    "finished_at": utcnow().isoformat(),
+                    "summary": "orphaned process unverifiable on backend startup",
+                },
+            )
+            release_provider_reservation(self.db, self.events, tid)
+            task_locks.release_locks_for_task(self.db, self.events, tid)
+            self.db.update(
+                "tasks",
+                tid,
+                {
+                    "status": TaskStatus.FAILED.value,
+                    "blocking_issue": (
+                        f"SIGKILL recovery: live process {pid} not verifiable as ours "
+                        "(not killed, not requeued — manual review required)"
+                    ),
+                },
+            )
+            self.events.publish(
+                EventType.TASK_FAILED,
+                mission_id=self.mission_id,
+                task_id=tid,
+                reason="sigkill_recovery_unverifiable",
+            )
+        # Drop stale reservations/locks owned by tasks with no runner.
+        for task in self.db.query(
+            "SELECT id FROM tasks WHERE mission_id=? AND status NOT IN ('RUNNING','CLAIMED','WAITING_FOR_PROVIDER')",
+            (self.mission_id,),
+        ):
+            release_provider_reservation(self.db, self.events, task["id"])
+            task_locks.release_locks_for_task(self.db, self.events, task["id"])
+
+    def _reset_interrupted_task(self, task: dict[str, Any], run_id: str, reason: str) -> None:
+        """Mark the run crashed and return the task to PENDING (or FAILED when out of attempts)."""
+        tid = task["id"]
+        self.db.update(
+            "provider_runs",
+            run_id,
+            {
+                "failure_class": FailureClass.CRASH.value,
+                "provider_state": ProviderState.CRASHED.value,
+                "finished_at": utcnow().isoformat(),
+            },
+        )
+        release_provider_reservation(self.db, self.events, tid)
+        task_locks.release_locks_for_task(self.db, self.events, tid)
+
+        attempt = int(task.get("attempts", 0)) + 1
+        max_attempts = int(task.get("max_attempts", 3))
+        self.db.update("tasks", tid, {"attempts": attempt})
+        if attempt < max_attempts:
+            self.db.update(
+                "tasks",
+                tid,
+                {"status": TaskStatus.PENDING.value, "blocking_issue": reason},
+            )
+        else:
+            self.db.update(
+                "tasks",
+                tid,
+                {"status": TaskStatus.FAILED.value, "blocking_issue": f"{reason}, exhausted attempts"},
+            )
+        self.events.publish(
+            EventType.TASK_FAILED,
+            mission_id=self.mission_id,
+            task_id=tid,
+            reason="sigkill_recovery",
+        )
 
     # ------------------------------------------------------------------
     # Blockage detection
