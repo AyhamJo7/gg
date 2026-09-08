@@ -197,7 +197,9 @@ class ParallelMissionEngine:
             run = runs[0]
             pid = run.get("pid")
             if pid is None or not process_alive(pid):
-                # Never spawned, or process is gone — safe to retry
+                # Safe to retry: the spawn handshake guarantees a provider
+                # child can only exec after its identity is persisted, so a
+                # missing pid (or a dead/zombie one) proves nothing ever wrote.
                 self._reset_interrupted_task(task, run["id"], f"SIGKILL recovery: process {pid} vanished")
                 continue
             provider = run.get("provider") or ""
