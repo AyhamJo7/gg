@@ -104,14 +104,56 @@ def main() -> int:
     if args.repo:
         import subprocess
 
-        try:
-            out = subprocess.run(
-                ["git", "-C", args.repo, "status", "--porcelain"],
-                capture_output=True, text=True, timeout=30,
-            ).stdout
-            print(f"repo_dirty_lines={len(out.strip().splitlines()) if out.strip() else 0}")
-        except (OSError, subprocess.SubprocessError):
-            print("repo_dirty_lines=unknown")
+        def _git(*git_args: str) -> tuple[int, str]:
+            try:
+                r = subprocess.run(
+                    ["git", "-C", args.repo, *git_args],
+                    capture_output=True, text=True, timeout=30,
+                )
+                return r.returncode, r.stdout
+            except (OSError, subprocess.SubprocessError):
+                return 128, ""
+
+        def _ignored(rel: str) -> bool:
+            code, _ = _git("check-ignore", "-q", "--", rel)
+            return code == 0
+
+        rc, out = _git("status", "--porcelain=v1", "--ignored", "-z")
+        if rc != 0:
+            print("repo_status=unreadable")
+            findings.append("git status unreadable for repo")
+        else:
+            ignored = modified = untracked = 0
+            for entry in out.split("\0"):
+                if len(entry) < 4 or entry[2] != " ":
+                    continue  # blank, or rename-target half (its XY half is counted)
+                code2, rel = entry[:2], entry[3:].strip().strip('"')
+                if code2 == "!!" or _ignored(rel):
+                    ignored += 1
+                elif code2 == "??":
+                    untracked += 1
+                    findings.append(f"uncommitted new file: {rel}")
+                else:
+                    modified += 1
+                    findings.append(f"uncommitted change: {code2.strip()} {rel}")
+            print(f"repo_ignored={ignored} repo_modified_tracked={modified} repo_untracked={untracked}")
+
+    if args.mission:
+        mission = conn.execute("SELECT status FROM missions WHERE id=?", (args.mission,)).fetchone()
+        if mission and mission["status"] == "COMPLETED":
+            for label, sql in (
+                ("integration", "SELECT 1 FROM task_integrations WHERE mission_id=? AND status='COMPLETED'"),
+                ("review", "SELECT 1 FROM reviews WHERE mission_id=?"),
+                ("final checkpoint", "SELECT 1 FROM checkpoints WHERE mission_id=?"),
+            ):
+                if not conn.execute(sql, (args.mission,)).fetchone():
+                    findings.append(f"COMPLETED mission missing {label} evidence")
+            print("evidence_check=done")
+        elif mission:
+            print(f"evidence_check=skipped status={mission['status']}")
+        else:
+            findings.append("mission not found")
+            print("evidence_check=mission-missing")
 
     if findings:
         print("--- findings ---")

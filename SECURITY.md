@@ -67,3 +67,9 @@ operations, and workspace escape.
   under the project's `.orchestrator/logs/` and are excluded from checkpoints
   by the sensitive-file rules only if they match secret filenames — treat that
   directory as sensitive.
+- `workspace_scope` is a scheduling lock, not a filesystem sandbox: a task
+  declares which paths it will touch so conflicting tasks serialize, but the
+  provider process itself is not confined to those paths.
+- Target verification inherits the orchestrator's environment, including
+  `VIRTUAL_ENV` when set: toolchain behavior in dogfood reflects the
+  operator's shell, not a hermetic container.
