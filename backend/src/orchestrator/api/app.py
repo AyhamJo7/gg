@@ -475,7 +475,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return {"status": "task cancelled"}
 
     @app.get("/api/missions/{mission_id}/tasks/{task_id}/logs")
-    def get_task_logs(mission_id: str, task_id: str) -> dict[str, Any]:
+    def get_task_logs(mission_id: str, task_id: str, tail_bytes: int = 262144) -> dict[str, Any]:
         task = orchestrator.db.get("tasks", task_id)
         if not task or task["mission_id"] != mission_id:
             raise HTTPException(404, "task not found")
@@ -495,27 +495,44 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             if project and project.get("path"):
                 log_dir = Path(project["path"]) / ".orchestrator" / "logs"
 
-        def _read_log(raw_path: Any) -> str:
+        # Bounded tail read: serve at most tail_bytes from the end, starting
+        # at the next newline so no line (and no secret pattern) is split
+        # before redaction.
+        tail_cap = max(1024, min(tail_bytes, 1048576))
+
+        def _read_log(raw_path: Any) -> tuple[str, int, bool]:
             if not raw_path or not isinstance(raw_path, str) or log_dir is None:
-                return ""
+                return "", 0, False
             try:
                 resolved = Path(raw_path).resolve()
                 if log_dir.resolve() not in resolved.parents:
                     logger.warning("refusing log path outside project log dir: %s", raw_path)
-                    return ""
+                    return "", 0, False
                 if not resolved.is_file():
-                    return ""
-                return redact(resolved.read_text(encoding="utf-8", errors="replace"))
+                    return "", 0, False
+                size = resolved.stat().st_size
+                with resolved.open("rb") as fh:
+                    if size > tail_cap:
+                        fh.seek(size - tail_cap)
+                        fh.readline()  # drop partial first line
+                    content = fh.read().decode("utf-8", errors="replace")
+                return redact(content), size, size > tail_cap
             except OSError:
-                return ""
+                return "", 0, False
 
         safe_run = _jsonable(run_row)
         if isinstance(safe_run.get("summary"), str):
             safe_run["summary"] = redact(safe_run["summary"])
+        stdout_text, stdout_size, stdout_truncated = _read_log(run_row.get("stdout_path"))
+        stderr_text, stderr_size, stderr_truncated = _read_log(run_row.get("stderr_path"))
         return {
-            "stdout": _read_log(run_row.get("stdout_path")),
-            "stderr": _read_log(run_row.get("stderr_path")),
+            "stdout": stdout_text,
+            "stderr": stderr_text,
             "run": safe_run,
+            "stdout_size": stdout_size,
+            "stderr_size": stderr_size,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
         }
 
     # ---------------- git ----------------

@@ -1,20 +1,59 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { ProviderRun } from "../lib/types";
+import type { TaskLogsResponse } from "../lib/types";
 
-export function TaskLogPanel({ missionId, taskId }: { missionId: string; taskId: string }) {
-  const [logs, setLogs] = useState<{ stdout: string; stderr: string; run: ProviderRun | null } | null>(null);
+const POLL_MS = 2500;
+const TAIL_BYTES = 65536;
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function TaskLogPanel({
+  missionId,
+  taskId,
+  active,
+  pollMs = POLL_MS,
+}: {
+  missionId: string;
+  taskId: string;
+  active: boolean;
+  pollMs?: number;
+}) {
+  const [logs, setLogs] = useState<TaskLogsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    api.missions.taskLogs(missionId, taskId)
-      .then((data) => { if (!cancelled) setLogs(data); })
-      .catch((e) => { if (!cancelled) setError((e as Error).message); });
-    return () => { cancelled = true; };
-  }, [missionId, taskId]);
+    setLogs(null);
+    setError(null);
+    const load = () => {
+      api.missions
+        .taskLogs(missionId, taskId, TAIL_BYTES)
+        .then((data) => {
+          if (!cancelled) {
+            setLogs(data);
+            setError(null);
+          }
+        })
+        .catch((e) => {
+          if (!cancelled) setError((e as Error).message);
+        });
+    };
+    load();
+    if (!active) return () => {
+      cancelled = true;
+    };
+    const id = setInterval(load, pollMs);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [missionId, taskId, active, pollMs]);
 
-  if (error) {
+  if (error && !logs) {
     return <div className="card" style={{ borderColor: "var(--red)" }}><p className="muted">Failed to load logs: {error}</p></div>;
   }
 
@@ -28,7 +67,12 @@ export function TaskLogPanel({ missionId, taskId }: { missionId: string; taskId:
   return (
     <div className="card" data-testid="task-log-panel">
       <div className="row spread" style={{ marginBottom: 8 }}>
-        <h3>Task Log</h3>
+        <h3>
+          Task Log{" "}
+          <span className="muted" style={{ fontSize: 11 }} data-testid="task-log-live">
+            {active ? "● live" : "■ final"}
+          </span>
+        </h3>
         {run && (
           <div className="row" style={{ gap: 12 }}>
             <span className="muted" style={{ fontSize: 11 }}>
@@ -50,6 +94,11 @@ export function TaskLogPanel({ missionId, taskId }: { missionId: string; taskId:
           </div>
         )}
       </div>
+      {(logs.stdout_truncated || logs.stderr_truncated) && (
+        <p className="muted" style={{ fontSize: 11 }}>
+          Showing last {formatBytes(TAIL_BYTES)} of {formatBytes(Math.max(logs.stdout_size, logs.stderr_size))} — older output truncated.
+        </p>
+      )}
       {!hasOutput && <p className="muted">No log output yet.</p>}
       {logs.stdout && (
         <div style={{ marginBottom: 8 }}>

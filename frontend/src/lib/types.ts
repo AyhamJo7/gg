@@ -174,6 +174,18 @@ export interface ProviderRun {
   summary: string;
 }
 
+export interface TaskLogsResponse {
+  stdout: string;
+  stderr: string;
+  run: ProviderRun | null;
+  stdout_size: number;
+  stderr_size: number;
+  stdout_truncated: boolean;
+  stderr_truncated: boolean;
+}
+
+export const TERMINAL_TASK_STATUSES = ["COMPLETED", "FAILED", "CANCELLED", "UNVERIFIED"];
+
 export interface ProviderHealth {
   name: string;
   state: string;

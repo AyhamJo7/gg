@@ -28,7 +28,7 @@ import type {
   PriorityMatrix,
   Project,
   ProviderHealth,
-  ProviderRun,
+  TaskLogsResponse,
 } from "./types";
 
 export const api = {
@@ -78,8 +78,8 @@ export const api = {
       req<{ status: string }>(`/api/missions/${missionId}/tasks/${taskId}/retry`, { method: "POST" }),
     cancelTask: (missionId: string, taskId: string) =>
       req<{ status: string }>(`/api/missions/${missionId}/tasks/${taskId}/cancel`, { method: "POST" }),
-    taskLogs: (missionId: string, taskId: string) =>
-      req<{ stdout: string; stderr: string; run: ProviderRun | null }>(`/api/missions/${missionId}/tasks/${taskId}/logs`),
+    taskLogs: (missionId: string, taskId: string, tailBytes = 65536) =>
+      req<TaskLogsResponse>(`/api/missions/${missionId}/tasks/${taskId}/logs?tail_bytes=${tailBytes}`),
   },
   providers: {
     list: () => req<ProviderHealth[]>("/api/providers"),

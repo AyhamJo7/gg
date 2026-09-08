@@ -111,6 +111,26 @@ async def test_log_secrets_redacted(client: httpx.AsyncClient, workspace: Path):
     assert "[REDACTED_API_KEY]" in body["run"]["summary"]
 
 
+async def test_log_tail_is_bounded_and_line_aligned(
+    client: httpx.AsyncClient, workspace: Path
+):
+    lines = "".join(f"line {i:04d} padding-padding-padding\n" for i in range(200))
+    mid, tid, _ = await _seed(client, workspace, "logs-tail", lines)
+    resp = await client.get(f"/api/missions/{mid}/tasks/{tid}/logs?tail_bytes=1024")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stdout_size"] == len(lines.encode())
+    assert body["stdout_truncated"] is True
+    assert len(body["stdout"].encode()) <= 1024 + 64
+    # starts on a line boundary — no split first line
+    assert body["stdout"].startswith("line ")
+    assert "line 0199" in body["stdout"]
+    # small request within size serves everything untruncated
+    resp = await client.get(f"/api/missions/{mid}/tasks/{tid}/logs")
+    assert resp.json()["stdout_truncated"] is False
+    assert resp.json()["stdout_size"] == len(lines.encode())
+
+
 async def test_log_mismatched_ids_404(client: httpx.AsyncClient, workspace: Path):
     mid, tid, _ = await _seed(client, workspace, "logs-owner", "hello\n")
     other = (

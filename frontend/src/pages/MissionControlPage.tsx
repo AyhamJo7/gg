@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import { useElapsed, usePolling } from "../lib/hooks";
 import { useMissionEvents } from "../lib/ws";
 import { Badge } from "../components/Badge";
+import { ConflictCard } from "../components/ConflictCard";
 import { DagGraph } from "../components/DagGraph";
 import { GateCard } from "../components/GateCard";
 import { GitPanel } from "../components/GitPanel";
@@ -14,7 +15,7 @@ import { TaskLogPanel } from "../components/TaskLogPanel";
 import { TaskPanel } from "../components/TaskPanel";
 import { Terminal } from "../components/Terminal";
 import { WorkflowTimeline } from "../components/WorkflowTimeline";
-import type { Mission } from "../lib/types";
+import { TERMINAL_TASK_STATUSES, type Mission } from "../lib/types";
 
 function MissionHeader({ mission }: { mission: Mission }) {
   const active = !["COMPLETED", "FAILED", "CANCELLED", "PAUSED", "UNVERIFIED"].includes(mission.status);
@@ -174,9 +175,12 @@ export function MissionControlPage() {
                   {detail.tasks.map((t) => (
                     <TaskPanel key={t.id} task={t} missionId={mission.id} onRefresh={refreshAll} />
                   ))}
-                  {selectedTaskId && (
-                    <TaskLogPanel missionId={mission.id} taskId={selectedTaskId} />
-                  )}
+                  {selectedTaskId &&
+                    (() => {
+                      const selectedTask = detail.tasks.find((t) => t.id === selectedTaskId);
+                      const live = !!selectedTask && !TERMINAL_TASK_STATUSES.includes(selectedTask.status);
+                      return <TaskLogPanel missionId={mission.id} taskId={selectedTaskId} active={live} />;
+                    })()}
                 </>
               ) : (
                 <div className="card">
@@ -197,6 +201,9 @@ export function MissionControlPage() {
                 </div>
               )}
               <IntegrationPanel integration={integration} />
+              {integration?.status === "MERGE_CONFLICT" && mission && (
+                <ConflictCard integration={integration} missionId={mission.id} onResumed={refreshAll} />
+              )}
             </div>
             <div className="stack">
               <ReviewFindingsPanel findings={detail?.findings ?? []} />
