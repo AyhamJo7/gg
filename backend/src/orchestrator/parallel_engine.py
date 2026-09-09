@@ -736,6 +736,11 @@ class ParallelMissionEngine:
 
         if result.ok:
             self.registry.record_success(provider_name, result.duration_s)
+        elif result.gate_refused:
+            # Spawn-handshake refusal is orchestrator-internal, not evidence
+            # about the provider — must not cost it a reliability cooldown,
+            # but mark_busy() still needs undoing or it's stuck unselectable.
+            self.registry.clear_busy_without_penalty(provider_name)
         else:
             self.registry.record_failure(provider_name, result.failure_class, result.duration_s, result.raw_tail[:300])
 
@@ -1024,9 +1029,16 @@ class ParallelMissionEngine:
                     )
                 break
 
-            state = self.registry.record_failure(
-                provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
-            )
+            if result.gate_refused:
+                # Spawn-handshake refusal is orchestrator-internal, not
+                # evidence about the provider — no reliability cooldown, but
+                # still clear the BUSY mark_busy() set.
+                self.registry.clear_busy_without_penalty(provider_name)
+                state = ProviderState.AVAILABLE
+            else:
+                state = self.registry.record_failure(
+                    provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
+                )
             failed = set(json.loads(self._mission().get("providers_failed") or "[]"))
             failed.add(provider_name)
             self.db.update("missions", self.mission_id, {"providers_failed": sorted(failed), "updated_at": utcnow()})
@@ -1423,7 +1435,12 @@ class ParallelMissionEngine:
                 provider=provider_name,
             )
         else:
-            self.registry.record_failure(provider_name, result.failure_class, result.duration_s, result.raw_tail[:300])
+            if result.gate_refused:
+                self.registry.clear_busy_without_penalty(provider_name)
+            else:
+                self.registry.record_failure(
+                    provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
+                )
             self.db.update(
                 "tasks",
                 task_id,

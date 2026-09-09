@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
 
-cd /home/adam/projects/gg
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
 # Setup disposable repo
 REPO="/tmp/gg-ui-dogfood-$(date +%s)"
@@ -43,7 +44,7 @@ git commit -m "initial"
 uv sync
 git add uv.lock
 git commit -m "add uv.lock"
-cd /home/adam/projects/gg
+cd "$REPO_ROOT"
 
 # Clean up any existing DB
 rm -f /tmp/gg-ui-dogfood.db
@@ -66,7 +67,7 @@ done
 # There is no network route to fetch it — read it straight from the file the
 # backend just wrote (guaranteed present once /api/health responds, since
 # create_app() generates it before uvicorn starts serving).
-AUTH_TOKEN=$(cat /home/adam/projects/gg/backend/.orchestrator/auth_token)
+AUTH_TOKEN=$(cat "$REPO_ROOT/backend/.orchestrator/auth_token")
 
 # Create project
 echo "Creating project..."
@@ -87,7 +88,7 @@ MISSION_ID=$(echo "$MISSION_RESP" | python3 -c "import sys,json; print(json.load
 echo "Mission ID: $MISSION_ID"
 
 # Start frontend in background
-cd /home/adam/projects/gg/frontend
+cd "$REPO_ROOT/frontend"
 npm run dev -- --port 5173 &
 FRONTEND_PID=$!
 
@@ -102,7 +103,7 @@ for i in $(seq 1 30); do
 done
 
 # Run Playwright screenshot script from frontend dir
-cd /home/adam/projects/gg/frontend
+cd "$REPO_ROOT/frontend"
 node -e "
 const { chromium } = require('playwright');
 const fs = require('fs');

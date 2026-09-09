@@ -21,7 +21,10 @@ export function getAuthToken(): Promise<string | null> {
       try {
         const token = await window.__TAURI_INTERNALS__.invoke("get_auth_token");
         return typeof token === "string" && token.length > 0 ? token : null;
-      } catch {
+      } catch (err) {
+        // Swallowing this silently turns an ACL/capability misconfiguration
+        // into a confusing downstream 401 with no clue why — log it.
+        console.error("get_auth_token IPC invoke failed — mutating requests will be unauthenticated:", err);
         return null;
       }
     }

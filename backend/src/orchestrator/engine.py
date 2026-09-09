@@ -486,9 +486,19 @@ class MissionEngine:
                 return result
 
             # failure path
-            state = self.registry.record_failure(
-                provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
-            )
+            if result.gate_refused:
+                # Spawn-handshake refusal is orchestrator-internal (identity
+                # persistence failed before exec) — not evidence about the
+                # provider itself, so it must not cost it a reliability
+                # cooldown the way a genuine crash/timeout does. Still must
+                # clear the BUSY state mark_busy() set, or is_eligible()
+                # leaves this provider permanently unselectable.
+                self.registry.clear_busy_without_penalty(provider_name)
+                state = ProviderState.AVAILABLE
+            else:
+                state = self.registry.record_failure(
+                    provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
+                )
             self.db.update(
                 "tasks", task.id, {"status": "failed", "summary": result.raw_tail[-300:], "finished_at": utcnow()}
             )

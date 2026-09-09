@@ -11,18 +11,28 @@ import react from "@vitejs/plugin-react";
 // run `gg-backend --init-token-only` first to guarantee the file exists;
 // missing here just means an unauthenticated build (e.g. a plain `vitest`
 // run, or a checkout that hasn't started the backend yet) — never throw.
-function readAuthToken(): string {
+function readAuthToken(warnIfMissing: boolean): string {
   try {
     return readFileSync(resolve(__dirname, "../backend/.orchestrator/auth_token"), "utf-8").trim();
   } catch {
+    if (warnIfMissing) {
+      // Bakes in as "" otherwise, silently 401-ing every mutating call for
+      // the whole dev-server session with no clue why — e.g. running
+      // `npm run dev` directly instead of `make dev`/`make frontend`, which
+      // run `gg-backend --init-token-only` first to guarantee this exists.
+      console.warn(
+        "[vite] backend/.orchestrator/auth_token not found — VITE_AUTH_TOKEN will be empty and every " +
+          "mutating API call will 401. Run `make token` (or `make dev`/`make frontend`) first.",
+      );
+    }
     return "";
   }
 }
 
-export default defineConfig({
+export default defineConfig(() => ({
   plugins: [react()],
   define: {
-    "import.meta.env.VITE_AUTH_TOKEN": JSON.stringify(readAuthToken()),
+    "import.meta.env.VITE_AUTH_TOKEN": JSON.stringify(readAuthToken(!process.env.VITEST)),
   },
   server: {
     port: 5173,
@@ -36,4 +46,4 @@ export default defineConfig({
     globals: true,
     setupFiles: "./src/test/setup.ts",
   },
-});
+}));

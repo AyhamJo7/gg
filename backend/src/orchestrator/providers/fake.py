@@ -40,6 +40,7 @@ class FakeAdapter(ProviderAdapter):
         await asyncio.sleep(0.01)
         if request.on_spawn:
             import os
+
             try:
                 pgid = os.getpgrp() if hasattr(os, "getpgrp") else os.getpid()
             except Exception:
@@ -80,6 +81,9 @@ class FakeAdapter(ProviderAdapter):
             "quota": (ProviderState.RATE_LIMITED, FailureClass.QUOTA_EXHAUSTED, 1),
             "crash": (ProviderState.CRASHED, FailureClass.CRASH, 2),
             "auth": (ProviderState.AUTH_REQUIRED, FailureClass.AUTH, 1),
+            # Simulates a spawn-handshake refusal (see _spawn_gate.py) — an
+            # orchestrator-internal failure, not evidence about the provider.
+            "gate_refused": (ProviderState.CRASHED, FailureClass.CRASH, 42),
         }
         state, failure, code = result_map.get(behavior, (ProviderState.COMPLETED, FailureClass.NONE, 0))
         if behavior == "ratelimit":
@@ -99,6 +103,7 @@ class FakeAdapter(ProviderAdapter):
             stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
             raw_tail=raw_tail,
             assistant_text=assistant_text,
+            gate_refused=behavior == "gate_refused",
         )
 
 

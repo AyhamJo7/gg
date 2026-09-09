@@ -155,6 +155,18 @@ class ProviderRegistry:
             (ProviderState.AVAILABLE.value, runtime_s, name),
         )
 
+    def clear_busy_without_penalty(self, name: str) -> None:
+        """Reset a provider to AVAILABLE after an orchestrator-internal
+        failure (a spawn-handshake refusal — see ExecutionResult.gate_refused)
+        that is not evidence about the provider itself. Unlike
+        record_failure, this applies no cooldown and does not increment
+        consecutive_failures — mark_busy() alone would otherwise leave the
+        provider permanently ineligible (is_eligible only admits AVAILABLE)."""
+        self._db.execute(
+            "UPDATE providers SET state=? WHERE name=?",
+            (ProviderState.AVAILABLE.value, name),
+        )
+
     def record_failure(self, name: str, failure: FailureClass, runtime_s: float, error: str) -> ProviderState:
         """Apply exponential cooldown. Returns the recorded state."""
         base = float(self._config.get("orchestration.cooldown_base_seconds", 60))
@@ -177,8 +189,12 @@ class ProviderRegistry:
         }
         state = state_by_failure.get(failure, ProviderState.AVAILABLE)
         cooldown_until: str | None = None
-        if state in (ProviderState.RATE_LIMITED, ProviderState.TIMED_OUT, ProviderState.CRASHED,
-            ProviderState.UNAVAILABLE):
+        if state in (
+            ProviderState.RATE_LIMITED,
+            ProviderState.TIMED_OUT,
+            ProviderState.CRASHED,
+            ProviderState.UNAVAILABLE,
+        ):
             cooldown_until = (datetime.now(UTC) + timedelta(seconds=cooldown_s)).isoformat()
         rate_inc = 1 if failure in (FailureClass.RATE_LIMIT, FailureClass.QUOTA_EXHAUSTED) else 0
         self._db.execute(
