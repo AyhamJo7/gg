@@ -3,11 +3,11 @@
 
 providers:
   claude:
-    enabled: false
+    enabled: true
     executable: claude
     timeout_minutes: 60
   codex:
-    enabled: false
+    enabled: true
     executable: codex
     timeout_minutes: 60
   agy:
@@ -43,11 +43,11 @@ scheduler:
 
 # Role-specific provider priority (top = most preferred). Editable via UI/API.
 priority:
-  planning:    [agy, opencode]
-  implementation: [opencode, agy]
-  testing:     [agy, opencode]
-  review:      [agy, opencode]
-  repair:      [opencode, agy]
+  planning:    [claude, codex, opencode, agy]
+  implementation: [opencode, codex, agy, claude]
+  testing:     [codex, claude, agy, opencode]
+  review:      [claude, codex, agy, opencode]
+  repair:      [opencode, codex, agy, claude]
 
 git:
   auto_checkpoint: true
