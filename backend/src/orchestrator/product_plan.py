@@ -103,7 +103,7 @@ def extract_product_plan(text: str) -> dict[str, Any] | None:
     idx = text.find(PLAN_MARKER)
     if idx < 0:
         return None
-    payload = text[idx + len(PLAN_MARKER):].strip()
+    payload = text[idx + len(PLAN_MARKER) :].strip()
     if payload.startswith("```"):
         lines = payload.splitlines()
         payload = "\n".join(lines[1:])
@@ -166,9 +166,7 @@ def validate_product_plan(data: dict[str, Any]) -> list[str]:
         for a in r.acceptance:
             ok, _ = is_executable_command(a.verify)
             if not ok:
-                errors.append(
-                    f"criterion {a.id} verify is not an executable allowlisted command: {a.verify[:100]!r}"
-                )
+                errors.append(f"criterion {a.id} verify is not an executable allowlisted command: {a.verify[:100]!r}")
     if not plan.phases:
         errors.append("at least one phase is required")
     phase_keys = [p.key for p in plan.phases]
@@ -216,6 +214,19 @@ def validate_product_plan(data: dict[str, Any]) -> list[str]:
         for pre in p.human_prerequisites:
             if pre not in prereq_keys:
                 errors.append(f"phase {p.key} references unknown prerequisite {pre}")
+    for e in plan.external_prerequisites:
+        validation = e.validation.strip()
+        # Only an explicit "run <command>" validation is ever executed (see
+        # ProjectCoordinator.resolve_gate); anything else — empty, or prose
+        # like "presence of TEST_TOKEN in .env" — is human-attested and never
+        # runs, so it needs no command validation.
+        if not validation.lower().startswith("run "):
+            continue
+        ok, _ = is_executable_command(validation[4:].strip())
+        if not ok:
+            errors.append(
+                f"prerequisite {e.key} validation is not an executable allowlisted command: {validation[:100]!r}"
+            )
     return errors
 
 
@@ -227,9 +238,9 @@ USER IDEA:
 {idea}
 
 CONSTRAINTS:
-{constraints or '(none)'}
+{constraints or "(none)"}
 
-TARGET WORKSPACE: {workspace_hint or '(a fresh local git repository will be created)'}
+TARGET WORKSPACE: {workspace_hint or "(a fresh local git repository will be created)"}
 
 RULES:
 - Prefer a simple maintainable architecture (monolith or small split, local-first).
@@ -238,18 +249,23 @@ RULES:
 - Every requirement needs measurable acceptance criteria.
 - Every criterion needs an EXECUTABLE verification command: a single command
   line starting with one of npm, npx, node, python, python3, pytest, uv, pnpm,
-  yarn, cargo, go, make (no shell operators, no rm/sudo/git). GG runs each
-  command in the target repository and a criterion passes only on exit 0.
-  For HTTP behavior, probe with node/python one-liners against a server the
-  command itself starts on an ephemeral port and kills afterwards.
-  Example: "node checks/whitespace-probe.js". Prose is not verification.
+  yarn, cargo, go, make (no shell operators, no rm/sudo/git, no inline code
+  via -c/-e/--eval — write a checks/*.js or checks/*.py FILE and run it as a
+  file argument). GG runs each command in the target repository and a
+  criterion passes only on exit 0. For HTTP behavior, write a small script
+  file that starts a server on an ephemeral port, probes it, and exits
+  non-zero on failure. Example: "node checks/whitespace-probe.js". Prose is
+  not verification.
 - Every phase needs acceptance criteria and must reference the requirement ids
   it implements. Every requirement must be covered by at least one phase.
 - Phase keys must be unique; depends_on may only reference other phase keys;
   no cycles. Workspace scopes: frontend, backend, data, docs, infra, tests, all.
 - List anything you cannot do yourself (credentials, accounts, external setup)
   under external_prerequisites with exact human actions — never ask the human
-  for work you can safely do yourself.
+  for work you can safely do yourself. Its "validation" field is either
+  descriptive prose (human-attested, never executed) or, if it can be checked
+  automatically, "run " followed by the same kind of executable allowlisted
+  command as above — never inline code, never rm/sudo/git.
 - Respond with a single PRODUCT_PLAN_JSON block and nothing else after it.
 
 SCHEMA (all listed fields; omit nothing required):

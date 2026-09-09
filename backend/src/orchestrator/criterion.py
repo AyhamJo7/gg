@@ -29,12 +29,19 @@ ALLOWED_COMMANDS = frozenset(
     {"npm", "npx", "node", "python", "python3", "pytest", "uv", "pnpm", "yarn", "cargo", "go", "make"}
 )
 
-#: Never executed, even when allowlisted above.
+#: Interpreters allowlisted above that accept an inline-code flag — the flag defeats the
+#: allowlist (arbitrary code, not a repo-declared script) so it is rejected outright.
+INLINE_CODE_INTERPRETERS = frozenset({"node", "python", "python3"})
+INLINE_CODE_FLAGS = frozenset({"-c", "-e", "--eval", "-p", "--print", "-pe", "-ne"})
+
+#: Never executed, even when allowlisted above. Matched as whole shlex tokens (or
+#: contiguous token sequences below), never as substrings of an unrelated word.
 BLOCKED_TOKENS = frozenset(
-    {
-        "rm", "sudo", "su", "shutdown", "reboot", "halt", "poweroff", "mkfs", "dd",
-        "chmod", "chown", "git", "npm publish", "cargo publish",
-    }
+    {"rm", "sudo", "su", "shutdown", "reboot", "halt", "poweroff", "mkfs", "dd", "chmod", "chown", "git"}
+)
+BLOCKED_SEQUENCES: tuple[tuple[str, ...], ...] = (
+    ("npm", "publish"),
+    ("cargo", "publish"),
 )
 
 MAX_COMMAND_CHARS = 2000
@@ -66,10 +73,15 @@ def is_executable_command(verify: str) -> tuple[bool, str]:
         return False, ""
     if argv[0] not in ALLOWED_COMMANDS:
         return False, ""
-    lowered = text.lower()
-    for token in BLOCKED_TOKENS:
-        if token in lowered:
+    argv_lower = [a.lower() for a in argv]
+    if any(tok in BLOCKED_TOKENS for tok in argv_lower):
+        return False, ""
+    for seq in BLOCKED_SEQUENCES:
+        n = len(seq)
+        if any(tuple(argv_lower[i : i + n]) == seq for i in range(len(argv_lower) - n + 1)):
             return False, ""
+    if argv[0] in INLINE_CODE_INTERPRETERS and any(a in INLINE_CODE_FLAGS for a in argv_lower[1:]):
+        return False, ""
     return True, text
 
 
@@ -81,9 +93,7 @@ async def run_check_command(repo: Path, command: str) -> tuple[int | None, str]:
     return result.exit_code, tail
 
 
-async def evaluate_criteria(
-    repo: Path, criteria: list[dict[str, Any]]
-) -> list[CriterionCheck]:
+async def evaluate_criteria(repo: Path, criteria: list[dict[str, Any]]) -> list[CriterionCheck]:
     """Execute executable checks; mark the rest non-executable (blocking)."""
     checks: list[CriterionCheck] = []
     for criterion in criteria:
@@ -93,8 +103,7 @@ async def evaluate_criteria(
         check = CriterionCheck(criterion_id=cid, command=command, executable=ok)
         if not ok:
             check.skipped_reason = (
-                "verify is not an executable allowlisted command "
-                f"(allowed: {', '.join(sorted(ALLOWED_COMMANDS))})"
+                f"verify is not an executable allowlisted command (allowed: {', '.join(sorted(ALLOWED_COMMANDS))})"
             )
             checks.append(check)
             continue
