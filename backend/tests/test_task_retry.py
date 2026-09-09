@@ -18,15 +18,15 @@ async def client(tmp_path: Path, workspace: Path):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=["fake-a"]), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as c:
         c.orchestrator = orch  # type: ignore[attr-defined]
         yield c
     await orch.shutdown()
 
 
-async def _mission_with_task(
-    client: httpx.AsyncClient, workspace: Path, title: str
-) -> tuple[dict, str]:
+async def _mission_with_task(client: httpx.AsyncClient, workspace: Path, title: str) -> tuple[dict, str]:
     project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
     mission = (
         await client.post(
@@ -61,9 +61,7 @@ async def _mission_with_task(
     return mission, namespaced
 
 
-async def test_retry_failed_task_resets_attempts_and_status(
-    client: httpx.AsyncClient, workspace: Path
-):
+async def test_retry_failed_task_resets_attempts_and_status(client: httpx.AsyncClient, workspace: Path):
     mission, tid = await _mission_with_task(client, workspace, "retry-ok")
     db = client.orchestrator.db
     db.update("tasks", tid, {"status": "FAILED", "attempts": 2, "blocking_issue": "boom"})

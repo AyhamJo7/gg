@@ -21,7 +21,9 @@ async def client(tmp_path: Path, workspace: Path):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=["fake-a"]), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as c:
         c.orchestrator = orch  # type: ignore[attr-defined]
         yield c
     await orch.shutdown()
@@ -41,9 +43,7 @@ def _dag(tasks=("task-a", "task-b"), deps=(), scopes=("src/a.py", "src/b.py")):
             }
             for i, tid in enumerate(tasks)
         ],
-        "dependencies": [
-            {"from_task_id": a, "to_task_id": b} for a, b in deps
-        ],
+        "dependencies": [{"from_task_id": a, "to_task_id": b} for a, b in deps],
     }
 
 
@@ -75,9 +75,7 @@ def test_namespace_rewrites_ids_and_deps():
     assert tasks[1].dependencies == ["mission1-a"]
 
 
-async def test_same_logical_ids_across_missions_do_not_collide(
-    client: httpx.AsyncClient, workspace: Path
-):
+async def test_same_logical_ids_across_missions_do_not_collide(client: httpx.AsyncClient, workspace: Path):
     m1 = await _mission(client, workspace, "m1")
     m2 = await _mission(client, workspace, "m2")
     r1 = await client.post(f"/api/missions/{m1['id']}/dag", json=_dag())

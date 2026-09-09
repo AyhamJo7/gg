@@ -50,7 +50,9 @@ async def lifecycle_client(tmp_path: Path):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", Config(data), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as c:
         yield c
     await orch.shutdown()
 
@@ -84,9 +86,7 @@ async def test_product_project_crud_and_plan(lifecycle_client: httpx.AsyncClient
 
 async def test_start_advance_gate_resolve_flow(lifecycle_client: httpx.AsyncClient):
     c = lifecycle_client
-    pid = (
-        await c.post("/api/product-projects", json={"name": "Gated", "idea": "needs a token"})
-    ).json()["id"]
+    pid = (await c.post("/api/product-projects", json={"name": "Gated", "idea": "needs a token"})).json()["id"]
     assert (await c.post(f"/api/product-projects/{pid}/plan")).json()["ok"] is True
 
     resp = await c.post(f"/api/product-projects/{pid}/start")

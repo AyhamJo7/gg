@@ -31,7 +31,9 @@ async def client(tmp_path: Path, workspace: Path):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=["fake-a"]), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as c:
         c.orchestrator = orch  # type: ignore[attr-defined]
         yield c
     await orch.shutdown()
@@ -45,7 +47,9 @@ async def test_f19_review_repair_lifecycle(tmp_path: Path) -> None:
     proj_id = "proj-f19"
     mission_id = "test-mission-f19"
 
-    db.insert("projects", {"id": proj_id, "name": "test-p", "path": str(tmp_path), "created_at": "2026-09-05T00:00:00Z"})
+    db.insert(
+        "projects", {"id": proj_id, "name": "test-p", "path": str(tmp_path), "created_at": "2026-09-05T00:00:00Z"}
+    )
     db.insert(
         "missions",
         {

@@ -19,8 +19,11 @@ async def client(tmp_path: Path, workspace: Path):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=["fake-a"]), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as c:
         c.orchestrator = orch  # type: ignore[attr-defined]
+        c.app = app  # type: ignore[attr-defined]
         yield c
     await orch.shutdown()
 
@@ -29,6 +32,33 @@ async def test_health(client: httpx.AsyncClient):
     resp = await client.get("/api/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+async def test_mutating_route_requires_bearer_token(client: httpx.AsyncClient, workspace: Path):
+    """F-LIFE-01 hardening: mutating routes reject requests without the token."""
+    app = client.app  # type: ignore[attr-defined]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as anon:
+        resp = await anon.post("/api/projects", json={"path": str(workspace)})
+        assert resp.status_code == 401
+        resp = await anon.post(
+            "/api/projects", json={"path": str(workspace)}, headers={"Authorization": "Bearer wrong-token"}
+        )
+        assert resp.status_code == 401
+        # GET routes stay open (no token needed) — including health.
+        resp = await anon.get("/api/health")
+        assert resp.status_code == 200
+        resp = await anon.get("/api/projects")
+        assert resp.status_code == 200
+    # The bootstrap endpoint hands back a token that then authorizes.
+    token_resp = await client.get("/api/auth/token")
+    assert token_resp.status_code == 200
+    fetched = token_resp.json()["token"]
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {fetched}"}
+    ) as authed:
+        resp = await authed.post("/api/projects", json={"path": str(workspace)})
+        assert resp.status_code in (200, 201), resp.text
 
 
 async def test_project_crud(client: httpx.AsyncClient, workspace: Path):
@@ -96,9 +126,7 @@ async def test_priority_settings(client: httpx.AsyncClient):
     matrix = resp.json()
     assert "planning" in matrix
 
-    resp = await client.post(
-        "/api/settings/priority", json={"role": "review", "providers": ["fake-a"]}
-    )
+    resp = await client.post("/api/settings/priority", json={"role": "review", "providers": ["fake-a"]})
     assert resp.status_code == 200
     assert resp.json()["review"] == ["fake-a"]
 
@@ -177,18 +205,14 @@ async def test_f13_websocket_origin_check(client: httpx.AsyncClient, workspace: 
     with TestClient(client._transport.app) as tc:  # type: ignore[union-attr]
         # Untrusted origin rejected with 1008
         try:
-            with tc.websocket_connect(
-                f"/ws/missions/{mission['id']}", headers={"origin": "http://evil.example"}
-            ) as ws:
+            with tc.websocket_connect(f"/ws/missions/{mission['id']}", headers={"origin": "http://evil.example"}) as ws:
                 ws.receive_text()
                 pytest.fail("untrusted origin was accepted")
         except WebSocketDisconnect as exc:
             assert exc.code == 1008
 
         # Trusted origin accepted
-        with tc.websocket_connect(
-            f"/ws/missions/{mission['id']}", headers={"origin": "http://localhost:5173"}
-        ) as ws:
+        with tc.websocket_connect(f"/ws/missions/{mission['id']}", headers={"origin": "http://localhost:5173"}) as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "MISSION_CREATED"
 
@@ -219,4 +243,3 @@ async def test_f15_priority_persisted_to_settings(client: httpx.AsyncClient):
     row = orch.db.get("settings", "priority.planning", key="key")
     assert row is not None
     assert json.loads(row["value"]) == ["fake-a"]
-

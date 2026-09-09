@@ -43,7 +43,9 @@ def _spawn(db: Path, port: int, log: Path, home: Path) -> subprocess.Popen[bytes
     binary = str(venv_python) if venv_python.exists() else sys.executable
     return subprocess.Popen(
         [binary, str(HELPER), str(db), str(port), str(home)],
-        env=env, stdout=fh, stderr=subprocess.STDOUT,
+        env=env,
+        stdout=fh,
+        stderr=subprocess.STDOUT,
         start_new_session=True,
     )
 
@@ -73,10 +75,15 @@ def _alive(pid: int | None) -> bool:
     return bool(pid) and Path(f"/proc/{pid}").exists()
 
 
+def _auth_headers(db: Path) -> dict[str, str]:
+    token = (db.parent / "auth_token").read_text().strip()
+    return {"Authorization": f"Bearer {token}"}
+
+
 def test_backend_sigkill_mid_run_recovers_without_duplicates(tmp_path: Path):
     ws = tmp_path / "ws"
     ws.mkdir()
-    (ws / "package.json").write_text(json.dumps({"name": "t", "scripts": {"test": "node -e \"process.exit(0)\""}}))
+    (ws / "package.json").write_text(json.dumps({"name": "t", "scripts": {"test": 'node -e "process.exit(0)"'}}))
     subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "t@t.t"], cwd=ws, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "t"], cwd=ws, check=True, capture_output=True)
@@ -90,25 +97,47 @@ def test_backend_sigkill_mid_run_recovers_without_duplicates(tmp_path: Path):
     try:
         _wait_health(port)
         base = f"http://127.0.0.1:{port}"
-        project = httpx.post(f"{base}/api/projects", json={"path": str(ws)}, timeout=10).json()
+        auth = _auth_headers(db)
+        project = httpx.post(f"{base}/api/projects", json={"path": str(ws)}, headers=auth, timeout=10).json()
         mission = httpx.post(
             f"{base}/api/missions",
-            json={"project_id": project["id"], "title": "kill me", "task": "park twice",
-                  "autonomy": "AUTONOMOUS", "scheduling_mode": "PARALLEL_SAFE", "start": False},
+            json={
+                "project_id": project["id"],
+                "title": "kill me",
+                "task": "park twice",
+                "autonomy": "AUTONOMOUS",
+                "scheduling_mode": "PARALLEL_SAFE",
+                "start": False,
+            },
+            headers=auth,
             timeout=10,
         ).json()
         mid = mission["id"]
         dag = {
             "tasks": [
-                {"id": "k-a", "role": "implementation", "title": "park a", "description": "park",
-                 "preferred_providers": '["slow-a"]', "workspace_scope": '["a.txt"]', "priority": 0},
-                {"id": "k-b", "role": "implementation", "title": "park b", "description": "park",
-                 "preferred_providers": '["slow-b"]', "workspace_scope": '["b.txt"]', "priority": 0},
+                {
+                    "id": "k-a",
+                    "role": "implementation",
+                    "title": "park a",
+                    "description": "park",
+                    "preferred_providers": '["slow-a"]',
+                    "workspace_scope": '["a.txt"]',
+                    "priority": 0,
+                },
+                {
+                    "id": "k-b",
+                    "role": "implementation",
+                    "title": "park b",
+                    "description": "park",
+                    "preferred_providers": '["slow-b"]',
+                    "workspace_scope": '["b.txt"]',
+                    "priority": 0,
+                },
             ],
             "dependencies": [],
         }
-        assert httpx.post(f"{base}/api/missions/{mid}/dag", json=dag, timeout=10).status_code == 200
-        assert httpx.post(f"{base}/api/missions/{mid}/start", timeout=10).status_code in (200, 201)
+        assert httpx.post(f"{base}/api/missions/{mid}/dag", json=dag, headers=auth, timeout=10).status_code == 200
+        assert httpx.post(f"{base}/api/missions/{mid}/start", headers=auth, timeout=10).status_code in (200, 201)
 
         # wait for two genuinely RUNNING tasks with live provider PIDs
         deadline = time.monotonic() + 60
@@ -117,8 +146,11 @@ def test_backend_sigkill_mid_run_recovers_without_duplicates(tmp_path: Path):
             tasks = _q(db, "SELECT id, status FROM tasks WHERE mission_id=?", (mid,))
             if sum(1 for t in tasks if t["status"] == "RUNNING") >= 2:
                 live_runs = _q(
-                    db, "SELECT id, task_id, provider, pid, pgid FROM provider_runs"
-                        " WHERE mission_id=? AND finished_at IS NULL", (mid,))
+                    db,
+                    "SELECT id, task_id, provider, pid, pgid FROM provider_runs"
+                    " WHERE mission_id=? AND finished_at IS NULL",
+                    (mid,),
+                )
                 if len(live_runs) >= 2 and all(_alive(r["pid"]) for r in live_runs):
                     break
             time.sleep(0.5)
@@ -157,7 +189,9 @@ def test_backend_sigkill_mid_run_recovers_without_duplicates(tmp_path: Path):
             deadline = time.monotonic() + 60
             relaunched = False
             while time.monotonic() < deadline:
-                tasks = {t["id"]: t for t in _q(db, "SELECT id, status, attempts FROM tasks WHERE mission_id=?", (mid,))}
+                tasks = {
+                    t["id"]: t for t in _q(db, "SELECT id, status, attempts FROM tasks WHERE mission_id=?", (mid,))
+                }
                 attempts = [int(tasks[f"{mid[:8]}-k-{s}"]["attempts"]) for s in ("a", "b")]
                 if all(a >= 1 for a in attempts):
                     relaunched = True
@@ -165,13 +199,16 @@ def test_backend_sigkill_mid_run_recovers_without_duplicates(tmp_path: Path):
                 time.sleep(0.5)
             assert relaunched, f"tasks never rescheduled: {tasks}"
             unfinished = _q(
-                db, "SELECT task_id, COUNT(*) n FROM provider_runs WHERE mission_id=? AND finished_at IS NULL"
-                    " GROUP BY task_id", (mid,))
+                db,
+                "SELECT task_id, COUNT(*) n FROM provider_runs WHERE mission_id=? AND finished_at IS NULL"
+                " GROUP BY task_id",
+                (mid,),
+            )
             assert all(r["n"] <= 1 for r in unfinished), f"duplicate active runs: {unfinished}"
 
             m = httpx.get(f"{base2}/api/missions/{mid}", timeout=10).json()
             assert m["status"] not in ("COMPLETED", "FAILED"), m["status"]
-            httpx.post(f"{base2}/api/missions/{mid}/cancel", timeout=10)
+            httpx.post(f"{base2}/api/missions/{mid}/cancel", headers=auth, timeout=10)
         finally:
             server2.terminate()
             try:

@@ -121,14 +121,17 @@ async def test_scenario_b_checkpoint_exhaustion_aborts_mission(tmp_path):
 
     adapters = _full_fake_adapters()
     orch = make_orchestrator(tmp_path, adapters)
-    orch.db.insert("projects", {
-        "id": "proj-1", "path": str(ws), "name": "test",
-        "created_at": "2026-01-01T00:00:00Z",
-    })
+    orch.db.insert(
+        "projects",
+        {
+            "id": "proj-1",
+            "path": str(ws),
+            "name": "test",
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    )
 
-    with patch.object(
-        git_ops, "checkpoint", side_effect=git_ops.GitError("disk full")
-    ):
+    with patch.object(git_ops, "checkpoint", side_effect=git_ops.GitError("disk full")):
         mission = await _run_mission_to_end(orch, ws)
 
     assert mission["status"] != MissionStatus.COMPLETED.value, (
@@ -152,15 +155,16 @@ def test_scenario_c_exit_0_code_with_yn_not_human_input():
     ]
     for output in source_outputs:
         result = classify_output(0, output, timed_out=False, cancelled=False)
-        assert result == FailureClass.NONE, (
-            f"Exit 0 misclassified as {result}: {output[:60]}"
-        )
+        assert result == FailureClass.NONE, f"Exit 0 misclassified as {result}: {output[:60]}"
 
 
 def test_scenario_c_nonzero_exit_human_input_detected():
     """N-05: Genuine interactive prompt with non-zero exit → HUMAN_INPUT."""
     assert classify_output(1, "[y/N]", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
-    assert classify_output(None, "Press any key to continue...", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    assert (
+        classify_output(None, "Press any key to continue...", timed_out=False, cancelled=False)
+        == FailureClass.HUMAN_INPUT
+    )
 
 
 # ===========================================================================
@@ -174,22 +178,42 @@ def test_scenario_d_pid_reuse_protection(tmp_path):
     orch = make_orchestrator(tmp_path, adapters)
 
     # Insert project first (FK constraint)
-    orch.db.insert("projects", {
-        "id": "p1", "path": str(tmp_path / "ws"), "name": "test",
-        "created_at": "2026-01-01T00:00:00Z",
-    })
+    orch.db.insert(
+        "projects",
+        {
+            "id": "p1",
+            "path": str(tmp_path / "ws"),
+            "name": "test",
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    )
     # Insert a stale provider run with a PID that doesn't exist
-    orch.db.insert("missions", {
-        "id": "m-stale", "project_id": "p1", "title": "t",
-        "task": "t", "status": "IMPLEMENTING",
-        "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
-    })
-    orch.db.insert("provider_runs", {
-        "id": "run-stale", "mission_id": "m-stale",
-        "provider": "fake-a", "pid": 999999999, "pgid": 999999999,
-        "started_at": "2026-01-01T00:00:00Z", "finished_at": None,
-        "failure_class": "RUNNING", "provider_state": "RUNNING",
-    })
+    orch.db.insert(
+        "missions",
+        {
+            "id": "m-stale",
+            "project_id": "p1",
+            "title": "t",
+            "task": "t",
+            "status": "IMPLEMENTING",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        },
+    )
+    orch.db.insert(
+        "provider_runs",
+        {
+            "id": "run-stale",
+            "mission_id": "m-stale",
+            "provider": "fake-a",
+            "pid": 999999999,
+            "pgid": 999999999,
+            "started_at": "2026-01-01T00:00:00Z",
+            "finished_at": None,
+            "failure_class": "RUNNING",
+            "provider_state": "RUNNING",
+        },
+    )
     # Reap should NOT crash and should mark the run as finished
     orch._reap_orphaned_processes()
     run = orch.db.get("provider_runs", "run-stale")
@@ -206,22 +230,39 @@ def test_scenario_d_pid_reuse_protection(tmp_path):
 def test_scenario_e_review_retry_persistence(tmp_path):
     """N-03: Review unparseable count must survive restart."""
     db = Database(tmp_path / "test.db")
-    db.insert("projects", {
-        "id": "p1", "name": "test", "path": str(tmp_path),
-        "created_at": "2026-01-01T00:00:00Z",
-    })
-    db.insert("missions", {
-        "id": "m1", "project_id": "p1", "title": "test",
-        "task": "t", "status": "REVIEWING",
-        "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
-    })
+    db.insert(
+        "projects",
+        {
+            "id": "p1",
+            "name": "test",
+            "path": str(tmp_path),
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    )
+    db.insert(
+        "missions",
+        {
+            "id": "m1",
+            "project_id": "p1",
+            "title": "test",
+            "task": "t",
+            "status": "REVIEWING",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        },
+    )
     # Simulate: 2 unparseable reviews already persisted
     for i in range(2):
-        db.insert("reviews", {
-            "id": f"rev-{i}", "mission_id": "m1",
-            "review_parsed": 0, "review_provider": "fake",
-            "created_at": "2026-01-01T00:00:00Z",
-        })
+        db.insert(
+            "reviews",
+            {
+                "id": f"rev-{i}",
+                "mission_id": "m1",
+                "review_parsed": 0,
+                "review_provider": "fake",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
 
     rows = db.query(
         "SELECT COUNT(*) as cnt FROM reviews WHERE mission_id=? AND review_parsed=0",
@@ -262,7 +303,9 @@ async def test_scenario_g_priority_validation(tmp_path, workspace):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=list(orch.registry.adapters.keys())), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as client:
         # Invalid role
         resp = await client.post("/api/settings/priority", json={"role": "hacking", "providers": ["fake-a"]})
         assert resp.status_code == 422, f"Expected 422 for invalid role, got {resp.status_code}"
@@ -296,22 +339,41 @@ async def test_scenario_h_gate_on_terminal_mission(tmp_path, workspace):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=list(orch.registry.adapters.keys())), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as client:
         # Seed project and cancelled mission with an open gate
-        orch.db.insert("projects", {
-            "id": "p1", "name": "test", "path": str(tmp_path),
-            "created_at": "2026-01-01T00:00:00Z",
-        })
-        orch.db.insert("missions", {
-            "id": "m-done", "project_id": "p1", "title": "done",
-            "task": "t", "status": "CANCELLED",
-            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
-        })
-        orch.db.insert("human_gates", {
-            "id": "gate-1", "mission_id": "m-done", "reason": "test",
-            "status": "open",
-            "created_at": "2026-01-01T00:00:00Z",
-        })
+        orch.db.insert(
+            "projects",
+            {
+                "id": "p1",
+                "name": "test",
+                "path": str(tmp_path),
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
+        orch.db.insert(
+            "missions",
+            {
+                "id": "m-done",
+                "project_id": "p1",
+                "title": "done",
+                "task": "t",
+                "status": "CANCELLED",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            },
+        )
+        orch.db.insert(
+            "human_gates",
+            {
+                "id": "gate-1",
+                "mission_id": "m-done",
+                "reason": "test",
+                "status": "open",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        )
 
         resp = await client.post(
             "/api/missions/m-done/gates/gate-1/resolve",
@@ -333,17 +395,13 @@ def test_scenario_i_review_schema_bare_ints():
 
 def test_scenario_i_review_schema_missing_severity():
     """Review schema: finding without severity must be rejected."""
-    ok, _findings = parse_review_output(
-        'REVIEW_FINDINGS_JSON: [{"description": "something"}]'
-    )
+    ok, _findings = parse_review_output('REVIEW_FINDINGS_JSON: [{"description": "something"}]')
     assert not ok, "Finding without severity should be unparseable"
 
 
 def test_scenario_i_review_schema_valid():
     """Review schema: well-formed finding must pass."""
-    ok, findings = parse_review_output(
-        'REVIEW_FINDINGS_JSON: [{"severity": "HIGH", "description": "bug"}]'
-    )
+    ok, findings = parse_review_output('REVIEW_FINDINGS_JSON: [{"severity": "HIGH", "description": "bug"}]')
     assert ok
     assert len(findings) == 1
 
@@ -360,15 +418,20 @@ async def test_scenario_j_retry_idempotency(tmp_path, workspace):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=list(orch.registry.adapters.keys())), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as client:
         # Seed project
         resp = await client.post("/api/projects", json={"path": str(workspace)})
         assert resp.status_code == 201
         project_id = resp.json()["id"]
 
         original = orch.create_mission(
-            project_id=project_id, title="original", task="test",
-            autonomy="BALANCED", profile="balanced",
+            project_id=project_id,
+            title="original",
+            task="test",
+            autonomy="BALANCED",
+            profile="balanced",
         )
         orch.db.update("missions", original["id"], {"status": "FAILED"})
 
@@ -380,6 +443,4 @@ async def test_scenario_j_retry_idempotency(tmp_path, workspace):
         assert retry2_resp.status_code == 200
         retry2 = retry2_resp.json()
 
-        assert retry1["id"] == retry2["id"], (
-            f"Second retry created new mission: {retry1['id']} vs {retry2['id']}"
-        )
+        assert retry1["id"] == retry2["id"], f"Second retry created new mission: {retry1['id']} vs {retry2['id']}"

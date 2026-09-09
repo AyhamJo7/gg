@@ -20,6 +20,7 @@ from ..orchestrator import IllegalMissionTransitionError, Orchestrator
 from ..project_engine import ProductValidationError
 from ..security import read_redacted_tail, redact, validate_workspace_path
 from ..workspace import inspect_workspace
+from .auth import AuthMiddleware, load_or_create_token
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,7 @@ class WaiverRequest(BaseModel):
     target_kind: str
     target_id: str
     reason: str
+    actor: str = "operator"
 
 
 def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
@@ -114,6 +116,18 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         allow_headers=["*"],
     )
     app.state.db = db_path
+    app.state.auth_token = load_or_create_token(db_path.parent)
+    app.add_middleware(AuthMiddleware, token=app.state.auth_token)
+
+    @app.get("/api/auth/token")
+    def get_auth_token() -> dict[str, str]:
+        # Bootstrap only: the server already binds 127.0.0.1 only, and this
+        # lets the frontend (browser webview, no local filesystem access in
+        # dev mode) obtain the token without a Tauri-specific fs bridge. It
+        # does not weaken the mutating-route check above — any local caller
+        # able to reach this port could already reach the mutating routes
+        # directly before that check existed.
+        return {"token": app.state.auth_token}
 
     # ---------------- projects ----------------
     @app.get("/api/projects")
@@ -209,8 +223,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     @app.get("/api/missions")
     def list_missions(project_id: str | None = None) -> list[dict[str, Any]]:
         if project_id:
-            rows = orchestrator.db.query("SELECT * FROM missions WHERE project_id=? ORDER BY created_at DESC",
-                (project_id,))
+            rows = orchestrator.db.query(
+                "SELECT * FROM missions WHERE project_id=? ORDER BY created_at DESC", (project_id,)
+            )
         else:
             rows = orchestrator.db.query("SELECT * FROM missions ORDER BY created_at DESC LIMIT 200")
         return [_jsonable(r) for r in rows]
@@ -239,15 +254,14 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         )
         mission["gates"] = [
             _jsonable(g)
-            for g in orchestrator.db.query("SELECT * FROM human_gates WHERE mission_id=? ORDER BY created_at DESC",
-                (mission_id,))
+            for g in orchestrator.db.query(
+                "SELECT * FROM human_gates WHERE mission_id=? ORDER BY created_at DESC", (mission_id,)
+            )
         ]
         mission["findings"] = orchestrator.db.query(
             "SELECT * FROM review_findings WHERE mission_id=? ORDER BY created_at", (mission_id,)
         )
-        reviews = orchestrator.db.query(
-            "SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at", (mission_id,)
-        )
+        reviews = orchestrator.db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at", (mission_id,))
         mission["reviews"] = reviews
         latest_review = reviews[-1] if reviews else None
         mission["latest_review"] = latest_review
@@ -424,17 +438,17 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             raise HTTPException(404, "product project not found") from None
 
     @app.post("/api/product-projects/{project_id}/pause")
-    def pause_product_project(project_id: str) -> dict[str, str]:
+    async def pause_product_project(project_id: str) -> dict[str, str]:
         try:
-            orchestrator.coordinator.pause_project(project_id)
+            await orchestrator.coordinator.pause_project(project_id)
         except KeyError:
             raise HTTPException(404, "product project not found") from None
         return {"status": "pausing"}
 
     @app.post("/api/product-projects/{project_id}/cancel")
-    def cancel_product_project(project_id: str) -> dict[str, str]:
+    async def cancel_product_project(project_id: str) -> dict[str, str]:
         try:
-            orchestrator.coordinator.cancel_project(project_id)
+            await orchestrator.coordinator.cancel_project(project_id)
         except KeyError:
             raise HTTPException(404, "product project not found") from None
         return {"status": "cancelled"}
@@ -453,7 +467,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     @app.post("/api/product-projects/{project_id}/gates/{gate_id}/resolve")
     async def resolve_product_gate(project_id: str, gate_id: str, req: GateResolutionRequest) -> dict[str, Any]:
         try:
-            result = orchestrator.coordinator.resolve_gate(project_id, gate_id, req.resolution)
+            result = await orchestrator.coordinator.resolve_gate(project_id, gate_id, req.resolution)
         except KeyError:
             raise HTTPException(404, "product project or gate not found") from None
         if not result.get("ok"):
@@ -469,10 +483,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             raise HTTPException(404, "product project not found") from None
 
     @app.post("/api/product-projects/{project_id}/waivers")
-    def create_product_waiver(project_id: str, req: WaiverRequest) -> dict[str, Any]:
+    async def create_product_waiver(project_id: str, req: WaiverRequest) -> dict[str, Any]:
         try:
-            return orchestrator.coordinator.create_waiver(
-                project_id, req.target_kind, req.target_id, req.reason
+            return await orchestrator.coordinator.create_waiver(
+                project_id, req.target_kind, req.target_id, req.reason, actor=req.actor
             )
         except KeyError:
             raise HTTPException(404, "product project not found") from None
@@ -802,7 +816,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     @app.get("/api/settings/profiles")
     def list_profiles() -> dict[str, Any]:
         rows = orchestrator.db.query("SELECT key, value FROM settings WHERE key LIKE 'profile.%'")
-        return {r["key"][len("profile."):]: json.loads(r["value"]) for r in rows}
+        return {r["key"][len("profile.") :]: json.loads(r["value"]) for r in rows}
 
     # ---------------- events / analytics ----------------
     @app.get("/api/missions/{mission_id}/events")
