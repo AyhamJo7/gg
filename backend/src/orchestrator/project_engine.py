@@ -67,6 +67,10 @@ TERMINAL_MISSION_VALUES = frozenset(s.value for s in TERMINAL_STATUSES)
 MAX_PLAN_ATTEMPTS = 3
 
 
+class ProductValidationError(ValueError):
+    """User-correctable product configuration problem (paths, plans)."""
+
+
 def _slug(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return slug[:48] or "product"
@@ -97,6 +101,11 @@ class ProjectCoordinator:
             raise ValueError("project name is required")
         if not idea.strip():
             raise ValueError("idea is required")
+        if target_repo_path.strip():
+            try:
+                validate_workspace_path(target_repo_path.strip(), self.orch.config.allowed_roots())
+            except ValueError as exc:
+                raise ProductValidationError(f"target repository path rejected: {exc}") from exc
         project_id = uuid.uuid4().hex[:16]
         now = utcnow()
         self.db.insert(
@@ -389,13 +398,35 @@ class ProjectCoordinator:
                 return existing
         raw_path = (row.get("target_repo_path") or "").strip()
         if raw_path:
-            repo_path = validate_workspace_path(raw_path, self.config.allowed_roots())
+            try:
+                repo_path = validate_workspace_path(raw_path, self.config.allowed_roots())
+            except ValueError as exc:
+                raise ProductValidationError(
+                    f"target repository path rejected: {exc} — configure a path inside "
+                    f"allowed roots ({', '.join(str(r) for r in self.config.allowed_roots()) or '$HOME, /tmp'})"
+                ) from exc
         else:
-            root = Path(self.config.get("lifecycle.workspace_root", str(Path.home() / "gg-products")))
-            root.mkdir(parents=True, exist_ok=True)
-            repo_path = root / f"{_slug(row['name'])}-{project_id[:8]}"
-            repo_path.mkdir(parents=True, exist_ok=True)
-            repo_path = validate_workspace_path(repo_path, self.config.allowed_roots())
+            default_root = Path(self.config.get("lifecycle.workspace_root", str(Path.home() / "gg-products")))
+            candidate = default_root / f"{_slug(row['name'])}-{project_id[:8]}"
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                repo_path = validate_workspace_path(candidate, self.config.allowed_roots())
+            except ValueError:
+                # The default product root is outside this deployment's allowed
+                # roots: fall back to the first allowed root (explicit user
+                # paths are never rerouted — only our own default).
+                roots = self.config.allowed_roots()
+                if not roots:
+                    raise ProductValidationError(
+                        f"default product root {default_root} is outside the allowed workspace roots — "
+                        "set lifecycle.workspace_root or provide a target repository path"
+                    ) from None
+                fallback = roots[0] / "gg-products" / f"{_slug(row['name'])}-{project_id[:8]}"
+                fallback.mkdir(parents=True, exist_ok=True)
+                try:
+                    repo_path = validate_workspace_path(fallback, self.config.allowed_roots())
+                except ValueError as exc:
+                    raise ProductValidationError(f"target repository path rejected: {exc}") from exc
             self.db.update("product_projects", project_id, {"target_repo_path": str(repo_path)})
         repo_path.mkdir(parents=True, exist_ok=True)
         if not (repo_path / ".git").exists():

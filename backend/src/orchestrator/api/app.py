@@ -17,6 +17,7 @@ from ..config import Config
 from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
 from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
+from ..project_engine import ProductValidationError
 from ..security import read_redacted_tail, redact, validate_workspace_path
 from ..workspace import inspect_workspace
 
@@ -333,6 +334,8 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
                 req.require_plan_approval,
                 req.target_repo_path,
             )
+        except ProductValidationError as exc:
+            raise HTTPException(400, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
@@ -396,6 +399,8 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             return project
         except KeyError:
             raise HTTPException(404, "product project not found") from None
+        except ProductValidationError as exc:
+            raise HTTPException(400, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 

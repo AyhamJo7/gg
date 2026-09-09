@@ -9,6 +9,7 @@ export function LifecyclePage() {
   const [name, setName] = useState("");
   const [idea, setIdea] = useState("");
   const [constraints, setConstraints] = useState("");
+  const [targetPath, setTargetPath] = useState("");
   const [autoExecute, setAutoExecute] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -17,10 +18,17 @@ export function LifecyclePage() {
     setError(null);
     setBusy(true);
     try {
-      const created = await api.lifecycle.create({ name, idea, constraints, auto_execute: autoExecute });
+      const created = await api.lifecycle.create({
+        name,
+        idea,
+        constraints,
+        auto_execute: autoExecute,
+        target_repo_path: targetPath.trim() || undefined,
+      });
       setName("");
       setIdea("");
       setConstraints("");
+      setTargetPath("");
       refresh();
       window.location.hash = `#/lifecycle/${created.id}`;
     } catch (e) {
@@ -60,6 +68,12 @@ export function LifecyclePage() {
             onChange={(e) => setConstraints(e.target.value)}
             rows={2}
             data-testid="lifecycle-constraints"
+          />
+          <input
+            placeholder="Target repository path (optional — GG creates one otherwise)"
+            value={targetPath}
+            onChange={(e) => setTargetPath(e.target.value)}
+            data-testid="lifecycle-target"
           />
           <label className="row" style={{ gap: 8 }}>
             <input type="checkbox" checked={autoExecute} onChange={(e) => setAutoExecute(e.target.checked)} />
