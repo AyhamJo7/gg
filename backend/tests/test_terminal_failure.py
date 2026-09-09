@@ -79,8 +79,29 @@ def test_gate_refused_failure_does_not_penalize_provider(tmp_path: Path, workspa
 
         row = orch.db.get("providers", "fake-a", key="name")
         assert row["consecutive_failures"] == 0
-        assert row["cooldown_until"] is None
+        # A short fixed cooldown is applied (distinct from the exponential
+        # reliability cooldown below) — not zero, but bounded and unrelated
+        # to failure count, so it never compounds like a real penalty would.
+        assert row["cooldown_until"] is not None
         assert row["state"] != "CRASHED"
+        await orch.shutdown()
+
+    asyncio.run(main())
+
+
+def test_gate_refused_cooldown_is_short_and_expires(tmp_path: Path, workspace: Path):
+    """The gate_refused exemption still applies a small fixed cooldown (not
+    the exponential reliability one) so a persistent internal fault can't
+    cause an immediate zero-delay respawn loop. Verify it directly against
+    the registry: not eligible right after, eligible again once it elapses."""
+
+    async def main() -> None:
+        orch = _failing_orch(tmp_path, behavior="gate_refused")
+        await orch.registry.detect_all()
+        orch.registry.clear_busy_without_penalty("fake-a")
+        assert orch.registry.is_eligible("fake-a") is False
+        await asyncio.sleep(0.1)  # > the 0.05s test-config gate_refused_cooldown_seconds
+        assert orch.registry.is_eligible("fake-a") is True
         await orch.shutdown()
 
     asyncio.run(main())

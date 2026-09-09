@@ -159,12 +159,19 @@ class ProviderRegistry:
         """Reset a provider to AVAILABLE after an orchestrator-internal
         failure (a spawn-handshake refusal — see ExecutionResult.gate_refused)
         that is not evidence about the provider itself. Unlike
-        record_failure, this applies no cooldown and does not increment
-        consecutive_failures — mark_busy() alone would otherwise leave the
-        provider permanently ineligible (is_eligible only admits AVAILABLE)."""
+        record_failure, this does not increment consecutive_failures or use
+        the exponential reliability cooldown — mark_busy() alone would
+        otherwise leave the provider permanently ineligible (is_eligible only
+        admits AVAILABLE). It does apply one small fixed cooldown, distinct
+        from and much shorter than the reliability cooldown: if the
+        underlying on_spawn failure is persistent rather than a one-off
+        (disk full, DB corruption, permission failure), an immediate re-spawn
+        with zero delay would otherwise fire on the very next attempt."""
+        cooldown_s = float(self._config.get("orchestration.gate_refused_cooldown_seconds", 5))
+        cooldown_until = (datetime.now(UTC) + timedelta(seconds=cooldown_s)).isoformat()
         self._db.execute(
-            "UPDATE providers SET state=? WHERE name=?",
-            (ProviderState.AVAILABLE.value, name),
+            "UPDATE providers SET state=?, cooldown_until=? WHERE name=?",
+            (ProviderState.AVAILABLE.value, cooldown_until, name),
         )
 
     def record_failure(self, name: str, failure: FailureClass, runtime_s: float, error: str) -> ProviderState:

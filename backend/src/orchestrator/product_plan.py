@@ -247,15 +247,24 @@ RULES:
 - Never invent microservices, cloud infrastructure, or paid dependencies unless
   the idea genuinely requires them.
 - Every requirement needs measurable acceptance criteria.
-- Every criterion needs an EXECUTABLE verification command: a single command
-  line starting with one of npm, npx, node, python, python3, pytest, uv, pnpm,
-  yarn, cargo, go, make (no shell operators, no rm/sudo/git, no inline code
-  via -c/-e/--eval — write a checks/*.js or checks/*.py FILE and run it as a
-  file argument). GG runs each command in the target repository and a
-  criterion passes only on exit 0. For HTTP behavior, write a small script
-  file that starts a server on an ephemeral port, probes it, and exits
-  non-zero on failure. Example: "node checks/whitespace-probe.js". Prose is
-  not verification.
+- Every criterion needs an EXECUTABLE verification command, matching ONE of
+  these exact shapes (anything else is rejected, no exceptions):
+  "npm test", "npm ci", "npm install", "npm run <script>" (npm only, always,
+  regardless of what the project's package.json otherwise uses); "node
+  <path>.js" (a single script file, no flags);
+  "python3 <path>.py" or "python3 -m {{pytest, unittest, mypy, ruff}}" (a single
+  script file or one of those four modules only — no other -m target, no
+  -c/-e/--eval, no other flags); "pytest" with an in-repo path and/or -k/-m/
+  -q/-v/-x/-s/--tb= flags; "go test ./...", "go test ./<path>", "go build
+  ./...", "go build ./<path>", or "go run ./<path>"; "cargo test" or "cargo
+  build" (optionally "--release"; "cargo run" is never accepted); "make
+  <target>" (bare target name, no flags); or "uv run <inner>" wrapping one of
+  the shapes above. Write a checks/*.js or checks/*.py FILE and run it as a
+  file argument rather than inline code. GG runs each command in the target
+  repository and a criterion passes only on exit 0. For HTTP behavior, write
+  a small script file that starts a server on an ephemeral port, probes it,
+  and exits non-zero on failure. Example: "node checks/whitespace-probe.js".
+  Prose is not verification.
 - Every phase needs acceptance criteria and must reference the requirement ids
   it implements. Every requirement must be covered by at least one phase.
 - Phase keys must be unique; depends_on may only reference other phase keys;

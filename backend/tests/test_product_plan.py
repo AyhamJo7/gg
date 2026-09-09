@@ -6,6 +6,7 @@ import copy
 import json
 
 from orchestrator.product_plan import (
+    build_planner_prompt,
     extract_product_plan,
     validate_product_plan,
 )
@@ -126,3 +127,15 @@ def test_prerequisite_validation_run_allowlisted_command_passes():
         }
     ]
     assert validate_product_plan(plan) == []
+
+
+def test_planner_prompt_never_advertises_unsupported_npm_family_tools():
+    # Regression: the prompt once told the planner npx/pnpm/yarn were valid
+    # verify-command prefixes while the validator's closed shape set
+    # permanently rejects all three (no fixed shape can make "run an
+    # arbitrary/remote package" safe) — any criterion the LLM wrote using
+    # them could never become satisfiable. Keep the prompt and validator in
+    # agreement so they can't silently drift apart again.
+    prompt = build_planner_prompt("A todo app", "")
+    for unsupported in ("npx", "pnpm", "yarn"):
+        assert unsupported not in prompt, f"prompt still advertises unsupported tool: {unsupported!r}"

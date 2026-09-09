@@ -30,6 +30,11 @@ orchestration:
   cooldown_base_seconds: 60
   cooldown_multiplier: 2.0
   cooldown_max_seconds: 3600
+  # Distinct from the exponential reliability cooldown above: applied when a
+  # spawn-handshake refusal is orchestrator-internal (not the provider's
+  # fault, see ExecutionResult.gate_refused) so a persistent internal fault
+  # still can't cause a zero-delay respawn loop.
+  gate_refused_cooldown_seconds: 5
   max_provider_wait_seconds: 7200
   scheduler_tick_seconds: 2
 

@@ -23,8 +23,8 @@ def workspace(tmp_path: Path) -> Path:
             {
                 "name": "fixture-project",
                 "scripts": {
-                    "test": "node -e \"process.exit(0)\"",
-                    "build": "node -e \"process.exit(0)\"",
+                    "test": 'node -e "process.exit(0)"',
+                    "build": 'node -e "process.exit(0)"',
                 },
             }
         )
@@ -48,6 +48,7 @@ def make_config(priority: dict[str, list[str]] | None = None, providers: list[st
             "cooldown_base_seconds": 0.05,
             "cooldown_multiplier": 1.0,
             "cooldown_max_seconds": 0.2,
+            "gate_refused_cooldown_seconds": 0.05,
             "scheduler_tick_seconds": 0.05,
         },
         "priority": priority
