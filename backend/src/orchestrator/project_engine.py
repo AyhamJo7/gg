@@ -1265,7 +1265,7 @@ RULES:
         ok, safe_command = is_executable_command(command)
         if not ok:
             return False
-        if not confined_to_repo(safe_command, repo):
+        if not await confined_to_repo(safe_command, repo):
             return False
         argv = shlex.split(safe_command)
         result = await run_process(argv, cwd=repo, timeout_s=120)
