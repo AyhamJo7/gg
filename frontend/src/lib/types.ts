@@ -237,6 +237,139 @@ export interface Analytics {
 
 export type PriorityMatrix = Record<string, string[]>;
 
+export interface ProductProjectSummary {
+  id: string;
+  name: string;
+  state: string;
+  acceptance_state: string;
+  plan_revision: number;
+  target_repo_path: string;
+  blocking_reason: string | null;
+  delivery_sha: string | null;
+  created_at: string;
+  updated_at: string;
+  phase_counts: Record<string, number>;
+  open_gates: number;
+}
+
+export interface PlanAcceptance {
+  id: string;
+  description: string;
+  verify: string;
+}
+
+export interface PlanRequirement {
+  id: string;
+  title: string;
+  description: string;
+  kind: string;
+  acceptance: PlanAcceptance[];
+}
+
+export interface PlanPhase {
+  key: string;
+  title: string;
+  goal: string;
+  deliverables: string[];
+  tasks: string[];
+  depends_on: string[];
+  workspace_scopes: string[];
+  suggested_providers: string[];
+  acceptance: PlanAcceptance[];
+  requirement_ids: string[];
+  verify_commands: string[];
+  human_prerequisites: string[];
+  effort: string;
+}
+
+export interface PlanPrerequisite {
+  key: string;
+  title: string;
+  what_required: string;
+  why_required: string;
+  human_action: string;
+  where_to_provide: string;
+  validation: string;
+  required_vars: string[];
+}
+
+export interface ProductPlan {
+  product_name: string;
+  goal: string;
+  users: string;
+  journeys: string[];
+  requirements: PlanRequirement[];
+  non_functional: string[];
+  assumptions: string[];
+  out_of_scope: string[];
+  risks: string[];
+  architecture: Record<string, unknown>;
+  phases: PlanPhase[];
+  external_prerequisites: PlanPrerequisite[];
+}
+
+export interface ProductPhaseRow {
+  id: string;
+  phase_key: string;
+  title: string;
+  goal: string;
+  status: string;
+  mission_id: string | null;
+  depends_on: string[];
+  acceptance_json: PlanAcceptance[];
+  evidence_json: Record<string, unknown>;
+  attempts: number;
+  blocking_issue: string | null;
+}
+
+export interface ProductGateRow {
+  id: string;
+  phase_id: string | null;
+  mission_gate_id: string | null;
+  gate_type: string;
+  title: string;
+  what_required: string;
+  why_required: string;
+  blocked_ref: string;
+  completed_so_far: string;
+  human_action: string;
+  where_to_provide: string;
+  validation: string;
+  after_resolve: string;
+  required_vars: string[];
+  status: string;
+  resolution: string | null;
+}
+
+export interface RequirementEvidenceRow {
+  requirement_id: string;
+  status: string;
+  evidence_json: Record<string, unknown>;
+}
+
+export interface ProductProjectDetail {
+  id: string;
+  name: string;
+  idea: string;
+  constraints_text: string;
+  state: string;
+  acceptance_state: string;
+  auto_execute: number;
+  require_plan_approval: number;
+  target_repo_path: string;
+  plan_revision: number;
+  blocking_reason: string | null;
+  delivery_sha: string | null;
+  delivery_report: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  phases: ProductPhaseRow[];
+  gates: ProductGateRow[];
+  evidence: RequirementEvidenceRow[];
+  plan: ProductPlan | null;
+  plan_revision_count: number;
+}
+
 export interface DagTaskInput {
   id: string;
   role: string;

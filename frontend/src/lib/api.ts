@@ -26,6 +26,8 @@ import type {
   MissionDag,
   MissionDetail,
   PriorityMatrix,
+  ProductProjectDetail,
+  ProductProjectSummary,
   Project,
   ProviderHealth,
   TaskLogsResponse,
@@ -110,6 +112,43 @@ export const api = {
   },
   analytics: () => req<Analytics>("/api/analytics"),
   health: () => req<{ status: string }>("/api/health"),
+  lifecycle: {
+    list: () => req<ProductProjectSummary[]>("/api/product-projects"),
+    create: (body: {
+      name: string;
+      idea: string;
+      constraints?: string;
+      auto_execute?: boolean;
+      require_plan_approval?: boolean;
+      target_repo_path?: string;
+    }) => req<ProductProjectDetail>("/api/product-projects", { method: "POST", body: JSON.stringify(body) }),
+    get: (id: string) => req<ProductProjectDetail>(`/api/product-projects/${id}`),
+    plan: (id: string) =>
+      req<{ ok: boolean; revision?: number; plan?: unknown; errors?: string[] }>(
+        `/api/product-projects/${id}/plan`,
+        { method: "POST" },
+      ),
+    revisePlan: (id: string, plan: unknown, reason: string) =>
+      req<{ ok: boolean; revision: number }>(`/api/product-projects/${id}/plan`, {
+        method: "PUT",
+        body: JSON.stringify({ plan, reason }),
+      }),
+    start: (id: string) => req<ProductProjectDetail>(`/api/product-projects/${id}/start`, { method: "POST" }),
+    advance: (id: string) => req<Record<string, unknown>>(`/api/product-projects/${id}/advance`, { method: "POST" }),
+    pause: (id: string) => req<{ status: string }>(`/api/product-projects/${id}/pause`, { method: "POST" }),
+    cancel: (id: string) => req<{ status: string }>(`/api/product-projects/${id}/cancel`, { method: "POST" }),
+    retryPhase: (id: string, phaseKey: string) =>
+      req<{ ok: boolean }>(`/api/product-projects/${id}/phases/${phaseKey}/retry`, { method: "POST" }),
+    resolveGate: (id: string, gateId: string, resolution: string) =>
+      req<{ ok: boolean }>(`/api/product-projects/${id}/gates/${gateId}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ resolution }),
+      }),
+    acceptance: (id: string) =>
+      req<{ ok: boolean; sha?: string; findings?: string[] }>(`/api/product-projects/${id}/acceptance`, {
+        method: "POST",
+      }),
+  },
 };
 
 export function missionWsUrl(missionId: string): string {

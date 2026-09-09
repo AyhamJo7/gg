@@ -4,6 +4,7 @@ import { useTheme } from "../lib/theme";
 const NAV = [
   { to: "/", label: "Mission Control", icon: "◎" },
   { to: "/new", label: "New Mission", icon: "+" },
+  { to: "/lifecycle", label: "Idea → Product", icon: "✦" },
   { to: "/projects", label: "Projects", icon: "▤" },
   { to: "/providers", label: "Providers", icon: "⬡" },
   { to: "/priority", label: "Priority Matrix", icon: "⇅" },

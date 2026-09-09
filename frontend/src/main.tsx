@@ -3,6 +3,8 @@ import { createRoot } from "react-dom/client";
 import { createHashRouter, RouterProvider } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { AnalyticsPage } from "./pages/AnalyticsPage";
+import { LifecycleDetailPage } from "./pages/LifecycleDetailPage";
+import { LifecyclePage } from "./pages/LifecyclePage";
 import { MissionControlPage } from "./pages/MissionControlPage";
 import { NewMissionPage } from "./pages/NewMissionPage";
 import { PriorityPage } from "./pages/PriorityPage";
@@ -17,6 +19,8 @@ const router = createHashRouter([
       { path: "/", element: <MissionControlPage /> },
       { path: "/new", element: <NewMissionPage /> },
       { path: "/projects", element: <ProjectsPage /> },
+      { path: "/lifecycle", element: <LifecyclePage /> },
+      { path: "/lifecycle/:id", element: <LifecycleDetailPage /> },
       { path: "/providers", element: <ProvidersPage /> },
       { path: "/priority", element: <PriorityPage /> },
       { path: "/analytics", element: <AnalyticsPage /> },
