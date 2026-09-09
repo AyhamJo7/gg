@@ -61,6 +61,20 @@ class ProviderToggleRequest(BaseModel):
     enabled: bool
 
 
+class CreateProductProjectRequest(BaseModel):
+    name: str
+    idea: str
+    constraints: str = ""
+    auto_execute: bool = False
+    require_plan_approval: bool = True
+    target_repo_path: str = ""
+
+
+class RevisePlanRequest(BaseModel):
+    plan: dict[str, Any]
+    reason: str
+
+
 def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
     for key in ("providers_used", "providers_failed", "choices", "payload", "command"):
         if isinstance(row.get(key), str):
@@ -295,6 +309,135 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         except IllegalMissionTransitionError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"status": "resolved"}
+
+    # ---------------- product lifecycle (idea-to-product) ----------------
+    @app.get("/api/product-projects")
+    def list_product_projects() -> list[dict[str, Any]]:
+        return orchestrator.coordinator.list_projects()
+
+    @app.post("/api/product-projects", status_code=201)
+    def create_product_project(req: CreateProductProjectRequest) -> dict[str, Any]:
+        try:
+            return orchestrator.coordinator.create_project(
+                req.name,
+                req.idea,
+                req.constraints,
+                req.auto_execute,
+                req.require_plan_approval,
+                req.target_repo_path,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/product-projects/{project_id}")
+    def get_product_project(project_id: str) -> dict[str, Any]:
+        project = orchestrator.coordinator.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "product project not found")
+        for row in project.get("phases", []):
+            for key in ("depends_on", "acceptance_json", "evidence_json"):
+                if isinstance(row.get(key), str):
+                    try:
+                        row[key] = json.loads(row[key])
+                    except json.JSONDecodeError:
+                        pass
+        for row in project.get("gates", []):
+            if isinstance(row.get("required_vars"), str):
+                try:
+                    row["required_vars"] = json.loads(row["required_vars"])
+                except json.JSONDecodeError:
+                    pass
+        for row in project.get("evidence", []):
+            if isinstance(row.get("evidence_json"), str):
+                try:
+                    row["evidence_json"] = json.loads(row["evidence_json"])
+                except json.JSONDecodeError:
+                    pass
+        return project
+
+    @app.post("/api/product-projects/{project_id}/plan")
+    async def generate_product_plan(project_id: str) -> dict[str, Any]:
+        try:
+            return await orchestrator.coordinator.generate_plan(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.put("/api/product-projects/{project_id}/plan")
+    def revise_product_plan(project_id: str, req: RevisePlanRequest) -> dict[str, Any]:
+        try:
+            result = orchestrator.coordinator.revise_plan(project_id, req.plan, req.reason)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not result.get("ok"):
+            raise HTTPException(400, "; ".join(result.get("errors", ["invalid plan"])))
+        return result
+
+    @app.post("/api/product-projects/{project_id}/start")
+    async def start_product_project(project_id: str) -> dict[str, Any]:
+        try:
+            project = orchestrator.coordinator.start_project(project_id)
+            await orchestrator.coordinator.advance_project(project_id)
+            return project
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/product-projects/{project_id}/advance")
+    async def advance_product_project(project_id: str) -> dict[str, Any]:
+        try:
+            return await orchestrator.coordinator.advance_project(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+
+    @app.post("/api/product-projects/{project_id}/pause")
+    def pause_product_project(project_id: str) -> dict[str, str]:
+        try:
+            orchestrator.coordinator.pause_project(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        return {"status": "pausing"}
+
+    @app.post("/api/product-projects/{project_id}/cancel")
+    def cancel_product_project(project_id: str) -> dict[str, str]:
+        try:
+            orchestrator.coordinator.cancel_project(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        return {"status": "cancelled"}
+
+    @app.post("/api/product-projects/{project_id}/phases/{phase_key}/retry")
+    async def retry_product_phase(project_id: str, phase_key: str) -> dict[str, Any]:
+        try:
+            result = orchestrator.coordinator.retry_phase(project_id, phase_key)
+            await orchestrator.coordinator.advance_project(project_id)
+            return result
+        except KeyError:
+            raise HTTPException(404, "product project or phase not found") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/product-projects/{project_id}/gates/{gate_id}/resolve")
+    async def resolve_product_gate(project_id: str, gate_id: str, req: GateResolutionRequest) -> dict[str, Any]:
+        try:
+            result = orchestrator.coordinator.resolve_gate(project_id, gate_id, req.resolution)
+        except KeyError:
+            raise HTTPException(404, "product project or gate not found") from None
+        if not result.get("ok"):
+            raise HTTPException(400, result.get("error", "gate not resolved"))
+        await orchestrator.coordinator.advance_project(project_id)
+        return result
+
+    @app.post("/api/product-projects/{project_id}/acceptance")
+    async def run_product_acceptance(project_id: str) -> dict[str, Any]:
+        try:
+            return await orchestrator.coordinator.run_acceptance(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
 
     # ---------------- DAG / parallel task endpoints ----------------
     @app.get("/api/missions/{mission_id}/dag")

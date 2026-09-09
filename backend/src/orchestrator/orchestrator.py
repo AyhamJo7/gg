@@ -29,6 +29,7 @@ from .models import (
 )
 from .notifications import Notifier, default_notifier
 from .parallel_engine import ParallelMissionEngine
+from .project_engine import ProjectCoordinator
 from .providers.base import ProviderAdapter
 from .providers.registry import ProviderRegistry
 
@@ -61,12 +62,14 @@ class Orchestrator:
         self._engine_tasks: dict[str, asyncio.Task[None]] = {}
         self._scheduler_task: asyncio.Task[None] | None = None
         self._shutdown = asyncio.Event()
+        self.coordinator = ProjectCoordinator(self)
 
     # -- lifecycle ------------------------------------------------------------
     async def start(self) -> None:
         await self.registry.detect_all()
         self._reap_orphaned_processes()
         await self._recover_missions()
+        await self.coordinator.recover()
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     async def shutdown(self) -> None:
@@ -186,6 +189,7 @@ class Orchestrator:
                 self.registry.health()  # expires cooldowns
                 for engine in list(self._engines.values()):
                     engine.wake()
+                await self.coordinator.advance_all()
                 # re-launch missions that are waiting (provider availability or
                 # workspace ownership) when their constraint clears
                 waiting = self.db.query(

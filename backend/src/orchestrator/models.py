@@ -119,6 +119,66 @@ class SchedulingMode(StrValueEnum):
     PARALLEL_SAFE = "PARALLEL_SAFE"
 
 
+class ProductStatus(StrValueEnum):
+    DRAFT = "DRAFT"
+    PLANNING = "PLANNING"
+    PLAN_READY = "PLAN_READY"
+    EXECUTING = "EXECUTING"
+    WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+    REVIEWING = "REVIEWING"
+    FINAL_ACCEPTANCE = "FINAL_ACCEPTANCE"
+    DELIVERED = "DELIVERED"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+ACTIVE_PRODUCT_STATUSES = frozenset(
+    {
+        ProductStatus.PLANNING,
+        ProductStatus.EXECUTING,
+        ProductStatus.WAITING_FOR_HUMAN,
+        ProductStatus.REVIEWING,
+        ProductStatus.FINAL_ACCEPTANCE,
+    }
+)
+
+TERMINAL_PRODUCT_STATUSES = frozenset(
+    {ProductStatus.DELIVERED, ProductStatus.FAILED, ProductStatus.CANCELLED}
+)
+
+
+class AcceptanceState(StrValueEnum):
+    PENDING = "PENDING"
+    ENGINEERING_COMPLETE = "ENGINEERING_COMPLETE"
+    LOCAL_ACCEPTED = "LOCAL_ACCEPTED"
+    WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+    EXTERNALLY_BLOCKED = "EXTERNALLY_BLOCKED"
+    UNVERIFIED = "UNVERIFIED"
+    DELIVERED = "DELIVERED"
+
+
+class ProjectPhaseStatus(StrValueEnum):
+    PENDING = "PENDING"
+    READY = "READY"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    BLOCKED = "BLOCKED"
+    WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+    SKIPPED = "SKIPPED"
+
+
+TERMINAL_PHASE_STATUSES = frozenset(
+    {
+        ProjectPhaseStatus.COMPLETED,
+        ProjectPhaseStatus.FAILED,
+        ProjectPhaseStatus.BLOCKED,
+        ProjectPhaseStatus.SKIPPED,
+    }
+)
+
+
 class TaskStatus(StrValueEnum):
     PENDING = "PENDING"
     BLOCKED = "BLOCKED"
@@ -202,6 +262,17 @@ class EventType(StrValueEnum):
     INTEGRATION_STARTED = "INTEGRATION_STARTED"
     MERGE_CONFLICT = "MERGE_CONFLICT"
     INTEGRATION_COMPLETED = "INTEGRATION_COMPLETED"
+    # Idea-to-Product lifecycle events (mission_id carries the phase mission
+    # when present; payload always includes product_project_id)
+    PRODUCT_PROJECT_CREATED = "PRODUCT_PROJECT_CREATED"
+    PRODUCT_STATUS_CHANGED = "PRODUCT_STATUS_CHANGED"
+    PRODUCT_PLAN_READY = "PRODUCT_PLAN_READY"
+    PRODUCT_PHASE_STARTED = "PRODUCT_PHASE_STARTED"
+    PRODUCT_PHASE_COMPLETED = "PRODUCT_PHASE_COMPLETED"
+    PRODUCT_GATE_CREATED = "PRODUCT_GATE_CREATED"
+    PRODUCT_GATE_RESOLVED = "PRODUCT_GATE_RESOLVED"
+    PRODUCT_ACCEPTANCE_RECORDED = "PRODUCT_ACCEPTANCE_RECORDED"
+    PRODUCT_DELIVERED = "PRODUCT_DELIVERED"
 
 
 # ---------------------------------------------------------------------------
