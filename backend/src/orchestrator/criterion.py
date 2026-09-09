@@ -81,6 +81,11 @@ class _ShapeMatch:
     """
 
     path_tokens: tuple[str, ...] = field(default_factory=tuple)
+    #: "go" or "cargo" when the matched shape invokes a toolchain whose own
+    #: manifest (go.mod / Cargo.toml) can redirect it outside the argv path
+    #: token entirely (replace directives, [patch]/path dependencies) — see
+    #: ``_manifest_confined``. ``None`` for shapes with no such indirection.
+    manifest_check: str | None = None
 
 
 def _no_shell_meta(token: str) -> bool:
@@ -153,11 +158,11 @@ def _match_go(argv: list[str]) -> _ShapeMatch | None:
         return None
     target = argv[2]
     if target == "./...":
-        return _ShapeMatch()
+        return _ShapeMatch(manifest_check="go")
     if target == ".":
-        return _ShapeMatch(path_tokens=(".",))
+        return _ShapeMatch(path_tokens=(".",), manifest_check="go")
     if target.startswith("./") and _safe_rel_path(target):
-        return _ShapeMatch(path_tokens=(target,))
+        return _ShapeMatch(path_tokens=(target,), manifest_check="go")
     return None
 
 
@@ -174,9 +179,9 @@ def _match_cargo(argv: list[str]) -> _ShapeMatch | None:
     if not argv or argv[0] != "cargo" or len(argv) < 2 or argv[1] not in ("test", "build"):
         return None
     if len(argv) == 2:
-        return _ShapeMatch()
+        return _ShapeMatch(manifest_check="cargo")
     if len(argv) == 3 and argv[2] == "--release":
-        return _ShapeMatch()
+        return _ShapeMatch(manifest_check="cargo")
     return None
 
 
@@ -266,6 +271,70 @@ def confined_to_repo(command: str, repo: Path) -> bool:
         candidate = (repo / tok).resolve()
         if not candidate.is_relative_to(repo_resolved):
             return False
+    if match.manifest_check is not None and not _manifest_confined(match.manifest_check, repo):
+        return False
+    return True
+
+
+#: A go.mod replace directive's target, either single-line (`replace OLD =>
+#: NEW`) or inside a `replace ( ... )` block (`OLD => NEW`, no leading
+#: keyword) — both forms put the target after `=>` on its own line.
+_GO_REPLACE_TARGET_RE = re.compile(r"=>\s*(\S+)")
+
+#: A Cargo.toml path dependency or [patch] entry: `path = "..."` anywhere in
+#: the file (normal [dependencies], a workspace member, or a [patch.*] table
+#: — all share this syntax).
+_CARGO_PATH_RE = re.compile(r'\bpath\s*=\s*"([^"]*)"')
+
+
+def _manifest_target_confined(target: str, repo: Path, repo_resolved: Path) -> bool:
+    """A replace/patch target that looks like a filesystem path must resolve
+    inside the repo. A bare module path or version-pinned reference (no `.`,
+    `/`, or `~` prefix — e.g. `example.com/other v1.2.3`) isn't a filesystem
+    escape at all and is left alone."""
+    if not (target.startswith(".") or target.startswith("/") or target.startswith("~")):
+        return True
+    if target.startswith("~"):
+        return False  # home-dir expansion always escapes the repo
+    if ".." in Path(target).parts:
+        return False  # blanket-reject traversal, consistent with _safe_rel_path
+    candidate = Path(target).resolve() if target.startswith("/") else (repo / target).resolve()
+    return candidate.is_relative_to(repo_resolved)
+
+
+def _manifest_confined(tool: str, repo: Path) -> bool:
+    """Best-effort text scan for manifest content that would redirect `go`
+    or `cargo` outside the repo the argv path token was already confined to
+    (a go.mod `replace` directive, a Cargo.toml `[patch]`/path dependency).
+    Deliberately not a real TOML/go.mod parser — a plain line scan is
+    sufficient here and false-positive-safe (reject on anything ambiguous)
+    is preferred over trying to be precise.
+    """
+    repo_resolved = repo.resolve()
+    if tool == "go":
+        go_mod = repo / "go.mod"
+        if not go_mod.is_file():
+            return True
+        try:
+            text = go_mod.read_text(errors="replace")
+        except OSError:
+            return False
+        for match in _GO_REPLACE_TARGET_RE.finditer(text):
+            if not _manifest_target_confined(match.group(1), repo, repo_resolved):
+                return False
+        return True
+    if tool == "cargo":
+        cargo_toml = repo / "Cargo.toml"
+        if not cargo_toml.is_file():
+            return True
+        try:
+            text = cargo_toml.read_text(errors="replace")
+        except OSError:
+            return False
+        for match in _CARGO_PATH_RE.finditer(text):
+            if not _manifest_target_confined(match.group(1), repo, repo_resolved):
+                return False
+        return True
     return True
 
 

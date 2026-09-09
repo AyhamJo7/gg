@@ -289,6 +289,63 @@ async def test_python_dash_m_attached_flag_never_executes(tmp_path: Path):
     assert not marker.exists(), "payload executed despite rejection"
 
 
+# -- manifest-driven repo-confinement escape (go.mod replace / Cargo.toml
+# [patch]/path deps) — defense in depth on top of the argv path check, since
+# these let the toolchain read/execute content outside the repo the argv
+# path was already confined to, via manifest content rather than argv. --
+
+
+def test_go_mod_replace_escaping_repo_rejected(tmp_path: Path):
+    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace example.com/x => ../../../../tmp/evil\n")
+    assert confined_to_repo("go test ./...", tmp_path) is False
+    assert confined_to_repo("go build ./...", tmp_path) is False
+    assert confined_to_repo("go run .", tmp_path) is False
+
+
+def test_go_mod_replace_absolute_path_escaping_repo_rejected(tmp_path: Path):
+    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace example.com/x => /etc\n")
+    assert confined_to_repo("go test ./...", tmp_path) is False
+
+
+def test_go_mod_replace_block_form_escaping_repo_rejected(tmp_path: Path):
+    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace (\n\texample.com/x => ../../outside\n)\n")
+    assert confined_to_repo("go test ./...", tmp_path) is False
+
+
+def test_go_mod_replace_in_repo_path_still_allowed(tmp_path: Path):
+    (tmp_path / "internal" / "foo").mkdir(parents=True)
+    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace example.com/foo => ./internal/foo\n")
+    assert confined_to_repo("go test ./...", tmp_path) is True
+
+
+def test_go_mod_replace_module_version_target_not_a_path_escape(tmp_path: Path):
+    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace example.com/foo => example.com/bar v1.2.3\n")
+    assert confined_to_repo("go test ./...", tmp_path) is True
+
+
+def test_go_test_with_no_go_mod_is_unaffected(tmp_path: Path):
+    assert confined_to_repo("go test ./...", tmp_path) is True
+
+
+def test_cargo_patch_escaping_repo_rejected(tmp_path: Path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "x"\n\n[patch.crates-io]\nfoo = { path = "../../../../tmp/evil" }\n'
+    )
+    assert confined_to_repo("cargo test", tmp_path) is False
+    assert confined_to_repo("cargo build", tmp_path) is False
+
+
+def test_cargo_path_dependency_escaping_repo_rejected(tmp_path: Path):
+    (tmp_path / "Cargo.toml").write_text('[dependencies]\nfoo = { path = "/etc/evil" }\n')
+    assert confined_to_repo("cargo test", tmp_path) is False
+
+
+def test_cargo_path_dependency_in_repo_still_allowed(tmp_path: Path):
+    (tmp_path / "crates" / "foo").mkdir(parents=True)
+    (tmp_path / "Cargo.toml").write_text('[dependencies]\nfoo = { path = "crates/foo" }\n')
+    assert confined_to_repo("cargo test", tmp_path) is True
+
+
 async def test_node_require_attached_flag_never_executes(tmp_path: Path):
     marker = tmp_path / "pwned.txt"
     (tmp_path / "py.js").write_text(f"require('fs').writeFileSync({marker.as_posix()!r}, 'MALICIOUS py.js EXECUTED')\n")
