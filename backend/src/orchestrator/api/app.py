@@ -95,7 +95,14 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     app = FastAPI(title="GG Orchestrator", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "tauri://localhost", "http://tauri.localhost"],
+        allow_origins=[
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5174",
+            "tauri://localhost",
+            "http://tauri.localhost",
+        ],
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -353,6 +360,11 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
                     row["evidence_json"] = json.loads(row["evidence_json"])
                 except json.JSONDecodeError:
                     pass
+        if isinstance(project.get("delivery_report"), str):
+            try:
+                project["delivery_report"] = json.loads(project["delivery_report"])
+            except json.JSONDecodeError:
+                project["delivery_report"] = {}
         return project
 
     @app.post("/api/product-projects/{project_id}/plan")
