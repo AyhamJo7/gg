@@ -44,6 +44,49 @@ BLOCKED_SEQUENCES: tuple[tuple[str, ...], ...] = (
     ("cargo", "publish"),
 )
 
+#: Package-manager tools whose "exec a raw command"/"download-and-run a package"
+#: subcommands defeat the allowlist the same way an inline-code interpreter flag
+#: does. Unlike "npm run <script>"/"yarn run <script>" — constrained by the tool
+#: itself to a package.json-declared script name — "exec"/"dlx"/"-c"/"--call"
+#: accept arbitrary text or an arbitrary package to run, so those are rejected
+#: outright; "run" is deliberately NOT in this set (it is the legitimate,
+#: load-bearing way to invoke a declared script).
+PM_TOOLS_WITH_DANGEROUS_TOKENS = frozenset({"npm", "npx", "pnpm", "yarn"})
+PM_DANGEROUS_TOKENS = frozenset({"exec", "dlx", "-c", "--call"})
+
+#: "run"-style subcommands (uv/go/cargo) accept a target to execute; the target
+#: must not itself be a shell/interpreter/network-fetcher, and (go specifically)
+#: must be an explicit local path — not a remote module reference that `go run`
+#: would fetch and execute.
+RUN_TARGET_DENYLIST = frozenset(
+    {
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "python",
+        "python2",
+        "python3",
+        "ruby",
+        "perl",
+        "php",
+        "node",
+        "env",
+        "xargs",
+        "curl",
+        "wget",
+        "nc",
+        "ncat",
+        "socat",
+    }
+)
+RUN_SUBCOMMAND_TOOLS = frozenset({"uv", "go", "cargo"})
+
+#: Flags that let `make` read a Makefile from outside the target repo.
+MAKE_PATH_ESCAPE_FLAGS = frozenset({"-f", "--file", "-C", "--directory"})
+
 MAX_COMMAND_CHARS = 2000
 CHECK_TIMEOUT_S = 300.0
 TAIL_CHARS = 3000
@@ -81,6 +124,20 @@ def is_executable_command(verify: str) -> tuple[bool, str]:
         if any(tuple(argv_lower[i : i + n]) == seq for i in range(len(argv_lower) - n + 1)):
             return False, ""
     if argv[0] in INLINE_CODE_INTERPRETERS and any(a in INLINE_CODE_FLAGS for a in argv_lower[1:]):
+        return False, ""
+    if argv[0] in PM_TOOLS_WITH_DANGEROUS_TOKENS and any(tok in PM_DANGEROUS_TOKENS for tok in argv_lower[1:]):
+        return False, ""
+    if argv[0] in RUN_SUBCOMMAND_TOOLS and len(argv) > 1 and argv_lower[1] == "run":
+        target = argv[2] if len(argv) > 2 else ""
+        if not target:
+            return False, ""
+        if target.lower() in RUN_TARGET_DENYLIST or "://" in target or "@" in target:
+            return False, ""
+        if argv[0] == "go" and not (target == "." or target.startswith("./") or target.startswith("../")):
+            return False, ""
+    if argv[0] == "make" and any(
+        tok in MAKE_PATH_ESCAPE_FLAGS or tok.startswith("--file=") or tok.startswith("--directory=") for tok in argv
+    ):
         return False, ""
     return True, text
 

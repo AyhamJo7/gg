@@ -1121,6 +1121,13 @@ RULES:
 
     # -- gates -------------------------------------------------------------
     async def resolve_gate(self, project_id: str, gate_id: str, resolution: str) -> dict[str, Any]:
+        # The external-command validation below can take up to 120s (see
+        # _run_gate_validation). Holding _advance_lock for that whole span would
+        # stall advance_all()'s ~2s scheduler tick for every other active
+        # project, so the slow part runs unlocked; the lock is only held for
+        # the state read that decides what to do and the state write that
+        # persists the outcome, with a re-check between them since the gate or
+        # project may have changed while validation ran (e.g. cancelled).
         async with self._advance_lock:
             gate = self.db.get("project_gates", gate_id)
             if not gate or gate["project_id"] != project_id or gate["status"] != "open":
@@ -1133,7 +1140,11 @@ RULES:
                     gate_id,
                     {"status": "resolved", "resolution": resolution or "continue", "resolved_at": utcnow()},
                 )
-            elif gate["gate_type"] == "secret":
+                self.events.publish(
+                    EventType.PRODUCT_GATE_RESOLVED, None, product_project_id=project_id, gate_id=gate_id
+                )
+                return {"ok": True, "gate_id": gate_id}
+            if gate["gate_type"] == "secret":
                 check = self._validate_secret_gate(project_id, gate)
                 if not check["ok"]:
                     return check
@@ -1146,23 +1157,45 @@ RULES:
                         "resolved_at": utcnow(),
                     },
                 )
-            else:
-                if not (resolution or "").strip():
-                    return {"ok": False, "error": "resolution text is required"}
-                validation_cmd = (gate.get("validation") or "").strip()
-                # Only an explicit `run <command>` validation executes anything;
-                # all other validation text is human-attested instruction. The
-                # command was already checked against the same allowlist at
-                # plan-validation time (validate_product_plan); re-checked here
-                # too — defense in depth, never trust a prior check alone.
-                if validation_cmd.lower().startswith("run "):
-                    if not await self._run_gate_validation(project_id, validation_cmd[4:].strip()):
-                        return {"ok": False, "error": "validation command failed — prerequisite not satisfied"}
+                self.events.publish(
+                    EventType.PRODUCT_GATE_RESOLVED, None, product_project_id=project_id, gate_id=gate_id
+                )
+                return {"ok": True, "gate_id": gate_id}
+            if not (resolution or "").strip():
+                return {"ok": False, "error": "resolution text is required"}
+            validation_cmd = (gate.get("validation") or "").strip()
+            # Only an explicit `run <command>` validation executes anything;
+            # all other validation text is human-attested instruction. The
+            # command was already checked against the same allowlist at
+            # plan-validation time (validate_product_plan); re-checked here
+            # too — defense in depth, never trust a prior check alone.
+            needs_exec = validation_cmd.lower().startswith("run ")
+            exec_command = validation_cmd[4:].strip() if needs_exec else ""
+            if not needs_exec:
                 self.db.update(
                     "project_gates",
                     gate_id,
                     {"status": "resolved", "resolution": (resolution or "").strip(), "resolved_at": utcnow()},
                 )
+                self.events.publish(
+                    EventType.PRODUCT_GATE_RESOLVED, None, product_project_id=project_id, gate_id=gate_id
+                )
+                return {"ok": True, "gate_id": gate_id}
+
+        # -- unlocked: the potentially slow part --
+        passed = await self._run_gate_validation(project_id, exec_command)
+
+        async with self._advance_lock:
+            gate = self.db.get("project_gates", gate_id)
+            if not gate or gate["project_id"] != project_id or gate["status"] != "open":
+                return {"ok": False, "error": "gate no longer open — project state changed during validation"}
+            if not passed:
+                return {"ok": False, "error": "validation command failed — prerequisite not satisfied"}
+            self.db.update(
+                "project_gates",
+                gate_id,
+                {"status": "resolved", "resolution": (resolution or "").strip(), "resolved_at": utcnow()},
+            )
             self.events.publish(EventType.PRODUCT_GATE_RESOLVED, None, product_project_id=project_id, gate_id=gate_id)
             return {"ok": True, "gate_id": gate_id}
 
