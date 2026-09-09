@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.sandbox import run_sandboxed, sandbox_available
+from orchestrator.sandbox import build_sandboxed_argv, run_sandboxed, sandbox_available
 
 pytestmark = pytest.mark.skipif(not sandbox_available(), reason="bubblewrap (bwrap) not installed")
 
@@ -79,6 +79,80 @@ async def test_env_is_cleared_except_forwarded_vars(tmp_path: Path):
     # --clearenv means only the explicitly forwarded/set names exist at all.
     assert "ANTHROPIC_API_KEY" not in result.combined_tail
     assert "AWS_SECRET_ACCESS_KEY" not in result.combined_tail
+
+
+async def test_sandboxed_process_cannot_signal_a_host_process(tmp_path: Path):
+    """Proven live during round-8 review: a shared PID namespace let a
+    sandboxed command kill(2) an arbitrary host process by pid, including
+    the orchestrator's own, despite no filesystem/network access. Must be
+    unreachable now that --unshare-pid is applied."""
+    victim = await asyncio.create_subprocess_exec("sleep", "30")
+    try:
+        await asyncio.sleep(0.3)
+        result = await run_sandboxed(["kill", "-TERM", str(victim.pid)], tmp_path, timeout_s=10)
+        assert result.exit_code != 0
+        await asyncio.sleep(0.3)
+        assert victim.returncode is None, "host process must survive a signal attempt from inside the sandbox"
+    finally:
+        victim.kill()
+        await victim.wait()
+
+
+async def test_process_count_ulimit_is_applied(tmp_path: Path):
+    result = await run_sandboxed(["bash", "-c", "ulimit -u"], tmp_path, timeout_s=10)
+    assert result.exit_code == 0
+    assert result.combined_tail.strip() == "2048"
+
+
+async def test_cache_dirs_outside_the_allowlist_are_not_bound(tmp_path: Path, monkeypatch):
+    """The allow-list replaced wholesale ~/.cache/~/.local binds after
+    those were proven to expose a live Hugging Face token and a live
+    Jupyter session secret on a real machine — neither a toolchain path.
+    Reproduces the same shape (a secret-looking file under an
+    unenumerated .cache subdirectory) against a synthetic fake $HOME, so
+    this doesn't touch the real developer home directory or depend on
+    what happens to exist on whichever machine runs this test."""
+    fake_home = tmp_path / "fake-home"
+    repo = tmp_path / "repo"  # sibling of fake_home, not an ancestor — the repo!=home guard must not fire
+    repo.mkdir()
+    (fake_home / ".cache" / "uv").mkdir(parents=True)  # on the allow-list: must stay reachable
+    (fake_home / ".cache" / "some-other-tool").mkdir(parents=True)  # not on the allow-list
+    secret = fake_home / ".cache" / "some-other-tool" / "token"
+    secret.write_text("should-never-be-readable-inside-the-sandbox")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    result = await run_sandboxed(["cat", str(secret)], repo, timeout_s=10)
+    assert result.exit_code != 0
+    assert "should-never-be-readable" not in result.combined_tail
+
+    allowed = await run_sandboxed(["ls", str(fake_home / ".cache" / "uv")], repo, timeout_s=10)
+    assert allowed.exit_code == 0, "the allow-listed subpath itself must still be reachable"
+
+
+def test_sandboxed_path_excludes_unbound_host_directories(tmp_path: Path):
+    argv = build_sandboxed_argv(["true"], tmp_path, tmp_path / "scratch")
+    path_value = None
+    for i, tok in enumerate(argv):
+        if tok == "--setenv" and i + 1 < len(argv) and argv[i + 1] == "PATH":
+            path_value = argv[i + 2]
+            break
+    assert path_value is not None
+    fake_unbound = "/definitely/not/a/bound/directory/bin"
+    assert fake_unbound not in path_value.split(":")
+
+
+def test_refuses_to_sandbox_repo_equal_to_home(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    with pytest.raises(ValueError, match="overlaps the real home directory"):
+        build_sandboxed_argv(["true"], tmp_path, tmp_path / "scratch")
+
+
+def test_refuses_to_sandbox_repo_that_is_an_ancestor_of_home(tmp_path: Path, monkeypatch):
+    home = tmp_path / "home" / "user"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    with pytest.raises(ValueError, match="overlaps the real home directory"):
+        build_sandboxed_argv(["true"], tmp_path, tmp_path / "scratch")
 
 
 # -- legitimate usage still works --------------------------------------------

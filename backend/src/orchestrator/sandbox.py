@@ -167,6 +167,17 @@ def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path) -> lis
     for d in _SYSTEM_RO_DIRS:
         _bind_ro(bwrap_args, Path(d))
 
+    # Generic mount points first — /proc, /dev, and a fresh empty /tmp are
+    # broad, low-specificity mounts. Every bind below this point must come
+    # *after* them: bwrap applies binds in argv order, and a later bind
+    # completely remounts over an earlier one nested inside it. Getting this
+    # backwards is silent and only bites when some later, more specific bind
+    # target happens to be a subpath of /tmp (real $HOME never is, but this
+    # ordering bug is worth being correct about on its own terms, not just
+    # because it happened to be caught by a test using a tmp_path-based
+    # fixture home).
+    bwrap_args += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]  # noqa: S108 - sandbox mount point, not a real temp-file use
+
     toolchain_binds = _resolve_toolchain_binds(home)
     for p in toolchain_binds:
         _bind_ro(bwrap_args, p)
@@ -183,7 +194,6 @@ def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path) -> lis
         if p.is_dir():
             bwrap_args += ["--tmpfs", str(p)]
 
-    bwrap_args += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]  # noqa: S108 - sandbox mount point, not a real temp-file use
     bwrap_args += ["--bind", str(scratch_home), str(scratch_home)]
     bwrap_args += ["--bind", str(repo), str(repo)]
     bwrap_args += ["--chdir", str(repo)]
