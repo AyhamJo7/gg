@@ -3,14 +3,28 @@ from orchestrator.providers.classify import classify_output
 
 
 def test_rate_limit_patterns():
-    assert classify_output(1, "Error: 429 too many requests", timed_out=False, cancelled=False) == FailureClass.RATE_LIMIT
-    assert classify_output(0, "You've hit your usage limit, try again at 5pm", timed_out=False, cancelled=False) == FailureClass.RATE_LIMIT
+    assert (
+        classify_output(1, "Error: 429 too many requests", timed_out=False, cancelled=False) == FailureClass.RATE_LIMIT
+    )
+    assert (
+        classify_output(0, "You've hit your usage limit, try again at 5pm", timed_out=False, cancelled=False)
+        == FailureClass.RATE_LIMIT
+    )
 
 
 def test_quota_exhausted_patterns():
-    assert classify_output(1, "resource_exhausted: quota exceeded", timed_out=False, cancelled=False) == FailureClass.QUOTA_EXHAUSTED
-    assert classify_output(1, "insufficient_quota on current plan", timed_out=False, cancelled=False) == FailureClass.QUOTA_EXHAUSTED
-    assert classify_output(1, "tokens per day limit reached", timed_out=False, cancelled=False) == FailureClass.QUOTA_EXHAUSTED
+    assert (
+        classify_output(1, "resource_exhausted: quota exceeded", timed_out=False, cancelled=False)
+        == FailureClass.QUOTA_EXHAUSTED
+    )
+    assert (
+        classify_output(1, "insufficient_quota on current plan", timed_out=False, cancelled=False)
+        == FailureClass.QUOTA_EXHAUSTED
+    )
+    assert (
+        classify_output(1, "tokens per day limit reached", timed_out=False, cancelled=False)
+        == FailureClass.QUOTA_EXHAUSTED
+    )
 
 
 def test_auth_patterns():
@@ -21,10 +35,21 @@ def test_auth_patterns():
 
 def test_human_input_patterns_f22():
     # F-22: relax regex to match question mark and other real prompt shapes
-    assert classify_output(1, "Do you want to proceed? [y/N]", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
-    assert classify_output(1, "Do you want to continue? [y/n]", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
-    assert classify_output(1, "Overwrite existing file? (y/n)", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
-    assert classify_output(1, "Press any key to continue...", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    assert (
+        classify_output(1, "Do you want to proceed? [y/N]", timed_out=False, cancelled=False)
+        == FailureClass.HUMAN_INPUT
+    )
+    assert (
+        classify_output(1, "Do you want to continue? [y/n]", timed_out=False, cancelled=False)
+        == FailureClass.HUMAN_INPUT
+    )
+    assert (
+        classify_output(1, "Overwrite existing file? (y/n)", timed_out=False, cancelled=False)
+        == FailureClass.HUMAN_INPUT
+    )
+    assert (
+        classify_output(1, "Press any key to continue...", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    )
     assert classify_output(None, "waiting for user input", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
 
 
@@ -46,9 +71,15 @@ def test_n05_exit_zero_source_code_not_human_input():
 def test_n05_genuine_human_input_still_detected():
     """N-05: Non-zero exit or timeout with human-input patterns still classified correctly."""
     # Non-zero exit with human input pattern
-    assert classify_output(1, "Do you want to proceed? [y/N]", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
-    # Exit None (process didn't finish) with human input pattern  
-    assert classify_output(None, "Press any key to continue...", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
+    assert (
+        classify_output(1, "Do you want to proceed? [y/N]", timed_out=False, cancelled=False)
+        == FailureClass.HUMAN_INPUT
+    )
+    # Exit None (process didn't finish) with human input pattern
+    assert (
+        classify_output(None, "Press any key to continue...", timed_out=False, cancelled=False)
+        == FailureClass.HUMAN_INPUT
+    )
     assert classify_output(None, "(y/n)", timed_out=False, cancelled=False) == FailureClass.HUMAN_INPUT
 
 
@@ -60,6 +91,19 @@ def test_timeout_and_cancel():
 def test_crash_and_clean():
     assert classify_output(2, "segmentation fault", timed_out=False, cancelled=False) == FailureClass.CRASH
     assert classify_output(0, "all good", timed_out=False, cancelled=False) == FailureClass.NONE
+
+
+def test_gate_refused_is_crash_not_pattern_matched():
+    # Regression: a spawn-gate refusal (backend died between fork and the
+    # on_spawn handshake persisting) exits GATE_REFUSED_EXIT with no real
+    # provider output — it must always resolve to CRASH, distinct from and
+    # never mistaken for the provider's own success/failure signals, even if
+    # empty output would otherwise fall through to NONE on exit code 0.
+    assert classify_output(0, "", timed_out=False, cancelled=False, gate_refused=True) == FailureClass.CRASH
+    assert classify_output(42, "", timed_out=False, cancelled=False, gate_refused=True) == FailureClass.CRASH
+    # A genuine exit-42 from the provider itself (gate_refused=False) is
+    # classified normally — it must not be conflated with a gate refusal.
+    assert classify_output(42, "", timed_out=False, cancelled=False, gate_refused=False) == FailureClass.CRASH
 
 
 def test_auth_beats_rate_limit_when_both_present():

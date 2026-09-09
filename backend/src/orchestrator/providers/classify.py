@@ -100,11 +100,20 @@ def classify_output(
     timed_out: bool,
     cancelled: bool,
     adapter: object | None = None,
+    gate_refused: bool = False,
 ) -> FailureClass:
     if cancelled:
         return FailureClass.CANCELLED
     if timed_out:
         return FailureClass.TIMEOUT
+    if gate_refused:
+        # The spawn handshake never released — the child exited before ever
+        # exec'ing the provider (e.g. backend died between fork and on_spawn
+        # persisting identity). Its exit code (GATE_REFUSED_EXIT) and empty
+        # output are not a real provider signal and must never be pattern-
+        # matched as one — this is an internal crash, not the provider's own
+        # exit, so it must never resolve to FailureClass.NONE.
+        return FailureClass.CRASH
 
     tail = combined_output[-8000:]
 

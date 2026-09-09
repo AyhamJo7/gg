@@ -50,15 +50,34 @@ async def test_mutating_route_requires_bearer_token(client: httpx.AsyncClient, w
         assert resp.status_code == 200
         resp = await anon.get("/api/projects")
         assert resp.status_code == 200
-    # The bootstrap endpoint hands back a token that then authorizes.
-    token_resp = await client.get("/api/auth/token")
-    assert token_resp.status_code == 200
-    fetched = token_resp.json()["token"]
+    # There is no network bootstrap route for the token (would defeat the
+    # whole scheme — any local process could just fetch it); the token is
+    # generated at process-launch time and injected out-of-band into the
+    # frontend build/IPC, so tests reach it the same in-process way real
+    # non-browser callers (Node e2e drivers) read it: from the token file.
+    fetched = (app.state.db.parent / "auth_token").read_text().strip()
+    assert fetched == app.state.auth_token
     async with httpx.AsyncClient(
         transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {fetched}"}
     ) as authed:
         resp = await authed.post("/api/projects", json={"path": str(workspace)})
         assert resp.status_code in (200, 201), resp.text
+
+
+async def test_auth_rejection_carries_cors_headers_for_allowed_origin(client: httpx.AsyncClient, workspace: Path):
+    """AuthMiddleware must run inside CORSMiddleware, not outside it — otherwise
+    a 401 to a legitimate cross-origin-allowed caller arrives as an opaque CORS
+    failure in the browser instead of a readable 401 body."""
+    app = client.app  # type: ignore[attr-defined]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as anon:
+        resp = await anon.post(
+            "/api/projects",
+            json={"path": str(workspace)},
+            headers={"Origin": "http://localhost:5173"},
+        )
+        assert resp.status_code == 401
+        assert resp.headers.get("access-control-allow-origin") == "http://localhost:5173"
 
 
 async def test_project_crud(client: httpx.AsyncClient, workspace: Path):

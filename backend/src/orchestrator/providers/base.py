@@ -56,6 +56,7 @@ class ExecutionResult:
     finished_at: str = field(default_factory=lambda: utcnow().isoformat())
     pid: int | None = None
     pgid: int | None = None
+    gate_refused: bool = False
 
     @property
     def ok(self) -> bool:
@@ -161,7 +162,9 @@ class ProviderAdapter(abc.ABC):
         )
         self._cancel_events.pop(request.run_id, None)
         finished = utcnow()
-        failure = self.classify_failure(result.exit_code, result.combined_tail, result.timed_out, result.cancelled)
+        failure = self.classify_failure(
+            result.exit_code, result.combined_tail, result.timed_out, result.cancelled, result.gate_refused
+        )
         state = ProviderState.COMPLETED if failure == FailureClass.NONE else FAILURE_TO_STATE[failure]
         return ExecutionResult(
             state=state,
@@ -178,6 +181,7 @@ class ProviderAdapter(abc.ABC):
             finished_at=finished.isoformat(),
             pid=result.pid,
             pgid=result.pgid,
+            gate_refused=result.gate_refused,
         )
 
     async def interrupt(self, run_id: str) -> bool:
@@ -192,8 +196,12 @@ class ProviderAdapter(abc.ABC):
         return False
 
     # -- failure translation -------------------------------------------------
-    def classify_failure(self, exit_code: int | None, combined: str, timed_out: bool, cancelled: bool) -> FailureClass:
-        return classify_output(exit_code, combined, timed_out=timed_out, cancelled=cancelled, adapter=self)
+    def classify_failure(
+        self, exit_code: int | None, combined: str, timed_out: bool, cancelled: bool, gate_refused: bool = False
+    ) -> FailureClass:
+        return classify_output(
+            exit_code, combined, timed_out=timed_out, cancelled=cancelled, adapter=self, gate_refused=gate_refused
+        )
 
     async def health_check(self) -> ProviderState:
         installed, _ = self.detect()

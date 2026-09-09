@@ -65,6 +65,21 @@ async def test_failed_persistence_never_executes(scratch: Path):
     )
     assert not mark.exists()
     assert result.exit_code != 0
+    assert result.gate_refused is True
+
+
+@pytest.mark.asyncio()
+async def test_normal_completion_is_not_flagged_gate_refused(scratch: Path):
+    mark = scratch / "mark.txt"
+    logs = scratch / "logs"
+    result = await run_process(
+        _writer_argv(mark),
+        cwd=scratch,
+        timeout_s=15.0,
+        stdout_path=logs / "o.log",
+        stderr_path=logs / "e.log",
+    )
+    assert result.gate_refused is False
 
 
 @pytest.mark.asyncio()
@@ -104,10 +119,15 @@ async def test_gate_eof_child_exits_refused(scratch: Path):
     shim = str(Path(__file__).resolve().parents[1] / "src" / "orchestrator" / "_spawn_gate.py")
     mark = scratch / "mark.txt"
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, shim, str(gate_r), *_writer_argv(mark),
+        sys.executable,
+        shim,
+        str(gate_r),
+        *_writer_argv(mark),
         cwd=str(scratch),
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        stdin=asyncio.subprocess.DEVNULL, start_new_session=True,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
         pass_fds=(gate_r,),
     )
     os.close(gate_r)
@@ -123,10 +143,15 @@ async def test_gate_release_single_byte_executes(scratch: Path):
     shim = str(Path(__file__).resolve().parents[1] / "src" / "orchestrator" / "_spawn_gate.py")
     mark = scratch / "mark.txt"
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, shim, str(gate_r), *_writer_argv(mark),
+        sys.executable,
+        shim,
+        str(gate_r),
+        *_writer_argv(mark),
         cwd=str(scratch),
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        stdin=asyncio.subprocess.DEVNULL, start_new_session=True,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
         pass_fds=(gate_r,),
     )
     os.close(gate_r)

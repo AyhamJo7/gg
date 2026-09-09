@@ -102,6 +102,15 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         await orchestrator.shutdown()
 
     app = FastAPI(title="GG Orchestrator", version="0.1.0", lifespan=lifespan)
+    app.state.db = db_path
+    app.state.auth_token = load_or_create_token(db_path.parent)
+    # Registration order matters: Starlette builds the middleware stack by
+    # prepending each add_middleware call and iterating in reverse, so the
+    # LAST middleware added ends up OUTERMOST. CORS must be outermost so a
+    # 401 from AuthMiddleware still carries CORS headers for allowed origins
+    # — otherwise a legitimate cross-origin-allowed caller sees an opaque
+    # CORS/network failure instead of a readable 401 body.
+    app.add_middleware(AuthMiddleware, token=app.state.auth_token)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -115,19 +124,6 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.state.db = db_path
-    app.state.auth_token = load_or_create_token(db_path.parent)
-    app.add_middleware(AuthMiddleware, token=app.state.auth_token)
-
-    @app.get("/api/auth/token")
-    def get_auth_token() -> dict[str, str]:
-        # Bootstrap only: the server already binds 127.0.0.1 only, and this
-        # lets the frontend (browser webview, no local filesystem access in
-        # dev mode) obtain the token without a Tauri-specific fs bridge. It
-        # does not weaken the mutating-route check above — any local caller
-        # able to reach this port could already reach the mutating routes
-        # directly before that check existed.
-        return {"token": app.state.auth_token}
 
     # ---------------- projects ----------------
     @app.get("/api/projects")
