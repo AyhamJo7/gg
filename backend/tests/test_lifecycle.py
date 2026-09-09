@@ -378,6 +378,28 @@ async def test_final_checkpoint_captures_uncommitted_changes(tmp_path: Path):
     await orch.shutdown()
 
 
+async def test_fresh_checkout_installs_and_reproduces(tmp_path: Path):
+    """Fresh-checkout acceptance installs dependencies before verifying."""
+    import subprocess as _subprocess  # noqa: ASYNC221 - test scaffolding, sync context ok
+
+    orch = await make_orch(tmp_path, standard_adapters())
+    repo = tmp_path / "freshrepo"
+    repo.mkdir()
+    (repo / "package.json").write_text(
+        json.dumps({"name": "fresh", "scripts": {"test": "node -e \"process.exit(0)\""}})
+    )
+    _subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: ASYNC221
+    _subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)  # noqa: ASYNC221
+    _subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)  # noqa: ASYNC221
+    sha = _subprocess.run(  # noqa: ASYNC221
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    ok, detail = await orch.coordinator._fresh_checkout_verify(repo, sha)
+    assert ok is True, detail
+    assert "npm install ok" in detail
+    await orch.shutdown()
+
+
 async def test_cancel_and_retry_phase(tmp_path: Path):
     orch = await make_orch(tmp_path, standard_adapters())
     pid = await start_planned_project(tmp_path, orch)

@@ -1147,9 +1147,9 @@ RULES:
                     findings.append(f"toolchain verification failed:\n{report.summary()}")
                 # 4. Fresh-checkout reproduction of the accepted SHA.
                 if sha and verify_ok and not findings:
-                    fresh_ok = await self._fresh_checkout_verify(repo, sha)
+                    fresh_ok, fresh_detail = await self._fresh_checkout_verify(repo, sha)
                     if not fresh_ok:
-                        findings.append(f"fresh checkout of {sha} did not reproduce verification")
+                        findings.append(f"fresh checkout of {sha} did not reproduce verification: {fresh_detail}")
         if findings:
             blocked_state = (
                 AcceptanceState.EXTERNALLY_BLOCKED.value if open_gates else AcceptanceState.UNVERIFIED.value
@@ -1189,7 +1189,12 @@ RULES:
         self._set_state(project_id, ProductStatus.DELIVERED, reason="", finished=True)
         return {"ok": True, "sha": sha}
 
-    async def _fresh_checkout_verify(self, repo: Path, sha: str) -> bool:
+    async def _fresh_checkout_verify(self, repo: Path, sha: str) -> tuple[bool, str]:
+        """Clone the accepted SHA fresh, install dependencies, reproduce verification.
+
+        Returns (ok, detail). Dependency install is part of reproducibility:
+        a checkout that cannot install + pass its toolchain is not accepted.
+        """
         def _clone_and_checkout() -> Path | None:
             tmp = Path(tempfile.mkdtemp(prefix="gg-accept-"))
             clone = tmp / "checkout"
@@ -1200,20 +1205,46 @@ RULES:
             proc = subprocess.run(["git", "-C", str(clone), "checkout", "-q", sha], capture_output=True, timeout=60)
             return clone if proc.returncode == 0 else None
 
+        def _install(cmd: list[str], cwd: Path) -> tuple[bool, str]:
+            try:
+                # noqa: S603 - argv built from fixed commands below, never plan text
+                proc = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=600)
+                tail = (proc.stdout.decode(errors="replace") + proc.stderr.decode(errors="replace"))[-1500:]
+                return proc.returncode == 0, tail
+            except Exception as exc:
+                return False, str(exc)[:500]
+
         tmp_root: Path | None = None
         try:
             clone = await asyncio.to_thread(_clone_and_checkout)
             if clone is None:
-                return False
+                return False, "git clone/checkout failed"
             tmp_root = clone.parent
             info = await inspect_workspace(clone)
             if not (info.test_commands or info.build_commands):
-                return True  # nothing to reproduce beyond the recorded SHA
+                return True, "no toolchain to reproduce beyond the recorded SHA"
+            install_note = "no install step needed"
+            if (clone / "package-lock.json").exists():
+                ok, log = await asyncio.to_thread(_install, ["npm", "ci", "--no-audit", "--no-fund"], clone)
+                install_note = "npm ci " + ("ok" if ok else f"FAILED: {log[-500:]}")
+                if not ok:
+                    return False, install_note
+            elif (clone / "package.json").exists():
+                ok, log = await asyncio.to_thread(_install, ["npm", "install", "--no-audit", "--no-fund"], clone)
+                install_note = "npm install " + ("ok" if ok else f"FAILED: {log[-500:]}")
+                if not ok:
+                    return False, install_note
+            elif (clone / "uv.lock").exists() or (clone / "pyproject.toml").exists():
+                ok, log = await asyncio.to_thread(_install, ["uv", "sync", "--frozen"], clone)
+                install_note = "uv sync " + ("ok" if ok else f"FAILED: {log[-500:]}")
+                if not ok:
+                    return False, install_note
             report = await run_verification(info, self.db, self.events, "", clone)
-            return report.all_passed
-        except Exception:
+            detail = f"{install_note}; {report.summary()}"
+            return report.all_passed, detail
+        except Exception as exc:
             logger.exception("fresh checkout verify failed")
-            return False
+            return False, str(exc)[:500]
         finally:
             if tmp_root is not None:
                 shutil.rmtree(tmp_root, ignore_errors=True)
