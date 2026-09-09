@@ -47,7 +47,6 @@ from .review import (
     mark_findings_repair_attempted,
     open_blockers,
     persist_findings,
-    resolve_repaired_findings,
 )
 from .security import redact
 from .workspace import inspect_workspace
@@ -150,9 +149,8 @@ class ParallelMissionEngine:
 
     def _on_spawn_handler(self, run_id: str) -> Any:
         def handler(pid: int, pgid: int, ts: float) -> None:
-            self.db.update(
-                "provider_runs", run_id, {"pid": pid, "pgid": pgid, "started_at_ts": ts}
-            )
+            self.db.update("provider_runs", run_id, {"pid": pid, "pgid": pgid, "started_at_ts": ts})
+
         return handler
 
     # ------------------------------------------------------------------
@@ -204,9 +202,8 @@ class ParallelMissionEngine:
                 continue
             provider = run.get("provider") or ""
             pgid = run.get("pgid")
-            verified = (
-                pgid is not None
-                and await asyncio.to_thread(verify_process_ownership, pid, pgid, run.get("started_at_ts"), provider)
+            verified = pgid is not None and await asyncio.to_thread(
+                verify_process_ownership, pid, pgid, run.get("started_at_ts"), provider
             )
             if verified and pgid is not None:
                 # Positively ours: terminate the orphan, then retry like vanished
@@ -562,9 +559,7 @@ class ParallelMissionEngine:
             logger.warning("final checkpoint failed: %s", exc)
             row = self.db.get("missions", self.mission_id)
             failures = int((row or {}).get("checkpoint_failures", 0)) + 1
-            self.db.update(
-                "missions", self.mission_id, {"checkpoint_failures": failures, "updated_at": utcnow()}
-            )
+            self.db.update("missions", self.mission_id, {"checkpoint_failures": failures, "updated_at": utcnow()})
             self.events.publish(EventType.GIT_CHECKPOINT_FAILED, self.mission_id, error=str(exc))
             max_failures = int(self.config.get("git.max_checkpoint_failures", 2))
             if failures >= max_failures:
@@ -648,7 +643,6 @@ class ParallelMissionEngine:
 
             blockers = open_blockers(self.db, self.mission_id)
             if not blockers:
-                resolve_repaired_findings(self.db, self.mission_id)
                 return True
             cycles = int(self._mission().get("repair_cycles", 0))
             if cycles >= max_cycles:
@@ -743,9 +737,7 @@ class ParallelMissionEngine:
         if result.ok:
             self.registry.record_success(provider_name, result.duration_s)
         else:
-            self.registry.record_failure(
-                provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
-            )
+            self.registry.record_failure(provider_name, result.failure_class, result.duration_s, result.raw_tail[:300])
 
         return result
 
@@ -946,9 +938,7 @@ class ParallelMissionEngine:
             provider_name = self._select_provider(role)
             if provider_name is None:
                 if not self.registry.has_potentially_available():
-                    self._set_mission_status(
-                        MissionStatus.FAILED, blocking_issue="no provider available for planning"
-                    )
+                    self._set_mission_status(MissionStatus.FAILED, blocking_issue="no provider available for planning")
                     return False
                 if wait_started is None:
                     wait_started = time.monotonic()
@@ -996,9 +986,7 @@ class ParallelMissionEngine:
                 },
             )
             self.registry.mark_busy(provider_name)
-            self.events.publish(
-                EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value
-            )
+            self.events.publish(EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value)
 
             try:
                 result = await adapter.execute(request, lambda line: None)
@@ -1041,9 +1029,7 @@ class ParallelMissionEngine:
             )
             failed = set(json.loads(self._mission().get("providers_failed") or "[]"))
             failed.add(provider_name)
-            self.db.update(
-                "missions", self.mission_id, {"providers_failed": sorted(failed), "updated_at": utcnow()}
-            )
+            self.db.update("missions", self.mission_id, {"providers_failed": sorted(failed), "updated_at": utcnow()})
             self.events.publish(
                 EventType.PROVIDER_RATE_LIMITED
                 if result.failure_class in (FailureClass.RATE_LIMIT, FailureClass.QUOTA_EXHAUSTED)
@@ -1437,9 +1423,7 @@ class ParallelMissionEngine:
                 provider=provider_name,
             )
         else:
-            self.registry.record_failure(
-                provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
-            )
+            self.registry.record_failure(provider_name, result.failure_class, result.duration_s, result.raw_tail[:300])
             self.db.update(
                 "tasks",
                 task_id,

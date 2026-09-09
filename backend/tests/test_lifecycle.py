@@ -41,18 +41,19 @@ async def make_orch(tmp_path: Path, adapters: dict[str, FakeAdapter], db_name: s
     return orch
 
 
-def seed_toolchain(repo: Path) -> None:
-    (repo / "package.json").write_text(
-        json.dumps(
-            {
-                "name": "lifecycle-target",
-                "scripts": {
-                    "test": "node -e \"process.exit(0)\"",
-                    "build": "node -e \"process.exit(0)\"",
-                },
-            }
-        )
-    )
+def seed_toolchain(repo: Path, extra_scripts: dict[str, str] | None = None) -> None:
+    # npm script BODIES are opaque to GG's criterion allowlist (only the
+    # top-level command, e.g. "npm run check", is checked) — tests use that
+    # to drive fixed exit codes / side effects without an inline -e/-c flag
+    # on the criterion's own verify command, which is now rejected (F-LIFE-01
+    # RCE hardening: only file-based or plain allowlisted commands run).
+    scripts = {
+        "test": 'node -e "process.exit(0)"',
+        "build": 'node -e "process.exit(0)"',
+    }
+    if extra_scripts:
+        scripts.update(extra_scripts)
+    (repo / "package.json").write_text(json.dumps({"name": "lifecycle-target", "scripts": scripts}))
 
 
 async def drive_mission(db: Database, mission_id: str, timeout_s: float = 120.0) -> dict[str, Any]:
@@ -91,7 +92,9 @@ async def drive_project(
     raise AssertionError(f"project {project_id} did not settle: {db.get('product_projects', project_id)}")
 
 
-def standard_adapters(plan: dict[str, Any] | None = None, planner_script: list[str] | None = None) -> dict[str, FakeAdapter]:
+def standard_adapters(
+    plan: dict[str, Any] | None = None, planner_script: list[str] | None = None
+) -> dict[str, FakeAdapter]:
     return {
         "fake-planner": PlanProvider("fake-planner", planner_script, plan),
         "fake-a": FakeAdapter("fake-a", ["work"]),
@@ -101,7 +104,11 @@ def standard_adapters(plan: dict[str, Any] | None = None, planner_script: list[s
 
 
 async def start_planned_project(
-    tmp_path: Path, orch: Orchestrator, plan: dict[str, Any] | None = None, **kwargs: Any
+    tmp_path: Path,
+    orch: Orchestrator,
+    plan: dict[str, Any] | None = None,
+    extra_scripts: dict[str, str] | None = None,
+    **kwargs: Any,
 ) -> str:
     project = orch.coordinator.create_project("Test Product", "prove the lifecycle", **kwargs)
     result = await orch.coordinator.generate_plan(project["id"])
@@ -109,7 +116,7 @@ async def start_planned_project(
     orch.coordinator.start_project(project["id"])
     target = orch.db.get("projects", orch.db.get("product_projects", project["id"])["target_project_id"])
     assert target is not None
-    seed_toolchain(Path(target["path"]))
+    seed_toolchain(Path(target["path"]), extra_scripts=extra_scripts)
     return project["id"]
 
 
@@ -178,7 +185,9 @@ async def test_full_lifecycle_to_delivered(tmp_path: Path):
     assert full is not None
     assert {p["status"] for p in full["phases"]} == {"COMPLETED"}
     assert {e["status"] for e in full["evidence"]} == {"SATISFIED"}
-    report = json.loads(full["delivery_report"]) if isinstance(full["delivery_report"], str) else full["delivery_report"]
+    report = (
+        json.loads(full["delivery_report"]) if isinstance(full["delivery_report"], str) else full["delivery_report"]
+    )
     assert report["git_sha"] == project["delivery_sha"]
     assert len(report["requirements"]) == 2
     # Exactly one mission per phase, no duplicates.
@@ -244,13 +253,13 @@ async def test_gate_resolution_resumes_to_delivered(tmp_path: Path):
     await drive_project(orch, pid, expect="WAITING_FOR_HUMAN")
     gate = orch.db.query("SELECT * FROM project_gates WHERE project_id=? AND status='open'", (pid,))[0]
     # Missing .env value: resolution refused, nothing exposed.
-    refused = orch.coordinator.resolve_gate(pid, gate["id"], "done")
+    refused = await orch.coordinator.resolve_gate(pid, gate["id"], "done")
     assert refused["ok"] is False
     target_id = orch.db.get("product_projects", pid)["target_project_id"]
     repo = Path(orch.db.get("projects", target_id)["path"])
     with (repo / ".env").open("a") as fh:
         fh.write("TEST_TOKEN=fake-token-for-tests\n")
-    resolved = orch.coordinator.resolve_gate(pid, gate["id"], "configured")
+    resolved = await orch.coordinator.resolve_gate(pid, gate["id"], "configured")
     assert resolved["ok"] is True
     project = await drive_project(orch, pid)
     assert project["state"] == "DELIVERED", project.get("blocking_reason")
@@ -265,7 +274,7 @@ async def test_secret_values_never_persisted(tmp_path: Path):
     target_id = orch.db.get("product_projects", pid)["target_project_id"]
     repo = Path(orch.db.get("projects", target_id)["path"])
     (repo / ".env").write_text("TEST_TOKEN=super-secret-value-999\n")
-    assert orch.coordinator.resolve_gate(pid, gate["id"], "x")["ok"] is True
+    assert (await orch.coordinator.resolve_gate(pid, gate["id"], "x"))["ok"] is True
     blob = json.dumps(orch.db.query("SELECT * FROM project_gates WHERE project_id=?", (pid,)))
     assert "super-secret-value-999" not in blob
     assert "TEST_TOKEN" in blob  # names are fine; values never are
@@ -307,7 +316,9 @@ async def test_restart_during_execution_recovers(tmp_path: Path):
     await orch.shutdown()
     orch2 = await make_orch(tmp_path, standard_adapters(), db_name="orch.db")
     # Mission recovery relaunches the in-flight engine, coordinator re-drives.
-    for row in orch2.db.query("SELECT id FROM missions WHERE status NOT IN ('COMPLETED','FAILED','UNVERIFIED','CANCELLED')"):
+    for row in orch2.db.query(
+        "SELECT id FROM missions WHERE status NOT IN ('COMPLETED','FAILED','UNVERIFIED','CANCELLED')"
+    ):
         orch2._launch_engine(row["id"])
     project = await drive_project(orch2, pid)
     assert project["state"] == "DELIVERED", project.get("blocking_reason")
@@ -344,7 +355,7 @@ async def test_acceptance_rejects_failing_toolchain(tmp_path: Path):
     target_id = project["target_project_id"]
     repo = Path(orch.db.get("projects", target_id)["path"])
     pkg = json.loads((repo / "package.json").read_text())
-    pkg["scripts"]["test"] = "node -e \"process.exit(3)\""
+    pkg["scripts"]["test"] = 'node -e "process.exit(3)"'
     (repo / "package.json").write_text(json.dumps(pkg))
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)  # noqa: ASYNC221
     subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "break tests"], check=True)  # noqa: ASYNC221
@@ -404,7 +415,9 @@ async def test_fresh_checkout_installs_and_reproduces(tmp_path: Path):
             {
                 "name": "fresh",
                 "dependencies": {"mydep": "file:./vendor/mydep"},
-                "scripts": {"test": "node -e \"console.log('CWD:'+process.cwd());process.exit(require('mydep')()==='vendored'?0:1)\""},
+                "scripts": {
+                    "test": "node -e \"console.log('CWD:'+process.cwd());process.exit(require('mydep')()==='vendored'?0:1)\""
+                },
             }
         )
     )
@@ -426,11 +439,11 @@ async def test_cancel_and_retry_phase(tmp_path: Path):
     orch = await make_orch(tmp_path, standard_adapters())
     pid = await start_planned_project(tmp_path, orch)
     await orch.coordinator.advance_project(pid)
-    orch.coordinator.cancel_project(pid)
+    await orch.coordinator.cancel_project(pid)
     project = orch.db.get("product_projects", pid)
     assert project["state"] == "CANCELLED"
     # Terminal states are immutable.
-    orch.coordinator.cancel_project(pid)
+    await orch.coordinator.cancel_project(pid)
     assert orch.db.get("product_projects", pid)["state"] == "CANCELLED"
     with pytest.raises(ValueError):
         await orch.coordinator.generate_plan(pid)

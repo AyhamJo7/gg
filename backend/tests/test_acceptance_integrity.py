@@ -7,6 +7,7 @@ only via explicit verification; waivers are versioned and auditable.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -36,13 +37,16 @@ def _plan_with_verify(verify: str) -> dict[str, Any]:
 
 
 async def _run_with_plan(
-    tmp_path: Path, plan: dict[str, Any], extra_adapters: dict[str, FakeAdapter] | None = None
+    tmp_path: Path,
+    plan: dict[str, Any],
+    extra_adapters: dict[str, FakeAdapter] | None = None,
+    extra_scripts: dict[str, str] | None = None,
 ) -> tuple[Orchestrator, str]:
     adapters = standard_adapters(plan)
     if extra_adapters:
         adapters.update(extra_adapters)
     orch = await make_orch(tmp_path, adapters)
-    pid = await start_planned_project(tmp_path, orch)
+    pid = await start_planned_project(tmp_path, orch, extra_scripts=extra_scripts)
     return orch, pid
 
 
@@ -51,9 +55,7 @@ async def test_completion_marks_work_not_satisfied(tmp_path: Path):
     orch = await make_orch(tmp_path, standard_adapters())
     pid = await start_planned_project(tmp_path, orch)
     await orch.coordinator.advance_project(pid)
-    phase = orch.db.query(
-        "SELECT * FROM project_phases WHERE project_id=? AND phase_key='foundation'", (pid,)
-    )[0]
+    phase = orch.db.query("SELECT * FROM project_phases WHERE project_id=? AND phase_key='foundation'", (pid,))[0]
     assert phase["mission_id"]
     from test_lifecycle import drive_mission
 
@@ -86,8 +88,8 @@ async def test_missing_target_blocks_delivery(tmp_path: Path):
 
 async def test_failing_criterion_blocks_despite_green_suite(tmp_path: Path):
     """Scenarios 3+4: generic toolchain passes but a failing criterion blocks."""
-    plan = _plan_with_verify("node -e \"process.exit(1)\"")
-    orch, pid = await _run_with_plan(tmp_path, plan)
+    plan = _plan_with_verify("npm run check-fail")
+    orch, pid = await _run_with_plan(tmp_path, plan, extra_scripts={"check-fail": 'node -e "process.exit(1)"'})
     project = await drive_project(orch, pid)
     assert project["state"] == "BLOCKED"
     assert project["state"] != "DELIVERED"
@@ -125,9 +127,7 @@ async def test_open_medium_requirement_finding_blocks(tmp_path: Path):
     # Mission completes (MEDIUM never blocks the mission loop) but delivery is refused.
     assert project["state"] == "BLOCKED", project.get("blocking_reason")
     assert "finding" in (project.get("blocking_reason") or "").lower()
-    rows = orch.db.query(
-        "SELECT * FROM review_findings WHERE description LIKE '%Whitespace-only%'"
-    )
+    rows = orch.db.query("SELECT * FROM review_findings WHERE description LIKE '%Whitespace-only%'")
     assert rows and rows[0]["status"] == "open"
     await orch.shutdown()
     # Scenario 8 setup continues in the waiver test below (fresh project there).
@@ -141,8 +141,15 @@ async def test_partial_repair_keeps_unverified_open(tmp_path: Path):
     db.insert("projects", {"id": "p", "name": "p", "path": str(tmp_path), "created_at": "2026-01-01T00:00:00"})
     db.insert(
         "missions",
-        {"id": "m", "project_id": "p", "title": "t", "task": "k", "status": "REVIEWING",
-         "created_at": "2026-01-01T00:00:00", "updated_at": "2026-01-01T00:00:00"},
+        {
+            "id": "m",
+            "project_id": "p",
+            "title": "t",
+            "task": "k",
+            "status": "REVIEWING",
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        },
     )
     from orchestrator.review import mark_findings_repair_attempted, persist_findings
 
@@ -171,8 +178,15 @@ async def test_verified_blocker_repair_permits_delivery(tmp_path: Path):
     reviewer = FindingsProvider(
         "fake-reviewer",
         findings_script=[
-            [{"severity": "HIGH", "category": "correctness", "file": "src/db.js",
-              "description": "Broken query crashes", "recommended_fix": "guard inputs"}],
+            [
+                {
+                    "severity": "HIGH",
+                    "category": "correctness",
+                    "file": "src/db.js",
+                    "description": "Broken query crashes",
+                    "recommended_fix": "guard inputs",
+                }
+            ],
             [],
         ],
         verified_script=[[], [{"fingerprint": fp, "evidence": "added guard, edge tests pass"}]],
@@ -225,10 +239,12 @@ async def test_waiver_is_versioned_and_respected(tmp_path: Path):
     # Unknown targets and empty reasons are rejected.
     for kind, tid, reason in [("nope", fid, "x"), ("finding", "missing", "x"), ("finding", fid, "  ")]:
         with pytest.raises((ProductValidationError, ValueError)):
-            orch.coordinator.create_waiver(pid, kind, tid, reason)
+            await orch.coordinator.create_waiver(pid, kind, tid, reason)
     assert orch.db.query("SELECT id FROM acceptance_waivers WHERE project_id=?", (pid,)) == []
     for fr in fid_rows:
-        waiver = orch.coordinator.create_waiver(pid, "finding", fr["id"], "accepted for MVP; tracked in R1 follow-up")
+        waiver = await orch.coordinator.create_waiver(
+            pid, "finding", fr["id"], "accepted for MVP; tracked in R1 follow-up"
+        )
         assert waiver["ok"] is True
     rows = orch.db.query("SELECT * FROM acceptance_waivers WHERE project_id=?", (pid,))
     assert len(rows) == len(fid_rows) == 2  # one waiver per finding row (one per phase mission)
@@ -242,12 +258,12 @@ async def test_waiver_is_versioned_and_respected(tmp_path: Path):
 
 async def test_criterion_waiver_unblocks(tmp_path: Path):
     """Waiving a failing criterion (with reason) permits delivery."""
-    plan = _plan_with_verify("node -e \"process.exit(1)\"")
-    orch, pid = await _run_with_plan(tmp_path, plan)
+    plan = _plan_with_verify("npm run check-fail")
+    orch, pid = await _run_with_plan(tmp_path, plan, extra_scripts={"check-fail": 'node -e "process.exit(1)"'})
     project = await drive_project(orch, pid)
     assert project["state"] == "BLOCKED"
-    orch.coordinator.create_waiver(pid, "criterion", "R1-A1", "covered manually this once")
-    orch.coordinator.create_waiver(pid, "criterion", "R2-A1", "covered manually this once")
+    await orch.coordinator.create_waiver(pid, "criterion", "R1-A1", "covered manually this once")
+    await orch.coordinator.create_waiver(pid, "criterion", "R2-A1", "covered manually this once")
     orch.db.update("product_projects", pid, {"state": "FINAL_ACCEPTANCE"})
     result = await orch.coordinator.run_acceptance(pid)
     assert result["ok"] is True, result
@@ -256,15 +272,52 @@ async def test_criterion_waiver_unblocks(tmp_path: Path):
     delivery = report["delivery_report"]
     delivery = json.loads(delivery) if isinstance(delivery, str) else delivery
     assert len(delivery["waivers"]) == 2
+
+
+async def test_waiver_does_not_survive_criterion_content_change_across_revision(tmp_path: Path):
+    """F-LIFE-01 hardening: a waiver is bound to the criterion's content at
+
+    authorization time. A later plan revision that reuses the same criterion
+    id for a materially different check must not silently inherit the old
+    waiver — the check must be re-executed and, if still failing, block.
+    """
+    plan = _plan_with_verify("npm run check-fail")
+    orch, pid = await _run_with_plan(tmp_path, plan, extra_scripts={"check-fail": 'node -e "process.exit(1)"'})
+    project = await drive_project(orch, pid)
+    assert project["state"] == "BLOCKED"
+    await orch.coordinator.create_waiver(pid, "criterion", "R1-A1", "covered manually this once")
+    await orch.coordinator.create_waiver(pid, "criterion", "R2-A1", "covered manually this once")
+
+    # Revise the plan while still non-terminal: R1-A1 keeps its id but its
+    # description (content) changes. R2-A1 is left untouched.
+    revised = copy.deepcopy(plan)
+    for req in revised["requirements"]:
+        for criterion in req["acceptance"]:
+            if criterion["id"] == "R1-A1":
+                criterion["description"] = "a materially different check than what was waived"
+    rev_result = orch.coordinator.revise_plan(pid, revised, "clarify R1-A1 wording")
+    assert rev_result["ok"], rev_result
+
+    orch.db.update("product_projects", pid, {"state": "FINAL_ACCEPTANCE"})
+    result = await orch.coordinator.run_acceptance(pid)
+    assert result["ok"] is False, result
+    assert orch.db.get("product_projects", pid)["state"] != "DELIVERED"
+    statuses = {
+        r["criterion_id"]: r["status"]
+        for r in orch.db.query("SELECT * FROM criterion_results WHERE project_id=?", (pid,))
+    }
+    assert statuses["R1-A1"] == "FAILED"  # re-executed — stale waiver did not apply
+    assert statuses["R2-A1"] == "WAIVED"  # unchanged content — waiver still honored
+    await orch.shutdown()
     await orch.shutdown()
 
 
 async def test_restart_reuses_criterion_results(tmp_path: Path):
     """Scenario 12: restart neither duplicates check runs nor skips criteria."""
     counter = tmp_path / "probe-count.txt"
-    probe = "node -e 'require(\"fs\").appendFileSync(" + json.dumps(str(counter)) + ",\"x\")'"
-    plan = _plan_with_verify(probe)
-    orch, pid = await _run_with_plan(tmp_path, plan)
+    probe_script = 'node -e \'require("fs").appendFileSync(' + json.dumps(str(counter)) + ',"x")\''
+    plan = _plan_with_verify("npm run probe")
+    orch, pid = await _run_with_plan(tmp_path, plan, extra_scripts={"probe": probe_script})
     project = await drive_project(orch, pid)
     assert project["state"] == "DELIVERED", project.get("blocking_reason")
     assert counter.read_text() == "xx"  # one run per criterion

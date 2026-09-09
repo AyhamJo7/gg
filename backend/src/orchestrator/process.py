@@ -42,6 +42,11 @@ class ProcessResult:
     stderr_tail: list[str] = field(default_factory=list)
     pid: int | None = None
     pgid: int | None = None
+    #: True when the spawn gate was never released (on_spawn raised, identity
+    #: never persisted) — the child exited GATE_REFUSED_EXIT without ever
+    #: exec'ing the real program. Distinguishes this from a genuine process
+    #: exit at the same code.
+    gate_refused: bool = False
 
     @property
     def combined_tail(self) -> str:
@@ -201,4 +206,5 @@ async def run_process(
         stderr_tail=stderr_tail,
         pid=spawn_pid,
         pgid=spawn_pgid,
+        gate_refused=not released,
     )

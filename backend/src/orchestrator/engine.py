@@ -41,7 +41,6 @@ from .review import (
     mark_findings_repair_attempted,
     open_blockers,
     persist_findings,
-    resolve_repaired_findings,
 )
 from .security import ensure_gitignore_protections, redact
 from .verify import run_verification
@@ -229,9 +228,7 @@ class MissionEngine:
                             "updated_at": utcnow(),
                         },
                     )
-                    raise git_ops.GitCheckpointError(
-                        f"git checkpoint failed repeatedly ({failures}x): {exc}"
-                    ) from exc
+                    raise git_ops.GitCheckpointError(f"git checkpoint failed repeatedly ({failures}x): {exc}") from exc
                 return None
         if sha:
             self.db.insert(
@@ -386,6 +383,7 @@ class MissionEngine:
             if self.project_path is None:
                 raise RuntimeError("engine project path not initialized")
             log_dir = self.project_path / ".orchestrator" / "logs"
+
             def on_spawn(pid: int, pgid: int, start_ts: float, r_id: str = run_id) -> None:
                 self.db.update(
                     "provider_runs",
@@ -875,7 +873,6 @@ class MissionEngine:
 
             blockers = open_blockers(self.db, self.mission_id)
             if not blockers:
-                resolve_repaired_findings(self.db, self.mission_id)
                 return True
             cycles = self._mission().repair_cycles
             if cycles >= max_cycles:

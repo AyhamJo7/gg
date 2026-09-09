@@ -19,9 +19,11 @@ Safety properties:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -45,7 +47,9 @@ from .models import (
     Role,
     utcnow,
 )
+from .process import run_process
 from .product_plan import (
+    AcceptanceCriterion,
     ProductPlan,
     build_plan_repair_prompt,
     build_planner_prompt,
@@ -126,9 +130,7 @@ class ProjectCoordinator:
                 "updated_at": now,
             },
         )
-        self.events.publish(
-            EventType.PRODUCT_PROJECT_CREATED, None, product_project_id=project_id, name=name.strip()
-        )
+        self.events.publish(EventType.PRODUCT_PROJECT_CREATED, None, product_project_id=project_id, name=name.strip())
         return self.get_project(project_id) or {}
 
     def get_project(self, project_id: str) -> dict[str, Any] | None:
@@ -221,7 +223,17 @@ class ProjectCoordinator:
     #: Finding categories that gate product delivery while unresolved.
     BLOCKING_FINDING_CATEGORIES = frozenset({"requirements", "correctness", "security", "tests"})
 
-    def create_waiver(
+    @staticmethod
+    def _criterion_content_hash(criterion: AcceptanceCriterion) -> str:
+        payload = f"{criterion.id}\x00{criterion.description}\x00{criterion.verify}"
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    @staticmethod
+    def _finding_content_hash(row: dict[str, Any]) -> str:
+        fields = (row.get("id", ""), row.get("severity", ""), row.get("category", ""), row.get("description", ""))
+        return hashlib.sha256("\x00".join(fields).encode()).hexdigest()
+
+    async def create_waiver(
         self,
         project_id: str,
         target_kind: str,
@@ -233,71 +245,84 @@ class ProjectCoordinator:
 
         A waiver excuses one criterion or finding from the DELIVERED gate.
         It records who authorized it, why, and under which plan revision —
-        never silently, never retroactively editable.
+        never silently, never retroactively editable. It is also bound to the
+        exact content of the target at creation time: a later plan revision
+        that reuses the same criterion id for a different check must not
+        silently inherit this waiver (see _waived_targets).
         """
-        row = self.db.get("product_projects", project_id)
-        if not row:
-            raise KeyError(f"product project {project_id} not found")
-        if row["state"] in {s.value for s in TERMINAL_PRODUCT_STATUSES}:
-            raise ValueError(f"project {project_id} is terminal ({row['state']})")
-        if target_kind not in ("criterion", "finding"):
-            raise ProductValidationError("target_kind must be 'criterion' or 'finding'")
-        if not target_id.strip():
-            raise ProductValidationError("target_id is required")
-        if not reason.strip():
-            raise ProductValidationError("waiver reason is required")
-        self._validate_waiver_target(project_id, target_kind, target_id.strip())
-        waiver_id = uuid.uuid4().hex[:16]
-        self.db.execute(
-            """INSERT INTO acceptance_waivers(id, project_id, target_kind, target_id, reason, actor,
-               plan_revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(project_id, target_kind, target_id) DO UPDATE SET
-                 reason=excluded.reason, actor=excluded.actor, plan_revision=excluded.plan_revision,
-                 created_at=excluded.created_at""",
-            (
-                waiver_id,
-                project_id,
-                target_kind,
-                target_id.strip(),
-                reason.strip(),
-                actor,
-                int(row.get("plan_revision") or 0),
-                utcnow().isoformat(),
-            ),
-        )
-        self.events.publish(
-            EventType.PRODUCT_ACCEPTANCE_RECORDED,
-            None,
-            product_project_id=project_id,
-            waiver=f"{target_kind}:{target_id.strip()}",
-            reason=reason.strip()[:200],
-        )
-        return {"ok": True, "target": f"{target_kind}:{target_id.strip()}"}
+        async with self._advance_lock:
+            row = self.db.get("product_projects", project_id)
+            if not row:
+                raise KeyError(f"product project {project_id} not found")
+            if row["state"] in {s.value for s in TERMINAL_PRODUCT_STATUSES}:
+                raise ValueError(f"project {project_id} is terminal ({row['state']})")
+            if target_kind not in ("criterion", "finding"):
+                raise ProductValidationError("target_kind must be 'criterion' or 'finding'")
+            if not target_id.strip():
+                raise ProductValidationError("target_id is required")
+            if not reason.strip():
+                raise ProductValidationError("waiver reason is required")
+            content_hash = self._validate_waiver_target(project_id, target_kind, target_id.strip())
+            waiver_id = uuid.uuid4().hex[:16]
+            self.db.execute(
+                """INSERT INTO acceptance_waivers(id, project_id, target_kind, target_id, reason, actor,
+                   plan_revision, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(project_id, target_kind, target_id) DO UPDATE SET
+                     reason=excluded.reason, actor=excluded.actor, plan_revision=excluded.plan_revision,
+                     content_hash=excluded.content_hash, created_at=excluded.created_at""",
+                (
+                    waiver_id,
+                    project_id,
+                    target_kind,
+                    target_id.strip(),
+                    reason.strip(),
+                    actor,
+                    int(row.get("plan_revision") or 0),
+                    content_hash,
+                    utcnow().isoformat(),
+                ),
+            )
+            self.events.publish(
+                EventType.PRODUCT_ACCEPTANCE_RECORDED,
+                None,
+                product_project_id=project_id,
+                waiver=f"{target_kind}:{target_id.strip()}",
+                reason=reason.strip()[:200],
+            )
+            return {"ok": True, "target": f"{target_kind}:{target_id.strip()}"}
 
-    def _validate_waiver_target(self, project_id: str, target_kind: str, target_id: str) -> None:
+    def _validate_waiver_target(self, project_id: str, target_kind: str, target_id: str) -> str:
+        """Confirm the target exists now and return its current content hash."""
         if target_kind == "criterion":
             plan = self._current_plan(project_id)
-            known = (
-                {a.id for r in plan.requirements for a in r.acceptance} if plan is not None else set()
-            )
-            if target_id not in known:
+            criteria = {a.id: a for r in plan.requirements for a in r.acceptance} if plan is not None else {}
+            criterion = criteria.get(target_id)
+            if criterion is None:
                 raise ProductValidationError(f"unknown criterion {target_id} in the current plan")
-            return
+            return self._criterion_content_hash(criterion)
         mission_ids = [
             p["mission_id"]
             for p in self.db.query("SELECT mission_id FROM project_phases WHERE project_id=?", (project_id,))
             if p.get("mission_id")
         ]
         for mid in mission_ids:
-            if self.db.query("SELECT id FROM review_findings WHERE id=? AND mission_id=?", (target_id, mid)):
-                return
+            rows = self.db.query("SELECT * FROM review_findings WHERE id=? AND mission_id=?", (target_id, mid))
+            if rows:
+                return self._finding_content_hash(rows[0])
         raise ProductValidationError(f"unknown finding {target_id} in this project")
 
-    def _waived_targets(self, project_id: str) -> set[str]:
+    def _waived_targets(self, project_id: str) -> dict[str, str]:
+        """Map ``"kind:id"`` -> content hash at waiver-creation time.
+
+        Callers must compare against the target's CURRENT content hash before
+        honoring a waiver — a stale hash means the underlying criterion/finding
+        changed since the waiver was authorized and the waiver no longer
+        applies (F-LIFE-01: never silently reapply across plan revisions).
+        """
         rows = self.db.query(
-            "SELECT target_kind, target_id FROM acceptance_waivers WHERE project_id=?", (project_id,)
+            "SELECT target_kind, target_id, content_hash FROM acceptance_waivers WHERE project_id=?", (project_id,)
         )
-        return {f"{r['target_kind']}:{r['target_id']}" for r in rows}
+        return {f"{r['target_kind']}:{r['target_id']}": r.get("content_hash") or "" for r in rows}
 
     async def generate_plan(self, project_id: str) -> dict[str, Any]:
         """Run the planning provider with bounded repair; persist a revision."""
@@ -345,9 +370,7 @@ class ProjectCoordinator:
         )
         self.db.update("product_projects", project_id, {"plan_revision": revision, "updated_at": utcnow()})
         self._set_state(project_id, ProductStatus.PLAN_READY, reason="")
-        self.events.publish(
-            EventType.PRODUCT_PLAN_READY, None, product_project_id=project_id, revision=revision
-        )
+        self.events.publish(EventType.PRODUCT_PLAN_READY, None, product_project_id=project_id, revision=revision)
         return {"ok": True, "revision": revision, "plan": plan_data}
 
     async def _run_planning_provider(self, prompt: str, project_id: str) -> str:
@@ -436,8 +459,7 @@ class ProjectCoordinator:
         # Sync phase rows: add new phases, keep existing rows (history preserved).
         plan = ProductPlan.model_validate(plan_data)
         existing = {
-            p["phase_key"]: p
-            for p in self.db.query("SELECT * FROM project_phases WHERE project_id=?", (project_id,))
+            p["phase_key"]: p for p in self.db.query("SELECT * FROM project_phases WHERE project_id=?", (project_id,))
         }
         for spec in plan.phases:
             if spec.key in existing:
@@ -638,7 +660,6 @@ class ProjectCoordinator:
                 "SELECT id FROM product_projects WHERE state IN ("  # noqa: S608 -- placeholders only
                 + ",".join("?" for _ in ACTIVE_PRODUCT_STATUSES)
                 + ")",
-
                 tuple(s.value for s in ACTIVE_PRODUCT_STATUSES),
             )
             for row in rows:
@@ -774,17 +795,17 @@ class ProjectCoordinator:
         verify_cmds = "\n".join(f"- {c}" for c in (spec.verify_commands if spec else []))
         return f"""You are implementing one phase of the product "{project_name}".
 
-PHASE: {phase['title']}
-GOAL: {phase['goal']}
+PHASE: {phase["title"]}
+GOAL: {phase["goal"]}
 
 TASKS:
-{tasks or '(see goal)'}
+{tasks or "(see goal)"}
 
 ACCEPTANCE CRITERIA (all must hold when you finish):
 {criteria}
 
 SUGGESTED VERIFICATION COMMANDS:
-{verify_cmds or '(use the repo toolchain)'}
+{verify_cmds or "(use the repo toolchain)"}
 
 RULES:
 - Write real, working code in the workspace. Follow existing conventions.
@@ -925,7 +946,7 @@ RULES:
         if plan is None:
             return
         spec = next((p for p in plan.phases if p.key == phase["phase_key"]), None)
-        for rid in (spec.requirement_ids if spec else []):
+        for rid in spec.requirement_ids if spec else []:
             current = self.db.query(
                 "SELECT status FROM requirement_evidence WHERE project_id=? AND requirement_id=?",
                 (project_id, rid),
@@ -947,9 +968,7 @@ RULES:
             (mission["id"],),
         )
         for gate in gates:
-            dup = self.db.query(
-                "SELECT id FROM project_gates WHERE mission_gate_id=? AND status='open'", (gate["id"],)
-            )
+            dup = self.db.query("SELECT id FROM project_gates WHERE mission_gate_id=? AND status='open'", (gate["id"],))
             if dup:
                 continue
             self.db.insert(
@@ -1018,8 +1037,7 @@ RULES:
         live = [
             p
             for p in phases
-            if p["status"] == ProjectPhaseStatus.RUNNING.value
-            or self._phase_launchable_locked(project_id, p)
+            if p["status"] == ProjectPhaseStatus.RUNNING.value or self._phase_launchable_locked(project_id, p)
         ]
         waiting = [p for p in phases if p["status"] == ProjectPhaseStatus.WAITING_FOR_HUMAN.value]
         failed = [p for p in phases if p["status"] == ProjectPhaseStatus.FAILED.value]
@@ -1045,38 +1063,38 @@ RULES:
         self._set_state(project_id, ProductStatus.BLOCKED, reason="no phase can progress (unsatisfied dependencies)")
 
     # -- operator actions --------------------------------------------------
-    def pause_project(self, project_id: str) -> None:
-        row = self.db.get("product_projects", project_id)
-        if not row:
-            raise KeyError(f"product project {project_id} not found")
-        for phase in self.db.query(
-            "SELECT mission_id FROM project_phases WHERE project_id=? AND status='RUNNING'", (project_id,)
-        ):
-            if phase.get("mission_id"):
-                try:
-                    self.orch.pause_mission(phase["mission_id"])
-                except Exception:
-                    logger.debug("pause of %s failed", phase["mission_id"], exc_info=True)
+    async def pause_project(self, project_id: str) -> None:
+        async with self._advance_lock:
+            row = self.db.get("product_projects", project_id)
+            if not row:
+                raise KeyError(f"product project {project_id} not found")
+            for phase in self.db.query(
+                "SELECT mission_id FROM project_phases WHERE project_id=? AND status='RUNNING'", (project_id,)
+            ):
+                if phase.get("mission_id"):
+                    try:
+                        self.orch.pause_mission(phase["mission_id"])
+                    except Exception:
+                        logger.debug("pause of %s failed", phase["mission_id"], exc_info=True)
 
-    def cancel_project(self, project_id: str) -> None:
-        row = self.db.get("product_projects", project_id)
-        if not row:
-            raise KeyError(f"product project {project_id} not found")
-        if row["state"] in {s.value for s in TERMINAL_PRODUCT_STATUSES}:
-            return
-        for phase in self.db.query(
-            "SELECT mission_id FROM project_phases WHERE project_id=? AND mission_id IS NOT NULL", (project_id,)
-        ):
-            try:
-                self.orch.cancel_mission(phase["mission_id"])
-            except Exception:
-                logger.debug("cancel of %s failed", phase["mission_id"], exc_info=True)
-        self._set_state(project_id, ProductStatus.CANCELLED, reason="cancelled by operator", finished=True)
+    async def cancel_project(self, project_id: str) -> None:
+        async with self._advance_lock:
+            row = self.db.get("product_projects", project_id)
+            if not row:
+                raise KeyError(f"product project {project_id} not found")
+            if row["state"] in {s.value for s in TERMINAL_PRODUCT_STATUSES}:
+                return
+            for phase in self.db.query(
+                "SELECT mission_id FROM project_phases WHERE project_id=? AND mission_id IS NOT NULL", (project_id,)
+            ):
+                try:
+                    self.orch.cancel_mission(phase["mission_id"])
+                except Exception:
+                    logger.debug("cancel of %s failed", phase["mission_id"], exc_info=True)
+            self._set_state(project_id, ProductStatus.CANCELLED, reason="cancelled by operator", finished=True)
 
     def retry_phase(self, project_id: str, phase_key: str) -> dict[str, Any]:
-        rows = self.db.query(
-            "SELECT * FROM project_phases WHERE project_id=? AND phase_key=?", (project_id, phase_key)
-        )
+        rows = self.db.query("SELECT * FROM project_phases WHERE project_id=? AND phase_key=?", (project_id, phase_key))
         if not rows:
             raise KeyError(f"phase {phase_key} not found")
         phase = rows[0]
@@ -1102,49 +1120,51 @@ RULES:
         return {"ok": True, "phase_key": phase_key}
 
     # -- gates -------------------------------------------------------------
-    def resolve_gate(self, project_id: str, gate_id: str, resolution: str) -> dict[str, Any]:
-        gate = self.db.get("project_gates", gate_id)
-        if not gate or gate["project_id"] != project_id or gate["status"] != "open":
-            raise KeyError(f"open gate {gate_id} not found")
-        if gate.get("mission_gate_id"):
-            # Delegate to the mission gate contract; mirror on success.
-            self.orch.resolve_gate(gate["mission_gate_id"], resolution or "continue")
-            self.db.update(
-                "project_gates",
-                gate_id,
-                {"status": "resolved", "resolution": resolution or "continue", "resolved_at": utcnow()},
-            )
-        elif gate["gate_type"] == "secret":
-            check = self._validate_secret_gate(project_id, gate)
-            if not check["ok"]:
-                return check
-            self.db.update(
-                "project_gates",
-                gate_id,
-                {
-                    "status": "resolved",
-                    "resolution": "prerequisite configured (values never stored)",
-                    "resolved_at": utcnow(),
-                },
-            )
-        else:
-            if not (resolution or "").strip():
-                return {"ok": False, "error": "resolution text is required"}
-            validation_cmd = (gate.get("validation") or "").strip()
-            # Only an explicit `run <command>` validation executes anything;
-            # all other validation text is human-attested instruction.
-            if validation_cmd.lower().startswith("run "):
-                if not self._run_gate_validation(project_id, validation_cmd[4:].strip()):
-                    return {"ok": False, "error": "validation command failed — prerequisite not satisfied"}
-            self.db.update(
-                "project_gates",
-                gate_id,
-                {"status": "resolved", "resolution": (resolution or '').strip(), "resolved_at": utcnow()},
-            )
-        self.events.publish(
-            EventType.PRODUCT_GATE_RESOLVED, None, product_project_id=project_id, gate_id=gate_id
-        )
-        return {"ok": True, "gate_id": gate_id}
+    async def resolve_gate(self, project_id: str, gate_id: str, resolution: str) -> dict[str, Any]:
+        async with self._advance_lock:
+            gate = self.db.get("project_gates", gate_id)
+            if not gate or gate["project_id"] != project_id or gate["status"] != "open":
+                raise KeyError(f"open gate {gate_id} not found")
+            if gate.get("mission_gate_id"):
+                # Delegate to the mission gate contract; mirror on success.
+                self.orch.resolve_gate(gate["mission_gate_id"], resolution or "continue")
+                self.db.update(
+                    "project_gates",
+                    gate_id,
+                    {"status": "resolved", "resolution": resolution or "continue", "resolved_at": utcnow()},
+                )
+            elif gate["gate_type"] == "secret":
+                check = self._validate_secret_gate(project_id, gate)
+                if not check["ok"]:
+                    return check
+                self.db.update(
+                    "project_gates",
+                    gate_id,
+                    {
+                        "status": "resolved",
+                        "resolution": "prerequisite configured (values never stored)",
+                        "resolved_at": utcnow(),
+                    },
+                )
+            else:
+                if not (resolution or "").strip():
+                    return {"ok": False, "error": "resolution text is required"}
+                validation_cmd = (gate.get("validation") or "").strip()
+                # Only an explicit `run <command>` validation executes anything;
+                # all other validation text is human-attested instruction. The
+                # command was already checked against the same allowlist at
+                # plan-validation time (validate_product_plan); re-checked here
+                # too — defense in depth, never trust a prior check alone.
+                if validation_cmd.lower().startswith("run "):
+                    if not await self._run_gate_validation(project_id, validation_cmd[4:].strip()):
+                        return {"ok": False, "error": "validation command failed — prerequisite not satisfied"}
+                self.db.update(
+                    "project_gates",
+                    gate_id,
+                    {"status": "resolved", "resolution": (resolution or "").strip(), "resolved_at": utcnow()},
+                )
+            self.events.publish(EventType.PRODUCT_GATE_RESOLVED, None, product_project_id=project_id, gate_id=gate_id)
+            return {"ok": True, "gate_id": gate_id}
 
     def _target_repo(self, project_id: str) -> Path | None:
         row = self.db.get("product_projects", project_id) or {}
@@ -1183,23 +1203,24 @@ RULES:
             }
         return {"ok": True}
 
-    def _run_gate_validation(self, project_id: str, command: str) -> bool:
-        import shlex
+    async def _run_gate_validation(self, project_id: str, command: str) -> bool:
+        """Execute a gate's `run <command>` validation text.
 
+        Uses the same allowlist as criterion verification (is_executable_command)
+        rather than a denylist — this text originates as LLM-authored plan JSON
+        (ExternalPrerequisite.validation) and validate_product_plan already
+        rejects non-allowlisted text at plan-save time, but that check must
+        never be trusted alone: it is re-applied here, at execution time.
+        """
         repo = self._target_repo(project_id)
         if repo is None or not command:
             return False
-        try:
-            argv = shlex.split(command)
-        except ValueError:
+        ok, safe_command = is_executable_command(command)
+        if not ok:
             return False
-        if not argv or argv[0] in ("rm", "sudo", "shutdown", "reboot", "mkfs", "dd"):
-            return False
-        try:
-            proc = subprocess.run(argv, cwd=repo, capture_output=True, timeout=120)  # noqa: S603 - argv from validated plan gate
-            return proc.returncode == 0
-        except Exception:
-            return False
+        argv = shlex.split(safe_command)
+        result = await run_process(argv, cwd=repo, timeout_s=120)
+        return result.exit_code == 0
 
     async def _evaluate_requirement_criteria_locked(
         self, project_id: str, plan: ProductPlan, repo: Path, sha: str
@@ -1217,7 +1238,7 @@ RULES:
             req_ok = True
             for criterion in req.acceptance:
                 cid = criterion.id
-                if f"criterion:{cid}" in waived:
+                if waived.get(f"criterion:{cid}") == self._criterion_content_hash(criterion):
                     self._record_criterion_waived(project_id, req.id, cid, sha)
                     continue
                 recorded = self.db.query(
@@ -1321,7 +1342,7 @@ RULES:
             for r in rows:
                 if str(r.get("category", "")).lower() not in self.BLOCKING_FINDING_CATEGORIES:
                     continue
-                if f"finding:{r['id']}" in waived:
+                if waived.get(f"finding:{r['id']}") == self._finding_content_hash(r):
                     continue
                 problems.append(
                     f"unresolved {r['severity']} {r['category']} finding {r['id']} "
@@ -1383,9 +1404,7 @@ RULES:
                     if not fresh_ok:
                         findings.append(f"fresh checkout of {sha} did not reproduce verification: {fresh_detail}")
         if findings:
-            blocked_state = (
-                AcceptanceState.EXTERNALLY_BLOCKED.value if open_gates else AcceptanceState.UNVERIFIED.value
-            )
+            blocked_state = AcceptanceState.EXTERNALLY_BLOCKED.value if open_gates else AcceptanceState.UNVERIFIED.value
             self.db.update(
                 "product_projects",
                 project_id,
@@ -1427,6 +1446,7 @@ RULES:
         Returns (ok, detail). Dependency install is part of reproducibility:
         a checkout that cannot install + pass its toolchain is not accepted.
         """
+
         def _clone_and_checkout() -> Path | None:
             tmp = Path(tempfile.mkdtemp(prefix="gg-accept-"))
             clone = tmp / "checkout"
@@ -1437,14 +1457,13 @@ RULES:
             proc = subprocess.run(["git", "-C", str(clone), "checkout", "-q", sha], capture_output=True, timeout=60)
             return clone if proc.returncode == 0 else None
 
-        def _install(cmd: list[str], cwd: Path) -> tuple[bool, str]:
-            try:
-                # noqa: S603 - argv built from fixed commands below, never plan text
-                proc = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=600)
-                tail = (proc.stdout.decode(errors="replace") + proc.stderr.decode(errors="replace"))[-1500:]
-                return proc.returncode == 0, tail
-            except Exception as exc:
-                return False, str(exc)[:500]
+        async def _install(cmd: list[str], cwd: Path) -> tuple[bool, str]:
+            # Routed through run_process (not subprocess.run): redacts secrets
+            # from captured output before it is ever persisted/rendered, and
+            # tree-kills the whole process group on timeout instead of leaving
+            # orphaned native-build children running past the deadline.
+            result = await run_process(cmd, cwd=cwd, timeout_s=600)
+            return result.exit_code == 0, result.combined_tail[-1500:]
 
         tmp_root: Path | None = None
         try:
@@ -1456,18 +1475,21 @@ RULES:
             if not (info.test_commands or info.build_commands):
                 return True, "no toolchain to reproduce beyond the recorded SHA"
             install_note = "no install step needed"
+            # --ignore-scripts: this is freshly cloned, potentially AI-generated
+            # code — lifecycle scripts (preinstall/postinstall) are an
+            # unnecessary extra code-execution surface during acceptance.
             if (clone / "package-lock.json").exists():
-                ok, log = await asyncio.to_thread(_install, ["npm", "ci", "--no-audit", "--no-fund"], clone)
+                ok, log = await _install(["npm", "ci", "--no-audit", "--no-fund", "--ignore-scripts"], clone)
                 install_note = "npm ci " + ("ok" if ok else f"FAILED: {log[-500:]}")
                 if not ok:
                     return False, install_note
             elif (clone / "package.json").exists():
-                ok, log = await asyncio.to_thread(_install, ["npm", "install", "--no-audit", "--no-fund"], clone)
+                ok, log = await _install(["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"], clone)
                 install_note = "npm install " + ("ok" if ok else f"FAILED: {log[-500:]}")
                 if not ok:
                     return False, install_note
             elif (clone / "uv.lock").exists() or (clone / "pyproject.toml").exists():
-                ok, log = await asyncio.to_thread(_install, ["uv", "sync", "--frozen"], clone)
+                ok, log = await _install(["uv", "sync", "--frozen"], clone)
                 install_note = "uv sync " + ("ok" if ok else f"FAILED: {log[-500:]}")
                 if not ok:
                     return False, install_note
@@ -1481,9 +1503,7 @@ RULES:
             if tmp_root is not None:
                 shutil.rmtree(tmp_root, ignore_errors=True)
 
-    def _build_delivery_report(
-        self, project_id: str, plan: ProductPlan, repo: Path | None, sha: str
-    ) -> dict[str, Any]:
+    def _build_delivery_report(self, project_id: str, plan: ProductPlan, repo: Path | None, sha: str) -> dict[str, Any]:
         phases = self.db.query("SELECT * FROM project_phases WHERE project_id=?", (project_id,))
         evidence = self.db.query("SELECT * FROM requirement_evidence WHERE project_id=?", (project_id,))
         gates = self.db.query("SELECT * FROM project_gates WHERE project_id=?", (project_id,))
@@ -1494,9 +1514,7 @@ RULES:
             mission_id = phase.get("mission_id")
             if not mission_id:
                 continue
-            rows = self.db.query(
-                "SELECT severity, description FROM review_findings WHERE mission_id=?", (mission_id,)
-            )
+            rows = self.db.query("SELECT severity, description FROM review_findings WHERE mission_id=?", (mission_id,))
             for f in rows:
                 review_notes.append(f"[{phase['phase_key']}/{f['severity']}] {f['description']}")
         test_summary: list[str] = []
@@ -1529,15 +1547,9 @@ RULES:
                     "criteria": [
                         {
                             "id": a.id,
-                            "status": next(
-                                (c["status"] for c in criteria if c["criterion_id"] == a.id), "PENDING"
-                            ),
-                            "command": next(
-                                (c["command"] for c in criteria if c["criterion_id"] == a.id), ""
-                            ),
-                            "exit_code": next(
-                                (c["exit_code"] for c in criteria if c["criterion_id"] == a.id), None
-                            ),
+                            "status": next((c["status"] for c in criteria if c["criterion_id"] == a.id), "PENDING"),
+                            "command": next((c["command"] for c in criteria if c["criterion_id"] == a.id), ""),
+                            "exit_code": next((c["exit_code"] for c in criteria if c["criterion_id"] == a.id), None),
                             "sha": next((c["sha"] for c in criteria if c["criterion_id"] == a.id), ""),
                         }
                         for a in r.acceptance
@@ -1603,7 +1615,6 @@ RULES:
         """Boot recovery: re-drive every non-terminal project (idempotent)."""
         rows = self.db.query(
             "SELECT id FROM product_projects WHERE state IN (" + ",".join("?" for _ in ACTIVE_PRODUCT_STATUSES) + ")",  # noqa: S608 -- placeholders only
-
             tuple(s.value for s in ACTIVE_PRODUCT_STATUSES),
         )
         for row in rows:
