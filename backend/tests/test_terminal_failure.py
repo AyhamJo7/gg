@@ -102,6 +102,11 @@ def test_gate_refused_cooldown_is_short_and_expires(tmp_path: Path, workspace: P
         assert orch.registry.is_eligible("fake-a") is False
         await asyncio.sleep(0.1)  # > the 0.05s test-config gate_refused_cooldown_seconds
         assert orch.registry.is_eligible("fake-a") is True
+        # is_eligible's lazy reconcile clears the now-expired cooldown_until
+        # out of the DB too (not just eligibility-correct) — otherwise
+        # health()'s dashboard payload shows a perpetually-stale timestamp.
+        row = orch.db.get("providers", "fake-a", key="name")
+        assert row["cooldown_until"] is None
         await orch.shutdown()
 
     asyncio.run(main())

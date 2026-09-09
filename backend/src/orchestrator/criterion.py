@@ -15,13 +15,25 @@ that does not match one of these shapes exactly is rejected — there is no
 This replaced an earlier denylist-of-dangerous-flags design that could not
 converge against tools (``uv run``, ``go run``, ``node``, ``make``) with
 effectively unbounded flag grammars for shelling out to something else.
+
+Manifest indirection (go.mod ``replace``, Cargo.toml ``[patch]``/path deps,
+package.json ``file:``/``link:`` deps) is checked with a real parser for
+each format (``go mod edit -json``, stdlib ``tomllib``, ``json.loads``) —
+never regex/text-scanning. A first attempt at these checks used regex and
+was itself bypassed (single-quoted TOML strings, a bare Cargo path
+containing "..", a quoted go.mod replace target) — a hand-rolled scan
+cannot keep pace with a real grammar's alternate syntax forms. Any future
+manifest-indirection check for a new tool must use that tool's own parser
+or an equivalent structured query, not a new regex.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shlex
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -81,9 +93,10 @@ class _ShapeMatch:
     """
 
     path_tokens: tuple[str, ...] = field(default_factory=tuple)
-    #: "go" or "cargo" when the matched shape invokes a toolchain whose own
-    #: manifest (go.mod / Cargo.toml) can redirect it outside the argv path
-    #: token entirely (replace directives, [patch]/path dependencies) — see
+    #: "go", "cargo", or "npm" when the matched shape invokes a toolchain
+    #: whose own manifest (go.mod / Cargo.toml / package.json) can redirect
+    #: it outside the argv path token entirely (replace directives,
+    #: [patch]/path dependencies, file:/link: dependencies) — see
     #: ``_manifest_confined``. ``None`` for shapes with no such indirection.
     manifest_check: str | None = None
 
@@ -147,9 +160,9 @@ def _match_npm(argv: list[str]) -> _ShapeMatch | None:
     if not argv or argv[0] != "npm":
         return None
     if len(argv) == 2 and argv[1] in ("test", "ci", "install"):
-        return _ShapeMatch()
+        return _ShapeMatch(manifest_check="npm")
     if len(argv) == 3 and argv[1] == "run" and _SCRIPT_NAME_RE.match(argv[2]):
-        return _ShapeMatch()
+        return _ShapeMatch(manifest_check="npm")
     return None
 
 
@@ -247,9 +260,12 @@ def is_executable_command(verify: str) -> tuple[bool, str]:
     return True, text
 
 
-def confined_to_repo(command: str, repo: Path) -> bool:
-    """Re-check an already-`is_executable_command`-approved command's path
-    arguments against the real filesystem.
+def _path_checks_confined(command: str, repo: Path) -> tuple[_ShapeMatch | None, Path | None]:
+    """The purely-synchronous half of ``confined_to_repo``: shape matching
+    plus argv path-token containment. Kept out of the async function's body
+    so it contains no direct blocking pathlib calls (ASYNC240) — the only
+    manifest check that needs to await anything is the go one, which gets
+    its own tiny sync existence-check helper below for the same reason.
 
     Syntactic checks alone (no `..`, not absolute) can't catch a symlink
     that lives inside the repo but resolves outside it — `Path.resolve()`
@@ -260,87 +276,172 @@ def confined_to_repo(command: str, repo: Path) -> bool:
     try:
         argv = shlex.split(command)
     except ValueError:
-        return False
+        return None, None
     match = _match_shape(argv)
     if match is None:
-        return False
+        return None, None
     repo_resolved = repo.resolve()
     for tok in match.path_tokens:
         if tok == "./...":
             continue
         candidate = (repo / tok).resolve()
         if not candidate.is_relative_to(repo_resolved):
-            return False
-    if match.manifest_check is not None and not _manifest_confined(match.manifest_check, repo):
+            return None, None
+    return match, repo_resolved
+
+
+async def confined_to_repo(command: str, repo: Path) -> bool:
+    """Re-check an already-`is_executable_command`-approved command's path
+    arguments — and, where the matched shape invokes a toolchain whose own
+    manifest can redirect it elsewhere, that manifest's declared paths too —
+    against the real filesystem."""
+    match, repo_resolved = _path_checks_confined(command, repo)
+    if match is None or repo_resolved is None:
+        return False
+    if match.manifest_check is not None and not await _manifest_confined(match.manifest_check, repo, repo_resolved):
         return False
     return True
 
 
-#: A go.mod replace directive's target, either single-line (`replace OLD =>
-#: NEW`) or inside a `replace ( ... )` block (`OLD => NEW`, no leading
-#: keyword) — both forms put the target after `=>` on its own line.
-_GO_REPLACE_TARGET_RE = re.compile(r"=>\s*(\S+)")
-
-#: A Cargo.toml path dependency or [patch] entry: `path = "..."` anywhere in
-#: the file (normal [dependencies], a workspace member, or a [patch.*] table
-#: — all share this syntax).
-_CARGO_PATH_RE = re.compile(r'\bpath\s*=\s*"([^"]*)"')
-
-
-def _manifest_target_confined(target: str, repo: Path, repo_resolved: Path) -> bool:
-    """A replace/patch target that looks like a filesystem path must resolve
-    inside the repo. A bare module path or version-pinned reference (no `.`,
-    `/`, or `~` prefix — e.g. `example.com/other v1.2.3`) isn't a filesystem
-    escape at all and is left alone."""
-    if not (target.startswith(".") or target.startswith("/") or target.startswith("~")):
-        return True
+def _escapes_repo(target: str, repo: Path, repo_resolved: Path) -> bool:
+    """True if a manifest-declared filesystem path target resolves outside
+    the repo. Callers only invoke this once they've already determined the
+    value is genuinely a filesystem path (a real parser told us so — a TOML
+    `path` key, an npm `file:`/`link:` prefix, a go.mod filesystem replace
+    with no pinned version) — there's no bare-token/module-reference
+    ambiguity left to resolve here, unlike the old regex-scan version."""
+    if not target:
+        return True  # empty/unparseable — fail closed
     if target.startswith("~"):
-        return False  # home-dir expansion always escapes the repo
+        return True  # home-dir expansion always escapes the repo
     if ".." in Path(target).parts:
-        return False  # blanket-reject traversal, consistent with _safe_rel_path
-    candidate = Path(target).resolve() if target.startswith("/") else (repo / target).resolve()
-    return candidate.is_relative_to(repo_resolved)
+        return True  # blanket-reject traversal, consistent with _safe_rel_path
+    try:
+        candidate = Path(target).resolve() if Path(target).is_absolute() else (repo / target).resolve()
+    except (OSError, ValueError):
+        return True  # fail closed if the path can't even be resolved
+    return not candidate.is_relative_to(repo_resolved)
 
 
-def _manifest_confined(tool: str, repo: Path) -> bool:
-    """Best-effort text scan for manifest content that would redirect `go`
-    or `cargo` outside the repo the argv path token was already confined to
-    (a go.mod `replace` directive, a Cargo.toml `[patch]`/path dependency).
-    Deliberately not a real TOML/go.mod parser — a plain line scan is
-    sufficient here and false-positive-safe (reject on anything ambiguous)
-    is preferred over trying to be precise.
-    """
-    repo_resolved = repo.resolve()
+def _npm_manifest_confined(repo: Path, repo_resolved: Path) -> bool:
+    """package.json `file:`/`link:` dependency targets must resolve inside
+    the repo — a real ``postinstall`` script in such a package runs during
+    `npm install`/`ci`, so this is as much an execution-confinement check as
+    the go/cargo manifest checks below."""
+    manifest = repo / "package.json"
+    if not manifest.is_file():
+        return True
+    try:
+        data = json.loads(manifest.read_text())
+    except (OSError, ValueError):
+        return False  # unreadable/malformed — fail closed
+    if not isinstance(data, dict):
+        return False
+    for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+        deps = data.get(section)
+        if not isinstance(deps, dict):
+            continue
+        for spec in deps.values():
+            if not isinstance(spec, str):
+                continue
+            for prefix in ("file:", "link:"):
+                if spec.startswith(prefix) and _escapes_repo(spec[len(prefix) :], repo, repo_resolved):
+                    return False
+    return True
+
+
+def _cargo_manifest_confined(repo: Path, repo_resolved: Path) -> bool:
+    """Cargo.toml path dependencies and [patch] entries must resolve inside
+    the repo. Parsed with stdlib `tomllib`, not a regex — a hand-rolled scan
+    for `path\\s*=\\s*"..."` misses single- and triple-quoted TOML strings,
+    which is exactly how this check was previously bypassed."""
+    manifest = repo / "Cargo.toml"
+    if not manifest.is_file():
+        return True
+    try:
+        data = tomllib.loads(manifest.read_text())
+    except (OSError, ValueError):
+        return False  # unreadable/malformed — fail closed
+
+    paths: list[str] = []
+
+    def collect(deps: object) -> None:
+        if not isinstance(deps, dict):
+            return
+        for spec in deps.values():
+            if isinstance(spec, dict):
+                p = spec.get("path")
+                if isinstance(p, str):
+                    paths.append(p)
+
+    for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+        collect(data.get(section))
+    workspace = data.get("workspace")
+    if isinstance(workspace, dict):
+        collect(workspace.get("dependencies"))
+    patch = data.get("patch")
+    if isinstance(patch, dict):
+        for registry_table in patch.values():
+            collect(registry_table)
+
+    return not any(_escapes_repo(p, repo, repo_resolved) for p in paths)
+
+
+def _go_mod_present(repo: Path) -> bool:
+    return (repo / "go.mod").is_file()
+
+
+async def _go_manifest_confined(repo: Path, repo_resolved: Path) -> bool:
+    """go.mod `replace` directives must resolve inside the repo when they
+    target the filesystem rather than another module+version. Uses `go mod
+    edit -json` (Go's own parser, via a structured field distinguishing a
+    filesystem replace — empty `New.Version` — from a module-path replace)
+    rather than hand-parsing go.mod's grammar, which allows quoted forms
+    (`=> "../outside"`, `` => `/etc/evil` ``) a naive regex can't keep pace
+    with. Any failure to query it (binary missing, malformed go.mod,
+    non-zero exit, bad JSON) fails closed rather than falling back to a
+    weaker check."""
+    if not _go_mod_present(repo):
+        return True
+    result = await run_process(["go", "mod", "edit", "-json"], cwd=repo, timeout_s=15.0)
+    if result.exit_code != 0:
+        return False
+    try:
+        data = json.loads("\n".join(result.stdout_tail))
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    replace_list = data.get("Replace")
+    if not isinstance(replace_list, list):
+        return True
+    for entry in replace_list:
+        if not isinstance(entry, dict):
+            return False
+        new = entry.get("New")
+        if not isinstance(new, dict):
+            return False
+        if new.get("Version"):
+            continue  # module-path replace (pinned version) — not a filesystem path
+        path = new.get("Path")
+        if not isinstance(path, str) or _escapes_repo(path, repo, repo_resolved):
+            return False
+    return True
+
+
+async def _manifest_confined(tool: str, repo: Path, repo_resolved: Path) -> bool:
     if tool == "go":
-        go_mod = repo / "go.mod"
-        if not go_mod.is_file():
-            return True
-        try:
-            text = go_mod.read_text(errors="replace")
-        except OSError:
-            return False
-        for match in _GO_REPLACE_TARGET_RE.finditer(text):
-            if not _manifest_target_confined(match.group(1), repo, repo_resolved):
-                return False
-        return True
+        return await _go_manifest_confined(repo, repo_resolved)
     if tool == "cargo":
-        cargo_toml = repo / "Cargo.toml"
-        if not cargo_toml.is_file():
-            return True
-        try:
-            text = cargo_toml.read_text(errors="replace")
-        except OSError:
-            return False
-        for match in _CARGO_PATH_RE.finditer(text):
-            if not _manifest_target_confined(match.group(1), repo, repo_resolved):
-                return False
-        return True
+        return _cargo_manifest_confined(repo, repo_resolved)
+    if tool == "npm":
+        return _npm_manifest_confined(repo, repo_resolved)
     return True
 
 
 async def run_check_command(repo: Path, command: str) -> tuple[int | None, str]:
     """Execute one allowlisted verification command in the target repo."""
-    if not confined_to_repo(command, repo):
+    if not await confined_to_repo(command, repo):
         return None, "path argument in verification command resolves outside the target repository"
     argv = shlex.split(command)
     result = await run_process(argv, cwd=repo, timeout_s=CHECK_TIMEOUT_S)

@@ -89,11 +89,17 @@ class ProviderRegistry:
                     if row["state"] != ProviderState.RATE_LIMITED.value:
                         row["state"] = "COOLDOWN"
                 else:
-                    # cooldown expired → provider becomes eligible again
+                    # cooldown expired → provider becomes eligible again.
+                    # AVAILABLE is included so a clear_busy_without_penalty
+                    # cooldown (state already AVAILABLE, just a short delay
+                    # before real re-eligibility) gets its stale
+                    # cooldown_until cleared too, not just the exponential
+                    # reliability-cooldown states.
                     expired = (
                         ProviderState.RATE_LIMITED.value,
                         ProviderState.TIMED_OUT.value,
                         ProviderState.CRASHED.value,
+                        ProviderState.AVAILABLE.value,
                     )
                     if row["state"] in expired:
                         self._db.execute(
@@ -124,12 +130,15 @@ class ProviderRegistry:
             if datetime.now(UTC) < until:
                 return False
             # Cooldown expired — lazily reconcile state so eligibility never
-            # depends on a scheduler tick having run health() first.
+            # depends on a scheduler tick having run health() first. AVAILABLE
+            # is included so a clear_busy_without_penalty cooldown's stale
+            # cooldown_until gets cleared here too, not only in health().
             if row["state"] in (
                 ProviderState.RATE_LIMITED.value,
                 ProviderState.TIMED_OUT.value,
                 ProviderState.CRASHED.value,
                 ProviderState.UNAVAILABLE.value,
+                ProviderState.AVAILABLE.value,
             ):
                 self._db.execute(
                     "UPDATE providers SET state=?, cooldown_until=NULL WHERE name=?",
