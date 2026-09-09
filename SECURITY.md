@@ -80,6 +80,21 @@ operations, and workspace escape.
   tool outside the repo now fails at the kernel's mount-namespace boundary
   regardless of which field caused it — the boundary doesn't depend on
   having enumerated the mechanism. See `backend/src/orchestrator/sandbox.py`.
+- This includes `backend/src/orchestrator/verify.py`'s FINAL_VALIDATION/
+  acceptance toolchain check: the command *string* it runs is fixed
+  (auto-detected from the repo's own manifests, e.g. `"npm test"`), but its
+  *behavior* is exactly as manifest-content-driven — and therefore as
+  attacker/AI-influenceable — as the criterion/gate-validation paths above,
+  so it goes through the same sandboxed boundary rather than being treated
+  as a separately-trusted code path.
+- The sandbox also unshares the PID namespace (`--unshare-pid`) and applies
+  a coarse process-count cap via the shell's `ulimit` (`bwrap` has no
+  `--rlimit` flag) — an earlier version shared the host's PID namespace,
+  which was proven to let a sandboxed command signal-kill arbitrary host
+  processes (including the orchestrator's own) despite having no filesystem
+  or network access. The process-count cap is a backstop against a
+  fork-bomb-shaped verify/gate command, not a precise resource guarantee; a
+  real cgroup-based `pids.max`/memory limit is a tracked follow-up.
 - A cheap closed-shape argv allowlist (`backend/src/orchestrator/
   criterion.py`) still runs first, as a pre-filter — it rejects obvious junk
   before a sandbox is even started, but it is explicitly **not** the safety
@@ -89,20 +104,39 @@ operations, and workspace escape.
   When it's missing, these commands are refused outright and reported as
   not-executable — there is deliberately no unsandboxed fallback.
 - The sandbox's environment is fully cleared (`--clearenv`) except a small
-  explicit allowlist (`PATH`, `LANG`, `LC_ALL`, `TERM`, plus toolchain-cache
+  explicit allowlist (`LANG`, `LC_ALL`, `TERM`, plus toolchain-cache
   locations pointed at a fresh per-run scratch directory) — this also
   prevents any secret present in the orchestrator's own process environment
-  from leaking into a sandboxed command's view.
-- Toolchain directories under `$HOME` (`.nvm`, `.local`, `.cargo`, `.rustup`,
-  `go`, `.npm`, `.cache`) are bound read-only so already-installed
-  dependencies/toolchains work offline; known credential files/directories
-  within them (`.npmrc`, `.netrc`, `.git-credentials`, `.gitconfig`,
-  `.cargo/credentials*`, `.ssh`, `.aws`, `.azure`, `.gnupg`, `.config/gh`,
-  `.docker`) are explicitly masked. This masking list is a best-effort
-  defense-in-depth layer, not the primary boundary — the primary boundary is
-  that these commands run after dependencies are already installed
-  (a separate, network-enabled, `--ignore-scripts`-hardened step) and have
-  no network access to exfiltrate anything they might still read.
+  from leaking into a sandboxed command's view. `PATH` is rebuilt from only
+  the directories actually bound into the sandbox rather than forwarded
+  from the host verbatim, so it can't name (even if it can't resolve into)
+  unrelated host directories.
+- Toolchain access under `$HOME` is an **explicit allow-list of specific
+  subpaths** (`.nvm`, `.local/bin`, `.local/share/uv`, `.cargo/bin`,
+  `.cargo/registry`, `.rustup`, `go/pkg/mod`, `.npm`, `.cache/uv`,
+  `.cache/pip`), not the whole `.cache`/`.local` directories. An earlier
+  version bound those two wholesale and relied on masking known
+  credential-file names within them; that was proven insufficient on a real
+  development machine (a live Hugging Face API token under
+  `.cache/huggingface/token` and a live Jupyter session-signing secret under
+  `.local/share/jupyter/runtime/` were both readable, since neither is a
+  toolchain path any masking list had reason to name — `.cache`/`.local` are
+  shared, general-purpose dumping grounds for every application on the
+  machine, not toolchain-specific). The allow-list above is the actual
+  boundary now; known credential files/directories (`.npmrc`, `.netrc`,
+  `.git-credentials`, `.gitconfig`, `.cargo/credentials*`, `.ssh`, `.aws`,
+  `.azure`, `.gnupg`, `.config/gh`, `.docker`) are still masked on top of it
+  as defense in depth, not the primary control. A second, independent layer
+  covers the same class of risk from the other direction: `git_ops.
+  checkpoint()`'s existing content-based secret scan (reusing
+  `security.SECRET_PATTERNS`) runs over every newly-staged file regardless
+  of filename, so even a credential read via some future unenumerated path
+  and copied into an innocuously-named tracked file is excluded from the
+  commit rather than silently persisted into history.
+- `run_sandboxed`/`build_sandboxed_argv` refuse to run at all if the target
+  repo resolves to the real `$HOME` or an ancestor of it — binding such a
+  repo read-write, applied after the credential masks in bwrap's bind
+  order, would silently remount over and undo those masks.
 
 ### Provider autonomy
 - CLIs run with permission bypass flags **inside the user-selected workspace** —
@@ -132,27 +166,45 @@ operations, and workspace escape.
 - `workspace_scope` is a scheduling lock, not a filesystem sandbox: a task
   declares which paths it will touch so conflicting tasks serialize, but the
   provider process itself is not confined to those paths.
-- Target verification (`backend/src/orchestrator/verify.py`, the fixed,
-  project-type-derived FINAL_VALIDATION toolchain check — not the
-  LLM-authored acceptance-criterion/gate-validation commands described
-  above) inherits the orchestrator's environment, including `VIRTUAL_ENV`
-  when set: toolchain behavior in dogfood reflects the operator's shell,
-  not a hermetic container. This is a different code path with a different
-  threat model (fixed commands, not attacker-influenceable text) and is not
-  sandboxed.
-- The sandbox's read-only toolchain/credential-masking bind list
-  (`sandbox.py`'s `_HOME_TOOLCHAIN_DIRS`/`_HOME_MASK_FILES`/
-  `_HOME_MASK_DIRS`) is a fixed set of common locations (nvm, cargo/rustup,
-  uv/pip caches, ssh/aws/gh credentials, ...) verified against this
-  project's own development machine — an unusual toolchain-manager layout
-  on a different machine could expose a credential path not in that list.
-  Unlike the manifest-enumeration approach this replaced, missing an entry
-  here only risks a read-only credential leak inside the sandbox, not an
-  escape outside the repo (network is off and the repo is the only
-  writable path regardless), but it is not an exhaustively audited list.
+- `backend/src/orchestrator/verify.py`'s FINAL_VALIDATION/acceptance
+  toolchain check now runs through the same `bwrap` sandbox as
+  criterion/gate-validation commands (see above) — it is no longer a
+  separately-trusted, unsandboxed code path. On a host without `bwrap`
+  (non-Linux, or unprivileged user namespaces disabled), verification
+  becomes unavailable rather than falling back to running unconfined; a
+  mission's FINAL_VALIDATION / a product's acceptance run will report
+  failure with that reason rather than silently skipping the check.
+- The sandbox's read-only toolchain allow-list (`sandbox.py`'s
+  `_HOME_TOOLCHAIN_SUBPATHS`) and its credential-masking defense-in-depth
+  list (`_HOME_MASK_FILES`/`_HOME_MASK_DIRS`) are a fixed set of common
+  locations (nvm, cargo/rustup/go, npm/uv/pip caches, ssh/aws/gh
+  credentials, ...) verified against this project's own development
+  machine — an unusual toolchain-manager layout on a different machine
+  could need an additional subpath added (a real tool failing offline
+  inside the sandbox because its cache isn't on the allow-list, not a
+  security gap) or, in the credential-mask list specifically, could in
+  principle miss a credential path colocated inside one of the allow-listed
+  subpaths (not `.cache`/`.local` wholesale, since those are no longer
+  bound at all). The content-based git-checkpoint scan described above is
+  the defense-in-depth backstop for exactly this residual case.
 - `bwrap` sandboxing depends on unprivileged user namespaces being enabled
   on the host kernel. If disabled (some hardened kernels/containers), the
   sandbox fails to start and — per the fail-closed design above — the
   command is refused rather than run unconfined; this can surface as
-  acceptance criteria/gate validations becoming permanently unexecutable
-  on such a host rather than a security gap.
+  acceptance criteria/gate validations/verification runs becoming
+  permanently unexecutable on such a host rather than a security gap.
+- The sandboxed process-count cap (`ulimit -u`) is a single, fixed ceiling
+  applied via a `bash` wrapper, not a per-sandbox cgroup limit — it bounds
+  the real UID's total process count, not just the sandbox's own subtree,
+  and requires `bash` to be present (falls back to no cap, with a logged
+  warning, if `bash` is missing). It stops a runaway fork bomb from
+  climbing unbounded; it is not a precise or airtight resource guarantee.
+  A cgroup-based `pids.max`/memory limit would be strictly better and is a
+  tracked follow-up, not implemented here.
+- `go` toolchain shapes (`go test`/`go build`/`go run` inside the sandbox,
+  and the `GOPATH` re-pointing fix in `sandbox.py`) have no empirical
+  verification in this project's own development/CI environment — no `go`
+  binary is installed there. The design mirrors the independently-verified
+  `CARGO_HOME`/`RUSTUP_HOME` pattern and follows Go's documented
+  `GOPATH`/`GOCACHE` semantics, but should be treated as unverified until
+  exercised on a machine with a real Go toolchain.

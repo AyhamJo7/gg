@@ -20,6 +20,17 @@ fails at the kernel's mount-namespace boundary regardless of which
 field caused it — the boundary doesn't depend on having enumerated the
 mechanism.
 
+Toolchain/cache directories under $HOME are bound by an explicit
+allow-list of specific subpaths (not whole directories like `.cache`/
+`.local`), because those two in particular are shared, general-purpose
+dumping grounds for every application on the machine — a first version
+of this module bound them wholesale and was proven, on a real
+development machine, to expose a live Hugging Face API token and a
+live Jupyter session-signing secret that had nothing to do with any
+build toolchain. The allow-list is the actual boundary; the credential
+file/dir masks below are defense in depth on top of it, not the
+primary control.
+
 bwrap is Linux-only. `sandbox_available()` must be checked by every
 caller; there is deliberately no non-sandboxed fallback path for
 planner-authored command execution.
@@ -28,6 +39,7 @@ planner-authored command execution.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 import tempfile
@@ -36,15 +48,30 @@ from pathlib import Path
 
 from .process import ProcessResult, run_process
 
+logger = logging.getLogger(__name__)
+
 BWRAP = "bwrap"
 
-# Toolchain-manager directories under $HOME that legitimate verify/build
-# commands may need read access to (binaries, shared libraries, package/
-# module caches already populated by the separate, network-enabled
-# install step). Bound read-only. Credential-bearing paths that may live
-# under any of these are masked out below regardless.
-_HOME_TOOLCHAIN_DIRS = (".nvm", ".local", ".cargo", ".rustup", "go", ".npm", ".cache")
+# Specific, narrow subpaths under $HOME that legitimate verify/build
+# commands may need read access to: toolchain binaries and package/module
+# caches already populated by the separate, network-enabled install step.
+# Deliberately NOT the whole ".cache"/".local" tree — see module docstring.
+_HOME_TOOLCHAIN_SUBPATHS = (
+    ".nvm",
+    ".local/bin",
+    ".local/share/uv",
+    ".cargo/bin",
+    ".cargo/registry",
+    ".rustup",
+    "go/pkg/mod",
+    ".npm",
+    ".cache/uv",
+    ".cache/pip",
+)
 
+# Defense in depth on top of the allow-list above, in case a future
+# addition to _HOME_TOOLCHAIN_SUBPATHS ever pulls in a directory that
+# itself contains a credential file/dir under one of these names.
 _HOME_MASK_FILES = (
     ".npmrc",
     ".netrc",
@@ -56,11 +83,22 @@ _HOME_MASK_FILES = (
 _HOME_MASK_DIRS = (".ssh", ".aws", ".azure", ".gnupg", ".config/gh", ".docker")
 
 _SYSTEM_RO_DIRS = ("/usr", "/bin", "/lib", "/lib64", "/sbin", "/etc")
+_SYSTEM_BIN_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
 
 # Environment variables explicitly forwarded into the sandbox despite
 # --clearenv wiping everything else (including any credentials/tokens
-# present in the orchestrator's own process environment).
-_FORWARDED_ENV = ("PATH", "LANG", "LC_ALL", "TERM")
+# present in the orchestrator's own process environment). PATH is
+# rebuilt (see _build_sandboxed_path), not forwarded verbatim.
+_FORWARDED_ENV = ("LANG", "LC_ALL", "TERM")
+
+# Cap on processes the sandboxed command tree may create, applied via the
+# shell's ulimit (bwrap has no --rlimit flag). This is a coarse anti-forkbomb
+# backstop, not a precise resource guarantee — a real cgroup-based pids.max
+# would bound this per-sandbox rather than against the whole real UID; see
+# module docstring / SECURITY.md for the tracked follow-up. Chosen well
+# above any legitimate parallel test-runner's process count while still
+# stopping runaway forking within a fraction of a second.
+_MAX_SANDBOX_PROCS = 2048
 
 
 def sandbox_available() -> bool:
@@ -72,23 +110,70 @@ def _bind_ro(bwrap_args: list[str], path: Path) -> None:
         bwrap_args += ["--ro-bind", str(path), str(path)]
 
 
+def _resolve_toolchain_binds(home: Path) -> list[Path]:
+    resolved: list[Path] = []
+    for rel in _HOME_TOOLCHAIN_SUBPATHS:
+        p = home / rel
+        if p.is_dir() or p.is_symlink():
+            resolved.append(p)
+    return resolved
+
+
+def _build_sandboxed_path(bound_dirs: list[Path]) -> str:
+    """Rebuild PATH from only directories actually reachable inside the
+    sandbox, instead of forwarding the operator's full host PATH verbatim
+    (which would name directories, e.g. version-manager or unrelated tool
+    installs, that aren't bound and can only ever fail lookups there —
+    unnecessary machine-specific coupling for zero functional benefit).
+    """
+    entries: list[str] = list(_SYSTEM_BIN_DIRS)
+    host_path = os.environ.get("PATH", "")
+    for raw in host_path.split(os.pathsep):
+        if not raw:
+            continue
+        try:
+            candidate = Path(raw).resolve()
+        except OSError:
+            continue
+        if any(candidate == b or candidate.is_relative_to(b) for b in bound_dirs):
+            if raw not in entries:
+                entries.append(raw)
+    return os.pathsep.join(entries)
+
+
+def _guard_repo_not_home(repo: Path) -> None:
+    """Reject a repo path that would let its own (later, read-write) bind
+    remount over an earlier home-relative credential mask — see module
+    docstring. Only the exact-match and repo-is-ancestor-of-home cases are
+    dangerous; a repo nested under home (the normal case: ~/projects/x) is
+    safe, since its mount point never overlaps a home-relative mask.
+    """
+    resolved_repo = repo.resolve()
+    resolved_home = Path.home().resolve()
+    if resolved_repo == resolved_home or resolved_repo in resolved_home.parents:
+        raise ValueError(f"refusing to sandbox with repo={resolved_repo}: overlaps the real home directory boundary")
+
+
 def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path) -> list[str]:
     """Wrap `argv` in a bwrap invocation confined to `repo` (read-write) plus a
     minimal read-only system/toolchain view, with no network. `scratch_home`
     is a fresh, per-invocation writable directory the caller creates and
     cleans up (see `run_sandboxed`); it becomes the sandboxed HOME.
     """
+    _guard_repo_not_home(repo)
     home = Path.home()
     bwrap_args: list[str] = [BWRAP, "--clearenv"]
 
     for d in _SYSTEM_RO_DIRS:
         _bind_ro(bwrap_args, Path(d))
 
-    for rel in _HOME_TOOLCHAIN_DIRS:
-        _bind_ro(bwrap_args, home / rel)
+    toolchain_binds = _resolve_toolchain_binds(home)
+    for p in toolchain_binds:
+        _bind_ro(bwrap_args, p)
 
     # Mask credential-bearing paths *after* the broader binds above so they
-    # take precedence at the same mount point (bwrap applies binds in order).
+    # take precedence at the same mount point (bwrap applies binds in order)
+    # — defense in depth on top of the allow-list, see module docstring.
     for rel in _HOME_MASK_FILES:
         p = home / rel
         if p.is_file():
@@ -102,12 +187,20 @@ def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path) -> lis
     bwrap_args += ["--bind", str(scratch_home), str(scratch_home)]
     bwrap_args += ["--bind", str(repo), str(repo)]
     bwrap_args += ["--chdir", str(repo)]
-    bwrap_args += ["--unshare-net", "--unshare-uts", "--unshare-ipc", "--die-with-parent"]
+    bwrap_args += [
+        "--unshare-net",
+        "--unshare-uts",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--new-session",
+        "--die-with-parent",
+    ]
 
     for name in _FORWARDED_ENV:
         value = os.environ.get(name)
         if value is not None:
             bwrap_args += ["--setenv", name, value]
+    bwrap_args += ["--setenv", "PATH", _build_sandboxed_path([*toolchain_binds, *(Path(d) for d in _SYSTEM_RO_DIRS)])]
 
     bwrap_args += ["--setenv", "HOME", str(scratch_home)]
     bwrap_args += ["--setenv", "TMPDIR", str(scratch_home)]
@@ -115,20 +208,47 @@ def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path) -> lis
     bwrap_args += ["--setenv", "npm_config_cache", str(scratch_home / "npm-cache")]
     bwrap_args += ["--setenv", "UV_CACHE_DIR", str(scratch_home / "uv-cache")]
     bwrap_args += ["--setenv", "PIP_CACHE_DIR", str(scratch_home / "pip-cache")]
-    bwrap_args += ["--setenv", "GOPATH", str(scratch_home / "go")]
     bwrap_args += ["--setenv", "GOCACHE", str(scratch_home / "go-cache")]
     bwrap_args += ["--setenv", "GOFLAGS", "-mod=mod"]
     bwrap_args += ["--setenv", "CARGO_TARGET_DIR", str(repo / "target")]
-    # cargo/rustup resolve their state via $HOME/.cargo, $HOME/.rustup by
-    # default; HOME is overridden to the scratch dir above, so re-point
-    # these explicitly at the real (read-only-bound) toolchain dirs rather
-    # than silently failing to find them under the scratch HOME.
+    # cargo/rustup/go resolve their state via $HOME/.cargo, $HOME/.rustup,
+    # $HOME/go by default; HOME is overridden to the scratch dir above, so
+    # each is re-pointed explicitly at the real (read-only-bound) toolchain
+    # path rather than silently failing to find it under the scratch HOME —
+    # this exact bug was caught for cargo/rustup by actually running a real
+    # build; GOPATH's equivalent was found only by review since no `go`
+    # toolchain exists in this development environment to verify it live.
     if (home / ".cargo").is_dir():
         bwrap_args += ["--setenv", "CARGO_HOME", str(home / ".cargo")]
     if (home / ".rustup").is_dir():
         bwrap_args += ["--setenv", "RUSTUP_HOME", str(home / ".rustup")]
+    if (home / "go").is_dir():
+        # GOPATH's module cache (pkg/mod) is read-only-bound above; GOPATH
+        # itself must point at the real path for `go` to find it there.
+        # GOCACHE (build output, not the module cache) stays in scratch.
+        bwrap_args += ["--setenv", "GOPATH", str(home / "go")]
+    else:
+        bwrap_args += ["--setenv", "GOPATH", str(scratch_home / "go")]
+
+    real_argv = argv
+    bash = shutil.which("bash")
+    if bash is not None:
+        # bwrap has no --rlimit flag; cap process count via the shell's
+        # ulimit as a coarse anti-forkbomb backstop (see module docstring).
+        # /bin/sh on this platform (dash) doesn't support `ulimit -u` —
+        # confirmed by testing; bash does.
+        real_argv = [
+            bash,
+            "-c",
+            f'ulimit -u {_MAX_SANDBOX_PROCS} 2>/dev/null; exec "$@"',
+            "sandboxed-command",
+            *argv,
+        ]
+    else:
+        logger.warning("bash not found; sandboxed execution will not have a process-count limit applied")
+
     bwrap_args += ["--"]
-    bwrap_args += argv
+    bwrap_args += real_argv
     return bwrap_args
 
 
