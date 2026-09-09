@@ -314,10 +314,20 @@ async def test_waiver_does_not_survive_criterion_content_change_across_revision(
 
 async def test_restart_reuses_criterion_results(tmp_path: Path):
     """Scenario 12: restart neither duplicates check runs nor skips criteria."""
-    counter = tmp_path / "probe-count.txt"
-    probe_script = 'node -e \'require("fs").appendFileSync(' + json.dumps(str(counter)) + ',"x")\''
+    # Counter must live inside the target repo, not just tmp_path: verify
+    # commands now run sandboxed, confined to the repo directory — a write
+    # to any path outside it (this used to be an absolute tmp_path path) is
+    # correctly rejected, same as it would be for a real escape attempt.
+    probe_script = 'node -e \'require("fs").appendFileSync("probe-count.txt","x")\''
     plan = _plan_with_verify("npm run probe")
     orch, pid = await _run_with_plan(tmp_path, plan, extra_scripts={"probe": probe_script})
+    target = orch.db.get("projects", orch.db.get("product_projects", pid)["target_project_id"])
+    repo = Path(target["path"])
+    counter = repo / "probe-count.txt"
+    # Gitignored: the probe's side-effect file must not itself perturb the
+    # repo's checkpointed SHA (which the restart-reuse cache below keys on)
+    # — it's an out-of-band test probe, not part of the product being built.
+    (repo / ".gitignore").write_text("probe-count.txt\n")
     project = await drive_project(orch, pid)
     assert project["state"] == "DELIVERED", project.get("blocking_reason")
     assert counter.read_text() == "xx"  # one run per criterion

@@ -1,57 +1,24 @@
 """Unit tests for the criterion/gate-validation command allowlist.
 
-Regression coverage for the RCE hardening. Three prior rounds of a
-denylist-of-dangerous-flags design were each defeated by a new bypass class;
-this suite locks in the fixed-shape allowlist that replaced it, including
-every bypass string proven live against the earlier designs.
+Regression coverage for the RCE hardening. Several rounds of a
+denylist-of-dangerous-flags design, then a manifest-content-enumeration
+design (go.mod/Cargo.toml/package.json parsed for escape-capable
+directives), were each defeated by a new bypass class — two independent
+adversarial reviews converged on "hand-enumerating manifest fields has no
+natural stopping point." This suite locks in what's left of the static
+argv-shape checks (a cheap pre-filter, not the safety boundary) plus every
+bypass string proven live against the earlier designs; the actual
+containment boundary (OS-level sandboxing) is covered separately in
+test_sandbox.py.
 """
 
 from __future__ import annotations
 
-import json
-import re
 from pathlib import Path
 
 import pytest
 
 from orchestrator.criterion import confined_to_repo, is_executable_command, run_check_command
-from orchestrator.process import ProcessResult
-
-
-def _parse_go_mod_replaces_for_test(text: str) -> list[dict]:
-    """Test-only stand-in for what `go mod edit -json` would report for the
-    simple go.mod fixtures below — mirrors go.mod's quoting rules (a single
-    matching pair of `"..."` or backticks around a target is stripped) and
-    the module-vs-filesystem distinction (a `path version` pair is a module
-    replace; anything else is a filesystem path)."""
-    replaces = []
-    for line in text.splitlines():
-        line = line.split("//", 1)[0].strip()  # real go.mod parsing ignores // comments
-        if "=>" not in line:
-            continue
-        target = line.split("=>", 1)[1].strip()
-        if len(target) >= 2 and target[0] == target[-1] and target[0] in ('"', "`"):
-            target = target[1:-1]
-        parts = target.split()
-        if len(parts) == 2 and re.match(r"^v[0-9]", parts[1]):
-            replaces.append({"New": {"Path": parts[0], "Version": parts[1]}})
-        else:
-            replaces.append({"New": {"Path": target, "Version": ""}})
-    return replaces
-
-
-def _install_fake_go_mod_edit_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Patch criterion.run_process so `_go_manifest_confined` can be tested
-    without a real `go` binary (none installed in this sandbox) — this tests
-    our own JSON-consumption and containment logic, not go's own parser."""
-
-    async def fake_run_process(argv, cwd, timeout_s=None, **kwargs):
-        go_mod = Path(cwd) / "go.mod"
-        replaces = _parse_go_mod_replaces_for_test(go_mod.read_text())
-        payload = json.dumps({"Replace": replaces})
-        return ProcessResult(exit_code=0, timed_out=False, cancelled=False, duration_s=0.0, stdout_tail=[payload])
-
-    monkeypatch.setattr("orchestrator.criterion.run_process", fake_run_process)
 
 
 def test_plain_allowlisted_command_passes():
@@ -273,34 +240,38 @@ def test_uv_run_bare_path_rejected():
 
 
 # -- confined_to_repo: real-filesystem containment, including symlinks -----
+#
+# This is a cheap pre-filter (sync, no subprocess involved) re-checking the
+# argv path token — not the safety boundary. See test_sandbox.py for the
+# containment proofs that actually matter (manifest-driven escapes, which
+# this function structurally cannot catch — that's the point of moving
+# enforcement into the sandbox instead of chasing manifest formats).
 
 
-async def test_confined_to_repo_accepts_in_repo_path(tmp_path: Path):
+def test_confined_to_repo_accepts_in_repo_path(tmp_path: Path):
     (tmp_path / "checks").mkdir()
     (tmp_path / "checks" / "probe.js").write_text("")
-    assert await confined_to_repo("node checks/probe.js", tmp_path) is True
+    assert confined_to_repo("node checks/probe.js", tmp_path) is True
 
 
-async def test_confined_to_repo_rejects_symlink_escaping_repo(tmp_path: Path):
+def test_confined_to_repo_rejects_symlink_escaping_repo(tmp_path: Path):
     outside = tmp_path.parent / "outside_evil.js"
     outside.write_text("")
     try:
         link = tmp_path / "escape.js"
         link.symlink_to(outside)
-        assert await confined_to_repo("node escape.js", tmp_path) is False
+        assert confined_to_repo("node escape.js", tmp_path) is False
     finally:
         outside.unlink(missing_ok=True)
 
 
-async def test_confined_to_repo_rejects_command_that_fails_shape_match():
-    assert await confined_to_repo("bash -c 'id'", Path(".")) is False
+def test_confined_to_repo_rejects_command_that_fails_shape_match():
+    assert confined_to_repo("bash -c 'id'", Path(".")) is False
 
 
 @pytest.mark.parametrize("target", ["./...", "."])
-async def test_confined_to_repo_handles_go_special_targets(tmp_path: Path, target: str):
-    # No go.mod present — _go_manifest_confined short-circuits before ever
-    # calling run_process, so no fake/mock is needed for this one.
-    assert await confined_to_repo(f"go test {target}", tmp_path) is True
+def test_confined_to_repo_handles_go_special_targets(tmp_path: Path, target: str):
+    assert confined_to_repo(f"go test {target}", tmp_path) is True
 
 
 # -- end-to-end proof for the two live RCEs proven against round 4 ---------
@@ -330,132 +301,6 @@ async def test_python_dash_m_attached_flag_never_executes(tmp_path: Path):
     assert not marker.exists(), "payload executed despite rejection"
 
 
-# -- manifest-driven repo-confinement escape (go.mod replace / Cargo.toml
-# [patch]/path deps / package.json file:|link: deps) — defense in depth on
-# top of the argv path check, since these let the toolchain read/execute
-# content outside the repo the argv path was already confined to, via
-# manifest content rather than argv. Parsed with real parsers (go mod edit
-# -json / tomllib / json.loads), never regex — a regex-based first attempt
-# at this check was itself bypassed via single-quoted TOML strings, a bare
-# Cargo path containing "..", and quoted go.mod replace targets (see the
-# quoted/backtick and single-quote/bare-path tests below). --
-
-
-async def test_go_mod_replace_escaping_repo_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    _install_fake_go_mod_edit_json(monkeypatch)
-    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace example.com/x => ../../../../tmp/evil\n")
-    assert await confined_to_repo("go test ./...", tmp_path) is False
-    assert await confined_to_repo("go build ./...", tmp_path) is False
-    assert await confined_to_repo("go run .", tmp_path) is False
-
-
-async def test_go_mod_replace_absolute_path_escaping_repo_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    _install_fake_go_mod_edit_json(monkeypatch)
-    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace example.com/x => /etc\n")
-    assert await confined_to_repo("go test ./...", tmp_path) is False
-
-
-async def test_go_mod_replace_block_form_escaping_repo_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    _install_fake_go_mod_edit_json(monkeypatch)
-    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace (\n\texample.com/x => ../../outside\n)\n")
-    assert await confined_to_repo("go test ./...", tmp_path) is False
-
-
-async def test_go_mod_replace_quoted_target_escaping_repo_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    # go.mod's grammar treats quoted and unquoted replace targets as
-    # identical — "identifiers and strings are interchangeable." A naive
-    # regex that captured the quote characters as part of the token treated
-    # this as a harmless bare module reference instead of a path escape.
-    _install_fake_go_mod_edit_json(monkeypatch)
-    (tmp_path / "go.mod").write_text('module example.com/x\n\nreplace example.com/x => "../../../../tmp/evil"\n')
-    assert await confined_to_repo("go test ./...", tmp_path) is False
-
-
-async def test_go_mod_replace_backtick_quoted_absolute_target_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    _install_fake_go_mod_edit_json(monkeypatch)
-    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace example.com/x => `/etc/evil`\n")
-    assert await confined_to_repo("go test ./...", tmp_path) is False
-
-
-async def test_go_mod_replace_in_repo_path_still_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    _install_fake_go_mod_edit_json(monkeypatch)
-    (tmp_path / "internal" / "foo").mkdir(parents=True)
-    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace example.com/foo => ./internal/foo\n")
-    assert await confined_to_repo("go test ./...", tmp_path) is True
-
-
-async def test_go_mod_replace_module_version_target_not_a_path_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    _install_fake_go_mod_edit_json(monkeypatch)
-    (tmp_path / "go.mod").write_text("module example.com/x\n\nreplace example.com/foo => example.com/bar v1.2.3\n")
-    assert await confined_to_repo("go test ./...", tmp_path) is True
-
-
-async def test_go_mod_comment_only_replace_mention_not_a_false_positive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    # A real parser (go mod edit -json) never sees comment text at all, so a
-    # historical/example "replace" mentioned only in a // comment can't
-    # trigger a false-positive rejection the way the earlier regex-scan
-    # design's raw-text scan could have.
-    _install_fake_go_mod_edit_json(monkeypatch)
-    (tmp_path / "go.mod").write_text("module example.com/x\n\n// historically: replace example.com/x => ../outside\n")
-    assert await confined_to_repo("go test ./...", tmp_path) is True
-
-
-async def test_go_test_with_no_go_mod_is_unaffected(tmp_path: Path):
-    # No go.mod present — _go_manifest_confined short-circuits before ever
-    # calling run_process, so no fake/mock is needed for this one.
-    assert await confined_to_repo("go test ./...", tmp_path) is True
-
-
-async def test_go_mod_edit_json_failure_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    async def failing_run_process(argv, cwd, timeout_s=None, **kwargs):
-        return ProcessResult(exit_code=1, timed_out=False, cancelled=False, duration_s=0.0, stderr_tail=["no go.mod"])
-
-    monkeypatch.setattr("orchestrator.criterion.run_process", failing_run_process)
-    (tmp_path / "go.mod").write_text("module example.com/x\n")
-    assert await confined_to_repo("go test ./...", tmp_path) is False
-
-
-async def test_cargo_patch_escaping_repo_rejected(tmp_path: Path):
-    (tmp_path / "Cargo.toml").write_text(
-        '[package]\nname = "x"\n\n[patch.crates-io]\nfoo = { path = "../../../../tmp/evil" }\n'
-    )
-    assert await confined_to_repo("cargo test", tmp_path) is False
-    assert await confined_to_repo("cargo build", tmp_path) is False
-
-
-async def test_cargo_path_dependency_escaping_repo_rejected(tmp_path: Path):
-    (tmp_path / "Cargo.toml").write_text('[dependencies]\nfoo = { path = "/etc/evil" }\n')
-    assert await confined_to_repo("cargo test", tmp_path) is False
-
-
-async def test_cargo_path_dependency_single_quoted_escaping_repo_rejected(tmp_path: Path):
-    # TOML literal strings (single-quoted) are just as valid as basic
-    # (double-quoted) strings — a regex matching only `"..."` missed this.
-    (tmp_path / "Cargo.toml").write_text("[dependencies]\nfoo = { path = '../../../../tmp/evil' }\n")
-    assert await confined_to_repo("cargo test", tmp_path) is False
-
-
-async def test_cargo_path_dependency_bare_with_traversal_rejected(tmp_path: Path):
-    # Every Cargo `path=` value is always a filesystem path — there's no
-    # "bare module reference" concept to exempt it from the traversal check
-    # the way go.mod's bare module paths legitimately are.
-    (tmp_path / "Cargo.toml").write_text('[dependencies]\nfoo = { path = "sub/../../../../tmp/evil" }\n')
-    assert await confined_to_repo("cargo build", tmp_path) is False
-
-
-async def test_cargo_path_dependency_in_repo_still_allowed(tmp_path: Path):
-    (tmp_path / "crates" / "foo").mkdir(parents=True)
-    (tmp_path / "Cargo.toml").write_text('[dependencies]\nfoo = { path = "crates/foo" }\n')
-    assert await confined_to_repo("cargo test", tmp_path) is True
-
-
-async def test_cargo_toml_malformed_fails_closed(tmp_path: Path):
-    (tmp_path / "Cargo.toml").write_text("this is not [ valid toml")
-    assert await confined_to_repo("cargo test", tmp_path) is False
-
-
 async def test_node_require_attached_flag_never_executes(tmp_path: Path):
     marker = tmp_path / "pwned.txt"
     (tmp_path / "py.js").write_text(f"require('fs').writeFileSync({marker.as_posix()!r}, 'MALICIOUS py.js EXECUTED')\n")
@@ -468,37 +313,3 @@ async def test_node_require_attached_flag_never_executes(tmp_path: Path):
     assert exit_code is None
     assert "resolves outside" in tail or "path argument" in tail
     assert not marker.exists(), "payload executed despite rejection"
-
-
-# -- package.json file:/link: dependency escape (npm install/ci/run all
-# share this indirection — a postinstall script in such a package runs
-# during `npm install`, outside the repo the argv path was confined to). --
-
-
-async def test_npm_file_dependency_escaping_repo_rejected(tmp_path: Path):
-    manifest = {"name": "x", "dependencies": {"evil-pkg": "file:../outside/evil-pkg"}}
-    (tmp_path / "package.json").write_text(json.dumps(manifest))
-    assert await confined_to_repo("npm install", tmp_path) is False
-    assert await confined_to_repo("npm ci", tmp_path) is False
-
-
-async def test_npm_link_dev_dependency_escaping_repo_rejected(tmp_path: Path):
-    manifest = {"name": "x", "devDependencies": {"evil-pkg": "link:/tmp/evil-pkg"}}
-    (tmp_path / "package.json").write_text(json.dumps(manifest))
-    assert await confined_to_repo("npm test", tmp_path) is False
-
-
-async def test_npm_file_dependency_in_repo_still_allowed(tmp_path: Path):
-    (tmp_path / "local-pkg").mkdir()
-    manifest = {"name": "x", "dependencies": {"local-pkg": "file:./local-pkg"}}
-    (tmp_path / "package.json").write_text(json.dumps(manifest))
-    assert await confined_to_repo("npm install", tmp_path) is True
-
-
-async def test_npm_no_package_json_is_unaffected(tmp_path: Path):
-    assert await confined_to_repo("npm test", tmp_path) is True
-
-
-async def test_npm_malformed_package_json_fails_closed(tmp_path: Path):
-    (tmp_path / "package.json").write_text("{not valid json")
-    assert await confined_to_repo("npm test", tmp_path) is False
