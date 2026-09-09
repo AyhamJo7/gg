@@ -244,11 +244,17 @@ class ProjectCoordinator:
         """Record an authorized acceptance waiver (auditable, versioned).
 
         A waiver excuses one criterion or finding from the DELIVERED gate.
-        It records who authorized it, why, and under which plan revision —
-        never silently, never retroactively editable. It is also bound to the
-        exact content of the target at creation time: a later plan revision
-        that reuses the same criterion id for a different check must not
-        silently inherit this waiver (see _waived_targets).
+        It records why and under which plan revision — never silently, never
+        retroactively editable. It is also bound to the exact content of the
+        target at creation time: a later plan revision that reuses the same
+        criterion id for a different check must not silently inherit this
+        waiver (see _waived_targets).
+
+        `actor` is a self-reported label for the audit trail, not a verified
+        identity — this tool authenticates callers with one shared bearer
+        token (see api/auth.py), which proves "holds the token," not "is a
+        specific person." Anyone able to call this endpoint can set `actor`
+        to any string. Treat it as a note, never as a security control.
         """
         async with self._advance_lock:
             row = self.db.get("product_projects", project_id)

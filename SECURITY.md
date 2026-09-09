@@ -48,6 +48,18 @@ operations, and workspace escape.
 - Backend binds to `127.0.0.1` only. CORS allows the Vite dev origin and Tauri.
 - Zero telemetry. Analytics are computed from the local database.
 - WebSocket streams redacted lines only.
+- Mutating HTTP routes (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/`) and both
+  WebSocket routes require a shared-secret bearer token, generated once per
+  checkout and persisted to `.orchestrator/auth_token` (0600). There is no
+  network route to fetch it — the frontend gets it out-of-band (Vite embeds
+  it at dev/build time; the Tauri shell reads the file via IPC) — see
+  `backend/src/orchestrator/api/auth.py`.
+- This is deliberate, not exhaustive: **`GET` routes stay unauthenticated by
+  design**, reachable by any local process on the machine (the trust model
+  this whole tool already assumes — see Threat model above). Treat the
+  token as raising "anything on the machine can call these routes" to
+  "anything that can read this user's files," not as isolating GG from
+  other locally-running software.
 
 ### Provider autonomy
 - CLIs run with permission bypass flags **inside the user-selected workspace** —
@@ -58,8 +70,15 @@ operations, and workspace escape.
 
 ## Known limitations
 
-- The HTTP API has no authentication (localhost-only by design). Do not expose
-  the port or run behind a reverse proxy without adding auth.
+- `GET` routes and the bearer token itself are not hardened against other
+  local processes reading the token file — a compromised local dependency
+  with filesystem access can still read `.orchestrator/auth_token` and call
+  any route. The token stops a blind network caller, not a co-resident
+  attacker with file access; do not expose the port or run behind a reverse
+  proxy without a stronger auth layer than this single-operator scheme.
+- The `actor` field on acceptance waivers is a self-reported audit label,
+  not a verified identity — the shared bearer token proves "holds the
+  token," not "is a specific person."
 - CLI sandboxing differs per provider (codex: `workspace-write` sandbox; claude/agy/
   opencode: permission-bypass in the workspace). Review generated changes in the
   Git ledger — that is what it is for.

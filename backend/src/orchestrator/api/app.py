@@ -81,6 +81,9 @@ class WaiverRequest(BaseModel):
     target_kind: str
     target_id: str
     reason: str
+    # Self-reported label for the audit trail, not a verified identity — the
+    # bearer token proves "holds the token," not "is a specific person."
+    # Anyone able to call this route can set this to any string.
     actor: str = "operator"
 
 
