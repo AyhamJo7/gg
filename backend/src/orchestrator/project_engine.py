@@ -47,7 +47,6 @@ from .models import (
     Role,
     utcnow,
 )
-from .process import run_process
 from .product_plan import (
     AcceptanceCriterion,
     ProductPlan,
@@ -1510,11 +1509,20 @@ RULES:
             return clone if proc.returncode == 0 else None
 
         async def _install(cmd: list[str], cwd: Path) -> tuple[bool, str]:
-            # Routed through run_process (not subprocess.run): redacts secrets
-            # from captured output before it is ever persisted/rendered, and
-            # tree-kills the whole process group on timeout instead of leaving
-            # orphaned native-build children running past the deadline.
-            result = await run_process(cmd, cwd=cwd, timeout_s=600)
+            # Sandboxed (network-enabled) rather than a plain run_process
+            # call: this installs dependencies for a freshly-cloned,
+            # potentially AI-generated repo, and package manifests (a
+            # malicious pyproject.toml build backend, an npm postinstall
+            # script) are exactly the attacker-influenceable content this
+            # whole sandbox mechanism exists to contain. Install genuinely
+            # needs network access to reach a registry — see
+            # sandbox.build_sandboxed_argv's docstring for exactly what
+            # allow_network=True does and does not confine. Fails closed
+            # (refuses to install) if bwrap isn't available, matching every
+            # other sandboxed call site in this codebase.
+            if not sandbox_available():
+                return False, "sandboxed execution unavailable on this platform — bubblewrap (bwrap) not found"
+            result = await run_sandboxed(cmd, cwd, timeout_s=600, allow_network=True)
             return result.exit_code == 0, result.combined_tail[-1500:]
 
         tmp_root: Path | None = None

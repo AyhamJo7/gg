@@ -154,29 +154,43 @@ def _guard_repo_not_home(repo: Path) -> None:
         raise ValueError(f"refusing to sandbox with repo={resolved_repo}: overlaps the real home directory boundary")
 
 
-def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path) -> list[str]:
+def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path, allow_network: bool = False) -> list[str]:
     """Wrap `argv` in a bwrap invocation confined to `repo` (read-write) plus a
-    minimal read-only system/toolchain view, with no network. `scratch_home`
-    is a fresh, per-invocation writable directory the caller creates and
-    cleans up (see `run_sandboxed`); it becomes the sandboxed HOME.
+    minimal read-only system/toolchain view. `scratch_home` is a fresh,
+    per-invocation writable directory the caller creates and cleans up (see
+    `run_sandboxed`); it becomes the sandboxed HOME.
+
+    `allow_network=True` omits `--unshare-net` — the one confinement a
+    dependency-install step cannot run without (it must reach a package
+    registry) — while every other boundary (PID/IPC/UTS isolation,
+    --clearenv, the credential-masked toolchain allow-list, no real-$HOME
+    exposure, the ulimit forkbomb backstop) stays identical. This does not
+    scope *which* network destinations are reachable, and the installed
+    package's own content can still be exfiltrated over that network
+    (inherent to needing network for install at all) — see SECURITY.md for
+    the full honest statement of what this mode does and doesn't contain.
     """
     _guard_repo_not_home(repo)
     home = Path.home()
     bwrap_args: list[str] = [BWRAP, "--clearenv"]
 
-    for d in _SYSTEM_RO_DIRS:
-        _bind_ro(bwrap_args, Path(d))
-
-    # Generic mount points first — /proc, /dev, and a fresh empty /tmp are
-    # broad, low-specificity mounts. Every bind below this point must come
-    # *after* them: bwrap applies binds in argv order, and a later bind
-    # completely remounts over an earlier one nested inside it. Getting this
-    # backwards is silent and only bites when some later, more specific bind
-    # target happens to be a subpath of /tmp (real $HOME never is, but this
+    # Generic mount points come first, before ANY specific bind (including
+    # the system dirs immediately below) — this is a structural guarantee,
+    # not a convention to remember at each new bind site: /proc, /dev, and a
+    # fresh empty /tmp are broad, low-specificity mounts, and bwrap applies
+    # binds in argv order — a later bind completely remounts over an earlier
+    # one nested inside it. Placing these three literally first means no
+    # future specific bind, wherever it's added below, can ever be silently
+    # wiped by them regardless of its target path. Getting this backwards is
+    # silent and only bites when some later, more specific bind target
+    # happens to be a subpath of /tmp (real $HOME never is, but this
     # ordering bug is worth being correct about on its own terms, not just
-    # because it happened to be caught by a test using a tmp_path-based
+    # because it happened to be caught once by a test using a tmp_path-based
     # fixture home).
     bwrap_args += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]  # noqa: S108 - sandbox mount point, not a real temp-file use
+
+    for d in _SYSTEM_RO_DIRS:
+        _bind_ro(bwrap_args, Path(d))
 
     toolchain_binds = _resolve_toolchain_binds(home)
     for p in toolchain_binds:
@@ -198,13 +212,14 @@ def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path) -> lis
     bwrap_args += ["--bind", str(repo), str(repo)]
     bwrap_args += ["--chdir", str(repo)]
     bwrap_args += [
-        "--unshare-net",
         "--unshare-uts",
         "--unshare-ipc",
         "--unshare-pid",
         "--new-session",
         "--die-with-parent",
     ]
+    if not allow_network:
+        bwrap_args += ["--unshare-net"]
 
     for name in _FORWARDED_ENV:
         value = os.environ.get(name)
@@ -270,10 +285,15 @@ async def run_sandboxed(
     stdout_path: Path | None = None,
     stderr_path: Path | None = None,
     cancel_event: asyncio.Event | None = None,
+    allow_network: bool = False,
 ) -> ProcessResult:
     """Run `argv` confined to `repo` via bwrap. Caller must check
     `sandbox_available()` first — this raises if bwrap is missing rather
     than silently running unsandboxed.
+
+    `allow_network=True` is for the dependency-install step only — see
+    `build_sandboxed_argv`'s docstring for exactly what that does and does
+    not contain. Every other caller should leave this False.
     """
     if not sandbox_available():
         raise RuntimeError("sandboxed execution unavailable: bubblewrap (bwrap) not found on this system")
@@ -282,7 +302,7 @@ async def run_sandboxed(
     try:
         for sub in ("cache", "npm-cache", "uv-cache", "pip-cache", "go", "go-cache"):
             (scratch / sub).mkdir(parents=True, exist_ok=True)
-        sandboxed_argv = build_sandboxed_argv(argv, repo, scratch)
+        sandboxed_argv = build_sandboxed_argv(argv, repo, scratch, allow_network=allow_network)
         return await run_process(
             sandboxed_argv,
             cwd=repo,

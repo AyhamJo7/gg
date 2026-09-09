@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from conftest import make_config
 from orchestrator.db import Database
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.providers.fake import FakeAdapter, PlanProvider, default_test_plan, gated_test_plan
+from orchestrator.sandbox import sandbox_available
 
 TERMINAL = {"COMPLETED", "FAILED", "UNVERIFIED", "CANCELLED"}
 
@@ -433,6 +435,71 @@ async def test_fresh_checkout_installs_and_reproduces(tmp_path: Path):
     assert ok is True, detail
     assert "npm install ok" in detail
     await orch.shutdown()
+
+
+@pytest.mark.skipif(not sandbox_available(), reason="bubblewrap (bwrap) not installed")
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv not installed")
+async def test_fresh_checkout_install_escape_is_contained(tmp_path: Path):
+    """A malicious PEP 517 build backend in the accepted SHA's own pyproject.toml
+    cannot escape the sandbox during _fresh_checkout_verify's install step.
+
+    Regression for the round-9 finding: `_install` used to call run_process
+    directly (full ambient env, no sandbox) — a build backend hook could read/
+    write anything the real orchestrator process could. Proven exploitable
+    pre-fix by manually reproducing this exact scenario outside the sandbox:
+    the hook wrote a real marker file into the real $HOME. This test proves
+    the now-sandboxed _install path contains that same attempt.
+    """
+    import subprocess as _subprocess  # noqa: ASYNC221 - test scaffolding, sync context ok
+
+    orch = await make_orch(tmp_path, standard_adapters())
+    repo = tmp_path / "freshrepo"
+    repo.mkdir()
+
+    pkg = repo / "evil_backend_pkg"
+    pkg.mkdir()
+    (pkg / "evil_backend.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "def build_editable(wheel_directory, config_settings=None, metadata_directory=None):\n"
+        "    marker = Path(os.environ.get('HOME', '/')) / 'MARKER_ESCAPED_HOME'\n"
+        "    try:\n"
+        "        marker.write_text('pwned-outside-home')\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    Path('BUILD_HOOK_RAN.txt').write_text('yes')\n"
+        "    raise SystemExit('intentional-stop-after-proof')\n"
+        "def get_requires_for_build_editable(config_settings=None):\n"
+        "    return []\n"
+    )
+    (pkg / "pyproject.toml").write_text(
+        '[project]\nname = "evil-pkg"\nversion = "0.1.0"\n\n'
+        '[build-system]\nrequires = []\nbuild-backend = "evil_backend"\nbackend-path = ["."]\n'
+    )
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "fresh"\nversion = "0.1.0"\nrequires-python = ">=3.12"\n'
+        'dependencies = ["evil-pkg"]\n\n'
+        '[tool.uv.sources]\nevil-pkg = { path = "evil_backend_pkg", editable = true }\n'
+    )
+    _subprocess.run(["uv", "lock"], cwd=repo, check=True, capture_output=True)  # noqa: ASYNC221
+    _subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: ASYNC221
+    _subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)  # noqa: ASYNC221
+    _subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)  # noqa: ASYNC221
+    sha = _subprocess.run(  # noqa: ASYNC221
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+
+    real_home_marker = Path.home() / "MARKER_ESCAPED_HOME"
+    assert not real_home_marker.exists(), "pre-existing marker from a prior failed run — remove before re-testing"
+    try:
+        ok, detail = await orch.coordinator._fresh_checkout_verify(repo, sha)
+        # The build backend deliberately fails (SystemExit), so install fails —
+        # what matters is that its escape attempt landed nowhere real.
+        assert ok is False, detail
+        assert not real_home_marker.exists(), "build backend escaped the sandbox and wrote into the real $HOME"
+    finally:
+        real_home_marker.unlink(missing_ok=True)
+        await orch.shutdown()
 
 
 async def test_cancel_and_retry_phase(tmp_path: Path):
