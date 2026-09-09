@@ -57,6 +57,7 @@ from .product_plan import (
     validate_product_plan,
 )
 from .providers.base import ExecutionRequest, ExecutionResult
+from .sandbox import run_sandboxed, sandbox_available
 from .security import redact, validate_workspace_path
 from .verify import run_verification
 from .workspace import inspect_workspace
@@ -1265,10 +1266,12 @@ RULES:
         ok, safe_command = is_executable_command(command)
         if not ok:
             return False
-        if not await confined_to_repo(safe_command, repo):
+        if not confined_to_repo(safe_command, repo):
+            return False
+        if not sandbox_available():
             return False
         argv = shlex.split(safe_command)
-        result = await run_process(argv, cwd=repo, timeout_s=120)
+        result = await run_sandboxed(argv, repo, timeout_s=120)
         return result.exit_code == 0
 
     async def _evaluate_requirement_criteria_locked(
