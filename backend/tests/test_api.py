@@ -184,8 +184,9 @@ async def test_websocket_replays_history(client: httpx.AsyncClient, workspace: P
     project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
     mission = orch.create_mission(project["id"], "m", "t", "AUTONOMOUS", "balanced")
 
+    app = client.app  # type: ignore[attr-defined]
     with TestClient(client._transport.app) as tc:  # type: ignore[union-attr]
-        with tc.websocket_connect(f"/ws/missions/{mission['id']}") as ws:
+        with tc.websocket_connect(f"/ws/missions/{mission['id']}?token={app.state.auth_token}") as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "MISSION_CREATED"
 
@@ -221,17 +222,58 @@ async def test_f13_websocket_origin_check(client: httpx.AsyncClient, workspace: 
     project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
     mission = orch.create_mission(project["id"], "m", "t", "AUTONOMOUS", "balanced")
 
+    app = client.app  # type: ignore[attr-defined]
+    token = app.state.auth_token
     with TestClient(client._transport.app) as tc:  # type: ignore[union-attr]
         # Untrusted origin rejected with 1008
         try:
-            with tc.websocket_connect(f"/ws/missions/{mission['id']}", headers={"origin": "http://evil.example"}) as ws:
+            with tc.websocket_connect(
+                f"/ws/missions/{mission['id']}?token={token}", headers={"origin": "http://evil.example"}
+            ) as ws:
                 ws.receive_text()
                 pytest.fail("untrusted origin was accepted")
         except WebSocketDisconnect as exc:
             assert exc.code == 1008
 
         # Trusted origin accepted
-        with tc.websocket_connect(f"/ws/missions/{mission['id']}", headers={"origin": "http://localhost:5173"}) as ws:
+        with tc.websocket_connect(
+            f"/ws/missions/{mission['id']}?token={token}", headers={"origin": "http://localhost:5173"}
+        ) as ws:
+            first = json.loads(ws.receive_text())
+            assert first["type"] == "MISSION_CREATED"
+
+
+async def test_websocket_requires_token(client: httpx.AsyncClient, workspace: Path):
+    """F-LIFE-01 hardening: the pre-existing Origin check is skipped when
+    Origin is absent (any non-browser client) — the token check must still
+    reject the connection in that case, and accept it with a valid token."""
+    from starlette.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    orch = client.orchestrator  # type: ignore[attr-defined]
+    app = client.app  # type: ignore[attr-defined]
+    project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
+    mission = orch.create_mission(project["id"], "m", "t", "AUTONOMOUS", "balanced")
+
+    with TestClient(client._transport.app) as tc:  # type: ignore[union-attr]
+        # No token at all — a raw non-browser client sends no Origin either.
+        try:
+            with tc.websocket_connect(f"/ws/missions/{mission['id']}") as ws:
+                ws.receive_text()
+                pytest.fail("missing token was accepted")
+        except WebSocketDisconnect as exc:
+            assert exc.code == 1008
+
+        # Wrong token — also rejected.
+        try:
+            with tc.websocket_connect(f"/ws/missions/{mission['id']}?token=wrong") as ws:
+                ws.receive_text()
+                pytest.fail("wrong token was accepted")
+        except WebSocketDisconnect as exc:
+            assert exc.code == 1008
+
+        # Correct token, no Origin header — accepted.
+        with tc.websocket_connect(f"/ws/missions/{mission['id']}?token={app.state.auth_token}") as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "MISSION_CREATED"
 

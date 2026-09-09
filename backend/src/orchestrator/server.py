@@ -23,8 +23,9 @@ def build_orchestrator(
     db = Database(db_path)
     # Merge persisted priorities from settings table
     import json
+
     for row in db.query("SELECT key, value FROM settings WHERE key LIKE 'priority.%'"):
-        role = row["key"][len("priority."):]
+        role = row["key"][len("priority.") :]
         try:
             config.set_priority(role, json.loads(row["value"]))
         except Exception:
@@ -44,6 +45,15 @@ def main() -> None:
     )
     config = Config.load()
     db_path = Path(config.get("database.path", ".orchestrator/orchestrator.db"))
+    if "--init-token-only" in sys.argv[1:]:
+        # Generate (or reuse) the auth token and exit, without starting the
+        # server. Used by `make dev`/`make frontend` to guarantee the token
+        # file exists before the frontend needs to read it — see
+        # frontend/vite.config.ts and Makefile.
+        from .api.auth import load_or_create_token
+
+        load_or_create_token(db_path.parent)
+        return
     orchestrator = build_orchestrator(db_path, config)
     app = create_app(db_path, config, orchestrator)
     port = int(os.environ.get("GG_SERVER_PORT") or config.get("server.port", 8787))

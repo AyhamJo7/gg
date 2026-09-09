@@ -20,7 +20,7 @@ from ..orchestrator import IllegalMissionTransitionError, Orchestrator
 from ..project_engine import ProductValidationError
 from ..security import read_redacted_tail, redact, validate_workspace_path
 from ..workspace import inspect_workspace
-from .auth import AuthMiddleware, load_or_create_token
+from .auth import AuthMiddleware, is_authorized, load_or_create_token
 
 logger = logging.getLogger(__name__)
 
@@ -828,10 +828,23 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return {"status": "ok", "time": utcnow().isoformat()}
 
     # ---------------- websocket ----------------
+    def _ws_token_ok(websocket: WebSocket) -> bool:
+        # The pre-existing Origin check only stops browser clients — it is
+        # skipped entirely when Origin is absent, which any non-browser
+        # client (curl, a script, a compromised local process — exactly the
+        # threat class the REST bearer-token check targets) can simply omit.
+        # WebSocket has no header mechanism from the browser API, so the
+        # token travels as a query param instead.
+        token = websocket.query_params.get("token")
+        return is_authorized(app.state.auth_token, f"Bearer {token}" if token else None)
+
     @app.websocket("/ws/missions/{mission_id}")
     async def mission_ws(websocket: WebSocket, mission_id: str) -> None:
         origin = websocket.headers.get("origin")
         if origin and origin not in ALLOWED_ORIGINS:
+            await websocket.close(code=1008)
+            return
+        if not _ws_token_ok(websocket):
             await websocket.close(code=1008)
             return
         await websocket.accept()
@@ -857,6 +870,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     async def global_ws(websocket: WebSocket) -> None:
         origin = websocket.headers.get("origin")
         if origin and origin not in ALLOWED_ORIGINS:
+            await websocket.close(code=1008)
+            return
+        if not _ws_token_ok(websocket):
             await websocket.close(code=1008)
             return
         await websocket.accept()

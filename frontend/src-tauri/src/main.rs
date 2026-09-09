@@ -29,6 +29,24 @@ fn spawn_backend() -> Option<Child> {
     }
 }
 
+/// Exposed to the frontend via Tauri IPC (`invoke("get_auth_token")`) — not a
+/// network route, so it is unreachable from arbitrary web content the way an
+/// HTTP endpoint would be (see backend/src/orchestrator/api/auth.py, which
+/// deliberately has no such route). `spawn_backend` above does not set
+/// `.current_dir()` on the child, so `gg-backend` inherits this process's cwd
+/// and writes its token file relative to it — reading the same relative path
+/// here always finds it.
+#[tauri::command]
+fn get_auth_token() -> Result<String, String> {
+    let path = std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join(".orchestrator")
+        .join("auth_token");
+    std::fs::read_to_string(&path)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("failed to read auth token at {}: {e}", path.display()))
+}
+
 fn wait_for_health(attempts: u32) -> bool {
     for _ in 0..attempts {
         if let Ok(resp) = ureq::get("http://127.0.0.1:8787/api/health")
@@ -54,6 +72,7 @@ fn main() {
     }
     tauri::Builder::default()
         .manage(BackendState(Mutex::new(backend)))
+        .invoke_handler(tauri::generate_handler![get_auth_token])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
                 let state = window.state::<BackendState>();

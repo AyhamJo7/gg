@@ -10,10 +10,20 @@ generated once and persisted next to the database (0600, gitignored) raises
 that from "anything on the machine" to "anything that can read this user's
 files" — the same trust boundary the rest of GG's local-first design already
 assumes.
+
+There is deliberately no network route to fetch this token (an earlier draft
+had one; any local process could just curl it, defeating the whole scheme).
+The frontend gets it out-of-band instead: the Makefile's `dev`/`backend`
+targets generate the token file before the frontend starts, `vite.config.ts`
+reads it at dev-server/build time and embeds it as `VITE_AUTH_TOKEN`, and the
+Tauri-packaged app reads the same file via Tauri's scoped fs IPC at startup
+— neither path is reachable from arbitrary web content the way a GET route
+would be.
 """
 
 from __future__ import annotations
 
+import os
 import secrets
 from pathlib import Path
 
@@ -22,24 +32,34 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 TOKEN_FILENAME = "auth_token"  # noqa: S105 - a filename, not a credential value
 
-#: Mutating requests under these paths are exempt — the token bootstrap route
-#: itself (chicken-and-egg) and health.
-UNAUTHENTICATED_PATHS = frozenset({"/api/auth/token", "/api/health"})
+#: Mutating requests under these paths are exempt (health only — there is no
+#: token bootstrap route; see docs/token delivery in Makefile/vite.config.ts).
+UNAUTHENTICATED_PATHS = frozenset({"/api/health"})
 
 
 def load_or_create_token(state_dir: Path) -> str:
-    """Return the persistent bearer token, generating one on first run."""
+    """Return the persistent bearer token, generating one on first run.
+
+    Creation is atomic and 0600 from the first syscall (O_CREAT|O_EXCL, mode
+    0o600 passed to open() — not write-then-chmod, which leaves a window
+    where the file exists at the process umask's default mode, typically
+    world/group-readable, and stays that way permanently if the process dies
+    between the two calls). If another process wins the race and creates it
+    first, O_EXCL fails here and the existing token is read instead — never
+    regenerated, so a concurrent first-run never produces two different
+    tokens for the same state dir.
+    """
     state_dir.mkdir(parents=True, exist_ok=True)
     token_path = state_dir / TOKEN_FILENAME
-    try:
-        existing = token_path.read_text().strip()
-    except FileNotFoundError:
-        existing = ""
-    if existing:
-        return existing
     token = secrets.token_urlsafe(32)
-    token_path.write_text(token)
-    token_path.chmod(0o600)
+    try:
+        fd = os.open(token_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return token_path.read_text().strip()
+    try:
+        os.write(fd, token.encode("ascii"))
+    finally:
+        os.close(fd)
     return token
 
 

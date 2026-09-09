@@ -1,13 +1,20 @@
 /** Typed API client. All requests go through Vite's dev proxy in dev,
  * or the backend directly in the Tauri shell. */
 
-const isTauri = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || window.location.origin.startsWith("tauri://"));
+import { getAuthToken, isTauri } from "./auth";
+
 export const BASE: string = (import.meta.env.VITE_API_BASE as string | undefined) ?? (isTauri ? "http://127.0.0.1:8787" : "");
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? "GET").toString().toUpperCase();
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (method !== "GET" && method !== "HEAD") {
+    const token = await getAuthToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }
   const resp = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...init,
+    headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
   });
   if (!resp.ok) {
     const body = await resp.text();
