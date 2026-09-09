@@ -87,3 +87,45 @@ async def test_resolve_gate_rejects_stale_state_after_unlocked_validation(tmp_pa
     assert result["ok"] is False
     assert "no longer open" in result["error"]
     await orch.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_resolve_gate_discards_outcome_if_project_cancelled_mid_validation(tmp_path: Path, monkeypatch):
+    """cancel_project only ever mutates product_projects, never project_gates
+    — so a gate can still read status=='open' after its project turned
+    terminal while validation was running unlocked. The post-validation
+    re-check must catch this via the project's own state, not just the
+    gate's, or a cancelled project gets a stray PRODUCT_GATE_RESOLVED."""
+    orch = await make_orch(tmp_path, standard_adapters())
+    pid = await start_planned_project(tmp_path, orch)
+    gate_id = await _open_action_gate(orch, pid, "run npm test")
+
+    async def fake_run_gate_validation_project_cancelled(self, project_id: str, command: str) -> bool:
+        await orch.coordinator.cancel_project(project_id)
+        return True
+
+    monkeypatch.setattr(
+        type(orch.coordinator),
+        "_run_gate_validation",
+        fake_run_gate_validation_project_cancelled,
+        raising=True,
+    )
+
+    published_gate_resolved = []
+    orig_publish = orch.coordinator.events.publish
+
+    def spy_publish(event_type, *args, **kwargs):
+        if getattr(event_type, "value", event_type) == "PRODUCT_GATE_RESOLVED":
+            published_gate_resolved.append(kwargs.get("gate_id"))
+        return orig_publish(event_type, *args, **kwargs)
+
+    monkeypatch.setattr(orch.coordinator.events, "publish", spy_publish)
+
+    result = await orch.coordinator.resolve_gate(pid, gate_id, "confirmed")
+
+    assert result["ok"] is False
+    assert "no longer active" in result["error"]
+    gate = orch.db.get("project_gates", gate_id)
+    assert gate["status"] == "open"
+    assert published_gate_resolved == []
+    await orch.shutdown()

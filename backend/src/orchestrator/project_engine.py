@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import git_ops
-from .criterion import evaluate_criteria, is_executable_command
+from .criterion import confined_to_repo, evaluate_criteria, is_executable_command
 from .models import (
     ACTIVE_PRODUCT_STATUSES,
     TERMINAL_PHASE_STATUSES,
@@ -1195,6 +1195,14 @@ RULES:
             gate = self.db.get("project_gates", gate_id)
             if not gate or gate["project_id"] != project_id or gate["status"] != "open":
                 return {"ok": False, "error": "gate no longer open — project state changed during validation"}
+            project_row = self.db.get("product_projects", project_id)
+            if not project_row or project_row["state"] in TERMINAL_PRODUCT_STATUSES:
+                # cancel_project/other terminal transitions only ever mutate
+                # product_projects, never project_gates — so the gate itself
+                # can still read status=='open' here even though its project
+                # became terminal while validation ran unlocked. Discard the
+                # outcome rather than resolving a gate for a dead project.
+                return {"ok": False, "error": "project no longer active — validation outcome discarded"}
             if not passed:
                 return {"ok": False, "error": "validation command failed — prerequisite not satisfied"}
             self.db.update(
@@ -1256,6 +1264,8 @@ RULES:
             return False
         ok, safe_command = is_executable_command(command)
         if not ok:
+            return False
+        if not confined_to_repo(safe_command, repo):
             return False
         argv = shlex.split(safe_command)
         result = await run_process(argv, cwd=repo, timeout_s=120)
