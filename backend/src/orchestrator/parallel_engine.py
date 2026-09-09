@@ -592,6 +592,26 @@ class ParallelMissionEngine:
             return sha
         return await git_ops.head_sha(project_path)
 
+    def _prior_findings_context(self) -> str:
+        """List prior findings with stable IDs so the reviewer can re-flag or verify each one."""
+        rows = self.db.query(
+            "SELECT id, severity, status, file, description, fingerprint FROM review_findings "
+            "WHERE mission_id=? AND status IN ('open','repair_attempted') ORDER BY created_at ASC",
+            (self.mission_id,),
+        )
+        if not rows:
+            return ""
+        lines = [
+            "## Prior findings (re-flag if still present, or verify fixed with evidence)",
+            "Omission without verification leaves a finding UNVERIFIED.",
+        ]
+        lines.extend(
+            f"- id={r['id']} fp={r.get('fingerprint') or '-'} [{r['severity']}/{r['status']}] "
+            f"{r['file'] or ''}: {r['description'][:300]}"
+            for r in rows
+        )
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # Review pipeline (mirrors v1 MissionEngine)
     # ------------------------------------------------------------------
@@ -602,7 +622,7 @@ class ParallelMissionEngine:
         max_cycles = int(self.config.get("orchestration.max_repair_cycles", 3))
         max_unparseable_attempts = int(self.config.get("orchestration.max_unparseable_review_attempts", 2))
         while True:
-            result = await self._run_provider_phase_for_role(Role.REVIEW)
+            result = await self._run_provider_phase_for_role(Role.REVIEW, extra_context=self._prior_findings_context())
             if result is None:
                 return False
             review_input = result.assistant_text + "\n" + result.summary
@@ -645,7 +665,8 @@ class ParallelMissionEngine:
             )
             self._set_mission_status(MissionStatus.REPAIRING)
             findings_text = "\n".join(
-                f"- [{f['severity']}] {f['file'] or ''}: {f['description']} → {f['recommended_fix']}" for f in blockers
+                f"- [{f['severity']}] id={f['id']} {f['file'] or ''}: {f['description']} → {f['recommended_fix']}"
+                for f in blockers
             )
             repair = await self._run_provider_phase_for_role(
                 Role.REPAIR, extra_context=f"## Open findings to fix\n{findings_text}"

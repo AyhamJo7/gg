@@ -358,3 +358,52 @@ def gated_test_plan() -> dict[str, Any]:
     ]
     plan["phases"][1]["human_prerequisites"] = ["test-token"]
     return plan
+
+
+class FindingsProvider(FakeAdapter):
+    """Deterministic reviewer: emits scripted findings per review call.
+
+    findings_script[i] is the findings list for the i-th review call; later
+    calls repeat the last entry. Non-review roles behave like ``ok``/``work``.
+    An optional verified_script[i] appends a VERIFIED_FIXED_JSON line.
+    """
+
+    executable = "true"
+
+    def __init__(
+        self,
+        name: str = "fake-reviewer",
+        findings_script: list[list[dict[str, Any]]] | None = None,
+        verified_script: list[list[dict[str, Any]]] | None = None,
+    ):
+        super().__init__(name, ["ok"])
+        self.findings_script = findings_script or [[]]
+        self.verified_script = verified_script or []
+        self.review_calls = 0
+
+    def build_command(self, request: ExecutionRequest) -> list[str]:
+        return ["true"]
+
+    async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
+        import json as _json
+
+        if request.role != "review":
+            return await super().execute(request, on_output)
+        idx = min(self.review_calls, len(self.findings_script) - 1)
+        self.review_calls += 1
+        items = self.findings_script[idx]
+        text = "REVIEW_FINDINGS_JSON: " + _json.dumps(items)
+        if idx < len(self.verified_script) and self.verified_script[idx]:
+            text += "\nVERIFIED_FIXED_JSON: " + _json.dumps(self.verified_script[idx])
+        on_output(text[:300])
+        return ExecutionResult(
+            state=ProviderState.COMPLETED,
+            failure_class=FailureClass.NONE,
+            exit_code=0,
+            duration_s=0.01,
+            summary=f"fake review {len(items)} findings",
+            stdout_path=Path(request.log_dir / f"{request.run_id}.stdout.log"),
+            stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
+            raw_tail=text[-2000:],
+            assistant_text=text,
+        )

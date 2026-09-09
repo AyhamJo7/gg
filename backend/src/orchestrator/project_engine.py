@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import git_ops
+from .criterion import evaluate_criteria, is_executable_command
 from .models import (
     ACTIVE_PRODUCT_STATUSES,
     TERMINAL_PHASE_STATUSES,
@@ -146,6 +147,14 @@ class ProjectCoordinator:
             "SELECT * FROM requirement_evidence WHERE project_id=? ORDER BY requirement_id ASC",
             (project_id,),
         )
+        row["criterion_results"] = self.db.query(
+            "SELECT * FROM criterion_results WHERE project_id=? ORDER BY criterion_id ASC",
+            (project_id,),
+        )
+        row["waivers"] = self.db.query(
+            "SELECT * FROM acceptance_waivers WHERE project_id=? ORDER BY created_at ASC",
+            (project_id,),
+        )
         plan = self.db.query(
             "SELECT * FROM plan_revisions WHERE project_id=? ORDER BY revision DESC LIMIT 1",
             (project_id,),
@@ -207,6 +216,88 @@ class ProjectCoordinator:
         if not plan:
             return None
         return ProductPlan.model_validate(json.loads(plan[0]["plan_json"]))
+
+    # -- acceptance waivers ------------------------------------------------
+    #: Finding categories that gate product delivery while unresolved.
+    BLOCKING_FINDING_CATEGORIES = frozenset({"requirements", "correctness", "security", "tests"})
+
+    def create_waiver(
+        self,
+        project_id: str,
+        target_kind: str,
+        target_id: str,
+        reason: str,
+        actor: str = "human",
+    ) -> dict[str, Any]:
+        """Record an authorized acceptance waiver (auditable, versioned).
+
+        A waiver excuses one criterion or finding from the DELIVERED gate.
+        It records who authorized it, why, and under which plan revision —
+        never silently, never retroactively editable.
+        """
+        row = self.db.get("product_projects", project_id)
+        if not row:
+            raise KeyError(f"product project {project_id} not found")
+        if row["state"] in {s.value for s in TERMINAL_PRODUCT_STATUSES}:
+            raise ValueError(f"project {project_id} is terminal ({row['state']})")
+        if target_kind not in ("criterion", "finding"):
+            raise ProductValidationError("target_kind must be 'criterion' or 'finding'")
+        if not target_id.strip():
+            raise ProductValidationError("target_id is required")
+        if not reason.strip():
+            raise ProductValidationError("waiver reason is required")
+        self._validate_waiver_target(project_id, target_kind, target_id.strip())
+        waiver_id = uuid.uuid4().hex[:16]
+        self.db.execute(
+            """INSERT INTO acceptance_waivers(id, project_id, target_kind, target_id, reason, actor,
+               plan_revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(project_id, target_kind, target_id) DO UPDATE SET
+                 reason=excluded.reason, actor=excluded.actor, plan_revision=excluded.plan_revision,
+                 created_at=excluded.created_at""",
+            (
+                waiver_id,
+                project_id,
+                target_kind,
+                target_id.strip(),
+                reason.strip(),
+                actor,
+                int(row.get("plan_revision") or 0),
+                utcnow().isoformat(),
+            ),
+        )
+        self.events.publish(
+            EventType.PRODUCT_ACCEPTANCE_RECORDED,
+            None,
+            product_project_id=project_id,
+            waiver=f"{target_kind}:{target_id.strip()}",
+            reason=reason.strip()[:200],
+        )
+        return {"ok": True, "target": f"{target_kind}:{target_id.strip()}"}
+
+    def _validate_waiver_target(self, project_id: str, target_kind: str, target_id: str) -> None:
+        if target_kind == "criterion":
+            plan = self._current_plan(project_id)
+            known = (
+                {a.id for r in plan.requirements for a in r.acceptance} if plan is not None else set()
+            )
+            if target_id not in known:
+                raise ProductValidationError(f"unknown criterion {target_id} in the current plan")
+            return
+        mission_ids = [
+            p["mission_id"]
+            for p in self.db.query("SELECT mission_id FROM project_phases WHERE project_id=?", (project_id,))
+            if p.get("mission_id")
+        ]
+        for mid in mission_ids:
+            if self.db.query("SELECT id FROM review_findings WHERE id=? AND mission_id=?", (target_id, mid)):
+                return
+        raise ProductValidationError(f"unknown finding {target_id} in this project")
+
+    def _waived_targets(self, project_id: str) -> set[str]:
+        rows = self.db.query(
+            "SELECT target_kind, target_id FROM acceptance_waivers WHERE project_id=?", (project_id,)
+        )
+        return {f"{r['target_kind']}:{r['target_id']}" for r in rows}
 
     async def generate_plan(self, project_id: str) -> dict[str, Any]:
         """Run the planning provider with bounded repair; persist a revision."""
@@ -762,7 +853,7 @@ RULES:
                     "updated_at": utcnow(),
                 },
             )
-            self._mark_requirements_satisfied_locked(project_id, phase, evidence)
+            self._mark_requirements_work_completed_locked(project_id, phase, evidence)
             self.events.publish(
                 EventType.PRODUCT_PHASE_COMPLETED,
                 mission["id"],
@@ -821,19 +912,32 @@ RULES:
             return True
         return False
 
-    def _mark_requirements_satisfied_locked(
+    def _mark_requirements_work_completed_locked(
         self, project_id: str, phase: dict[str, Any], evidence: dict[str, Any]
     ) -> None:
+        """Record that implementation work finished (F-LIFE-01).
+
+        Mission COMPLETED proves work was done — never that acceptance
+        criteria hold. Mapped requirements move to WORK_COMPLETED; only
+        executed criterion checks (or authorized waivers) grant SATISFIED.
+        """
         plan = self._current_plan(project_id)
         if plan is None:
             return
         spec = next((p for p in plan.phases if p.key == phase["phase_key"]), None)
         for rid in (spec.requirement_ids if spec else []):
+            current = self.db.query(
+                "SELECT status FROM requirement_evidence WHERE project_id=? AND requirement_id=?",
+                (project_id, rid),
+            )
+            if current and current[0]["status"] in ("SATISFIED", "FAILED"):
+                continue  # acceptance verdicts are never overwritten by work completion
             self.db.execute(
                 """INSERT INTO requirement_evidence(project_id, requirement_id, status, evidence_json, updated_at)
-                   VALUES (?, ?, 'SATISFIED', ?, ?)
+                   VALUES (?, ?, 'WORK_COMPLETED', ?, ?)
                    ON CONFLICT(project_id, requirement_id) DO UPDATE SET
-                     status='SATISFIED', evidence_json=excluded.evidence_json, updated_at=excluded.updated_at""",
+                     status='WORK_COMPLETED', evidence_json=excluded.evidence_json,
+                     updated_at=excluded.updated_at""",
                 (project_id, rid, json.dumps({**evidence, "phase_key": phase["phase_key"]}), utcnow().isoformat()),
             )
 
@@ -1097,6 +1201,134 @@ RULES:
         except Exception:
             return False
 
+    async def _evaluate_requirement_criteria_locked(
+        self, project_id: str, plan: ProductPlan, repo: Path, sha: str
+    ) -> list[str]:
+        """Execute every required criterion check; record per-criterion verdicts.
+
+        Restart-safe: a recorded result for the same (criterion, command, SHA)
+        is reused, never re-executed — checks may have side effects (e.g. HTTP
+        probes that create records), so acceptance must not duplicate runs.
+        Returns blocking finding strings (empty when all criteria satisfied).
+        """
+        problems: list[str] = []
+        waived = self._waived_targets(project_id)
+        for req in plan.requirements:
+            req_ok = True
+            for criterion in req.acceptance:
+                cid = criterion.id
+                if f"criterion:{cid}" in waived:
+                    self._record_criterion_waived(project_id, req.id, cid, sha)
+                    continue
+                recorded = self.db.query(
+                    "SELECT * FROM criterion_results WHERE project_id=? AND criterion_id=?", (project_id, cid)
+                )
+                verify = criterion.verify or ""
+                ok, command = is_executable_command(verify)
+                if not ok:
+                    problems.append(
+                        f"criterion {cid} has no executable verification "
+                        f"(revise the plan with an allowlisted command): {verify[:120]}"
+                    )
+                    self._record_criterion(project_id, req.id, cid, "UNVERIFIED", "", None, "no executable verify", sha)
+                    req_ok = False
+                    continue
+                if recorded and recorded[0].get("command") == command and recorded[0].get("sha") == sha:
+                    if recorded[0]["status"] != "SATISFIED":
+                        problems.append(f"criterion {cid} failed: {command} (exit={recorded[0].get('exit_code')})")
+                        req_ok = False
+                    continue
+                checks = await evaluate_criteria(repo, [{"id": cid, "verify": verify}])
+                check = checks[0]
+                status = "SATISFIED" if check.passed else "FAILED"
+                self._record_criterion(
+                    project_id, req.id, cid, status, command, check.exit_code, check.output_tail, sha
+                )
+                if not check.passed:
+                    problems.append(f"criterion {cid} failed: {command} (exit={check.exit_code})")
+                    req_ok = False
+            self.db.execute(
+                """INSERT INTO requirement_evidence(project_id, requirement_id, status, evidence_json, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(project_id, requirement_id) DO UPDATE SET
+                     status=excluded.status, evidence_json=excluded.evidence_json, updated_at=excluded.updated_at""",
+                (
+                    project_id,
+                    req.id,
+                    "SATISFIED" if req_ok else "FAILED",
+                    json.dumps({"sha": sha, "criteria": [a.id for a in req.acceptance]}),
+                    utcnow().isoformat(),
+                ),
+            )
+        return problems
+
+    def _record_criterion(
+        self,
+        project_id: str,
+        requirement_id: str,
+        criterion_id: str,
+        status: str,
+        command: str,
+        exit_code: int | None,
+        output_tail: str,
+        sha: str,
+    ) -> None:
+        self.db.execute(
+            """INSERT INTO criterion_results(project_id, criterion_id, requirement_id, status, command,
+                   exit_code, output_tail, sha, checked_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(project_id, criterion_id) DO UPDATE SET
+                 requirement_id=excluded.requirement_id, status=excluded.status, command=excluded.command,
+                 exit_code=excluded.exit_code, output_tail=excluded.output_tail, sha=excluded.sha,
+                 checked_at=excluded.checked_at""",
+            (
+                project_id,
+                criterion_id,
+                requirement_id,
+                status,
+                command,
+                exit_code,
+                output_tail[:3000],
+                sha,
+                utcnow().isoformat(),
+            ),
+        )
+
+    def _record_criterion_waived(self, project_id: str, requirement_id: str, criterion_id: str, sha: str) -> None:
+        self._record_criterion(project_id, requirement_id, criterion_id, "WAIVED", "", None, "authorized waiver", sha)
+
+    def _blocking_findings_locked(self, project_id: str) -> list[str]:
+        """Unresolved requirement/correctness findings across phase missions.
+
+        Open findings plus repair-attempted-but-unverified findings at MEDIUM
+        or above block delivery unless explicitly waived. Omission by a later
+        review never clears them (F-LIFE-02).
+        """
+        waived = self._waived_targets(project_id)
+        mission_ids = [
+            p["mission_id"]
+            for p in self.db.query("SELECT mission_id FROM project_phases WHERE project_id=?", (project_id,))
+            if p.get("mission_id")
+        ]
+        problems: list[str] = []
+        for mid in mission_ids:
+            rows = self.db.query(
+                """SELECT id, severity, category, status, description FROM review_findings
+                   WHERE mission_id=? AND status IN ('open','repair_attempted')
+                   AND severity IN ('BLOCKER','HIGH','MEDIUM')""",
+                (mid,),
+            )
+            for r in rows:
+                if str(r.get("category", "")).lower() not in self.BLOCKING_FINDING_CATEGORIES:
+                    continue
+                if f"finding:{r['id']}" in waived:
+                    continue
+                problems.append(
+                    f"unresolved {r['severity']} {r['category']} finding {r['id']} "
+                    f"({r['status']}): {(r['description'] or '')[:160]}"
+                )
+        return problems
+
     # -- acceptance + delivery ---------------------------------------------
     async def _run_acceptance_locked(self, project_id: str) -> dict[str, Any]:
         row = self.db.get("product_projects", project_id)
@@ -1105,14 +1337,8 @@ RULES:
             return {"ok": False}
         repo = self._target_repo(project_id)
         findings: list[str] = []
-        # 1. Requirement coverage from persisted evidence.
-        ev_rows = {
-            r["requirement_id"]: r["status"]
-            for r in self.db.query("SELECT * FROM requirement_evidence WHERE project_id=?", (project_id,))
-        }
-        uncovered = [r.id for r in plan.requirements if ev_rows.get(r.id) != "SATISFIED"]
-        if uncovered:
-            findings.append(f"requirements without satisfied evidence: {', '.join(uncovered)}")
+        # 1. Requirement criteria: executed checks, never mission completion.
+        # (Runs after the SHA is fixed below; evaluated in step 3b.)
         # 2. Open human gates block delivery.
         open_gates = self.db.query(
             "SELECT title FROM project_gates WHERE project_id=? AND status='open'", (project_id,)
@@ -1145,6 +1371,12 @@ RULES:
                     findings.append("no toolchain commands detected — nothing objectively verified")
                 elif not verify_ok:
                     findings.append(f"toolchain verification failed:\n{report.summary()}")
+                # 3b. Criterion-level acceptance against the accepted SHA.
+                if sha and not findings:
+                    findings.extend(await self._evaluate_requirement_criteria_locked(project_id, plan, repo, sha))
+                # 3c. Unresolved requirement/correctness findings block delivery.
+                if not findings:
+                    findings.extend(self._blocking_findings_locked(project_id))
                 # 4. Fresh-checkout reproduction of the accepted SHA.
                 if sha and verify_ok and not findings:
                     fresh_ok, fresh_detail = await self._fresh_checkout_verify(repo, sha)
@@ -1255,6 +1487,8 @@ RULES:
         phases = self.db.query("SELECT * FROM project_phases WHERE project_id=?", (project_id,))
         evidence = self.db.query("SELECT * FROM requirement_evidence WHERE project_id=?", (project_id,))
         gates = self.db.query("SELECT * FROM project_gates WHERE project_id=?", (project_id,))
+        criteria = self.db.query("SELECT * FROM criterion_results WHERE project_id=?", (project_id,))
+        waivers = self.db.query("SELECT * FROM acceptance_waivers WHERE project_id=?", (project_id,))
         review_notes: list[str] = []
         for phase in phases:
             mission_id = phase.get("mission_id")
@@ -1292,6 +1526,22 @@ RULES:
                     "id": r.id,
                     "title": r.title,
                     "status": next((e["status"] for e in evidence if e["requirement_id"] == r.id), "PENDING"),
+                    "criteria": [
+                        {
+                            "id": a.id,
+                            "status": next(
+                                (c["status"] for c in criteria if c["criterion_id"] == a.id), "PENDING"
+                            ),
+                            "command": next(
+                                (c["command"] for c in criteria if c["criterion_id"] == a.id), ""
+                            ),
+                            "exit_code": next(
+                                (c["exit_code"] for c in criteria if c["criterion_id"] == a.id), None
+                            ),
+                            "sha": next((c["sha"] for c in criteria if c["criterion_id"] == a.id), ""),
+                        }
+                        for a in r.acceptance
+                    ],
                 }
                 for r in plan.requirements
             ],
@@ -1307,6 +1557,15 @@ RULES:
                 {"title": g["title"], "status": g["status"], "resolution": g.get("resolution")} for g in gates
             ],
             "env_vars": sorted({v for g in gates for v in json.loads(g.get("required_vars") or "[]")}),
+            "waivers": [
+                {
+                    "target": f"{w['target_kind']}:{w['target_id']}",
+                    "reason": w["reason"],
+                    "actor": w["actor"],
+                    "plan_revision": w["plan_revision"],
+                }
+                for w in waivers
+            ],
             "run_instructions": self._run_instructions(plan),
         }
 

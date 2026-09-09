@@ -76,6 +76,12 @@ class RevisePlanRequest(BaseModel):
     reason: str
 
 
+class WaiverRequest(BaseModel):
+    target_kind: str
+    target_id: str
+    reason: str
+
+
 def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
     for key in ("providers_used", "providers_failed", "choices", "payload", "command"):
         if isinstance(row.get(key), str):
@@ -455,6 +461,17 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             return await orchestrator.coordinator.run_acceptance(project_id)
         except KeyError:
             raise HTTPException(404, "product project not found") from None
+
+    @app.post("/api/product-projects/{project_id}/waivers")
+    def create_product_waiver(project_id: str, req: WaiverRequest) -> dict[str, Any]:
+        try:
+            return orchestrator.coordinator.create_waiver(
+                project_id, req.target_kind, req.target_id, req.reason
+            )
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        except (ProductValidationError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     # ---------------- DAG / parallel task endpoints ----------------
     @app.get("/api/missions/{mission_id}/dag")

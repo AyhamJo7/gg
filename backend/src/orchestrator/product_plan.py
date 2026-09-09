@@ -13,6 +13,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .criterion import is_executable_command
+
 PLAN_MARKER = "PRODUCT_PLAN_JSON:"
 MAX_PLAN_BYTES = 200_000
 
@@ -161,6 +163,12 @@ def validate_product_plan(data: dict[str, Any]) -> list[str]:
     for r in plan.requirements:
         if not r.acceptance:
             errors.append(f"requirement {r.id} has no acceptance criteria")
+        for a in r.acceptance:
+            ok, _ = is_executable_command(a.verify)
+            if not ok:
+                errors.append(
+                    f"criterion {a.id} verify is not an executable allowlisted command: {a.verify[:100]!r}"
+                )
     if not plan.phases:
         errors.append("at least one phase is required")
     phase_keys = [p.key for p in plan.phases]
@@ -228,6 +236,13 @@ RULES:
 - Never invent microservices, cloud infrastructure, or paid dependencies unless
   the idea genuinely requires them.
 - Every requirement needs measurable acceptance criteria.
+- Every criterion needs an EXECUTABLE verification command: a single command
+  line starting with one of npm, npx, node, python, python3, pytest, uv, pnpm,
+  yarn, cargo, go, make (no shell operators, no rm/sudo/git). GG runs each
+  command in the target repository and a criterion passes only on exit 0.
+  For HTTP behavior, probe with node/python one-liners against a server the
+  command itself starts on an ephemeral port and kills afterwards.
+  Example: "node checks/whitespace-probe.js". Prose is not verification.
 - Every phase needs acceptance criteria and must reference the requirement ids
   it implements. Every requirement must be covered by at least one phase.
 - Phase keys must be unique; depends_on may only reference other phase keys;

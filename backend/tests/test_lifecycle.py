@@ -314,19 +314,25 @@ async def test_restart_during_execution_recovers(tmp_path: Path):
     await orch2.shutdown()
 
 
-async def test_acceptance_rejects_uncovered_requirement(tmp_path: Path):
+async def test_acceptance_recomputes_from_checks_not_stored_evidence(tmp_path: Path):
+    """Stored evidence rows alone prove nothing; verdicts come from executed checks."""
     orch = await make_orch(tmp_path, standard_adapters())
     pid = await start_planned_project(tmp_path, orch)
     project = await drive_project(orch, pid)
     assert project["state"] == "DELIVERED"
-    orch.db.execute("DELETE FROM requirement_evidence WHERE project_id=? AND requirement_id='R2'", (pid,))
+    # Delete stored requirement evidence: acceptance must recompute from checks.
+    orch.db.execute("DELETE FROM requirement_evidence WHERE project_id=?", (pid,))
     orch.db.update(
         "product_projects", pid, {"state": "FINAL_ACCEPTANCE", "acceptance_state": "PENDING", "delivery_sha": None}
     )
     result = await orch.coordinator.run_acceptance(pid)
-    assert result["ok"] is False
-    assert any("R2" in f for f in result["findings"])
-    assert orch.db.get("product_projects", pid)["state"] != "DELIVERED"
+    assert result["ok"] is True, result
+    assert orch.db.get("product_projects", pid)["state"] == "DELIVERED"
+    # Recorded check rows carry the accepted SHA and exit codes.
+    rows = orch.db.query("SELECT * FROM criterion_results WHERE project_id=?", (pid,))
+    assert {r["criterion_id"] for r in rows} == {"R1-A1", "R2-A1"}
+    assert all(r["status"] == "SATISFIED" and r["exit_code"] == 0 for r in rows)
+    assert all(r["sha"] == orch.db.get("product_projects", pid)["delivery_sha"] for r in rows)
     await orch.shutdown()
 
 
@@ -379,14 +385,28 @@ async def test_final_checkpoint_captures_uncommitted_changes(tmp_path: Path):
 
 
 async def test_fresh_checkout_installs_and_reproduces(tmp_path: Path):
-    """Fresh-checkout acceptance installs dependencies before verifying."""
+    """Fresh-checkout acceptance installs dependencies before verifying.
+
+    The test script requires a file: dependency that exists only after
+    install, proving install+verify ran inside the clone (not the source).
+    """
     import subprocess as _subprocess  # noqa: ASYNC221 - test scaffolding, sync context ok
 
     orch = await make_orch(tmp_path, standard_adapters())
     repo = tmp_path / "freshrepo"
     repo.mkdir()
+    vendor = repo / "vendor" / "mydep"
+    vendor.mkdir(parents=True)
+    (vendor / "package.json").write_text(json.dumps({"name": "mydep", "version": "1.0.0", "main": "index.js"}))
+    (vendor / "index.js").write_text("module.exports = () => 'vendored';\n")
     (repo / "package.json").write_text(
-        json.dumps({"name": "fresh", "scripts": {"test": "node -e \"process.exit(0)\""}})
+        json.dumps(
+            {
+                "name": "fresh",
+                "dependencies": {"mydep": "file:./vendor/mydep"},
+                "scripts": {"test": "node -e \"console.log('CWD:'+process.cwd());process.exit(require('mydep')()==='vendored'?0:1)\""},
+            }
+        )
     )
     _subprocess.run(["git", "init", "-q", str(repo)], check=True)  # noqa: ASYNC221
     _subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)  # noqa: ASYNC221
@@ -394,6 +414,8 @@ async def test_fresh_checkout_installs_and_reproduces(tmp_path: Path):
     sha = _subprocess.run(  # noqa: ASYNC221
         ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True
     ).stdout.strip()
+    # Sanity: without install the check genuinely fails.
+    assert (repo / "node_modules").exists() is False
     ok, detail = await orch.coordinator._fresh_checkout_verify(repo, sha)
     assert ok is True, detail
     assert "npm install ok" in detail
