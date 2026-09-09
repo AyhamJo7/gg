@@ -15,6 +15,7 @@ import pytest
 
 from orchestrator.db import Database
 from orchestrator.orchestrator import Orchestrator
+from orchestrator.project_engine import ProductValidationError
 from orchestrator.providers.fake import FakeAdapter, FindingsProvider, default_test_plan
 from orchestrator.review import finding_fingerprint
 from test_lifecycle import (
@@ -223,7 +224,7 @@ async def test_waiver_is_versioned_and_respected(tmp_path: Path):
     fid = fid_rows[0]["id"]
     # Unknown targets and empty reasons are rejected.
     for kind, tid, reason in [("nope", fid, "x"), ("finding", "missing", "x"), ("finding", fid, "  ")]:
-        with pytest.raises(Exception):
+        with pytest.raises((ProductValidationError, ValueError)):
             orch.coordinator.create_waiver(pid, kind, tid, reason)
     assert orch.db.query("SELECT id FROM acceptance_waivers WHERE project_id=?", (pid,)) == []
     for fr in fid_rows:
