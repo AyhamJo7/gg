@@ -126,3 +126,31 @@ async def test_start_requires_plan(lifecycle_client: httpx.AsyncClient):
     pid = (await c.post("/api/product-projects", json={"name": "N", "idea": "i"})).json()["id"]
     resp = await c.post(f"/api/product-projects/{pid}/start")
     assert resp.status_code == 409
+
+
+async def test_waiver_endpoint_validation(lifecycle_client: httpx.AsyncClient):
+    c = lifecycle_client
+    pid = (await c.post("/api/product-projects", json={"name": "W", "idea": "i"})).json()["id"]
+    await c.post(f"/api/product-projects/{pid}/plan")
+    # Unknown criterion rejected.
+    resp = await c.post(
+        f"/api/product-projects/{pid}/waivers",
+        json={"target_kind": "criterion", "target_id": "NOPE", "reason": "x"},
+    )
+    assert resp.status_code == 400
+    # Empty reason rejected.
+    resp = await c.post(
+        f"/api/product-projects/{pid}/waivers",
+        json={"target_kind": "criterion", "target_id": "R1-A1", "reason": "  "},
+    )
+    assert resp.status_code == 400
+    # Valid waiver recorded with revision stamp.
+    resp = await c.post(
+        f"/api/product-projects/{pid}/waivers",
+        json={"target_kind": "criterion", "target_id": "R1-A1", "reason": "manual check done"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = (await c.get(f"/api/product-projects/{pid}")).json()
+    assert len(body["waivers"]) == 1
+    assert body["waivers"][0]["target_id"] == "R1-A1"
+    assert body["waivers"][0]["plan_revision"] == 1

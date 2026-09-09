@@ -347,6 +347,27 @@ export interface RequirementEvidenceRow {
   evidence_json: Record<string, unknown>;
 }
 
+export interface CriterionResultRow {
+  criterion_id: string;
+  requirement_id: string;
+  status: string;
+  command: string;
+  exit_code: number | null;
+  output_tail: string;
+  sha: string;
+  checked_at: string;
+}
+
+export interface AcceptanceWaiverRow {
+  id: string;
+  target_kind: string;
+  target_id: string;
+  reason: string;
+  actor: string;
+  plan_revision: number;
+  created_at: string;
+}
+
 export interface ProductProjectDetail {
   id: string;
   name: string;
@@ -366,6 +387,8 @@ export interface ProductProjectDetail {
   phases: ProductPhaseRow[];
   gates: ProductGateRow[];
   evidence: RequirementEvidenceRow[];
+  criterion_results: CriterionResultRow[];
+  waivers: AcceptanceWaiverRow[];
   plan: ProductPlan | null;
   plan_revision_count: number;
 }

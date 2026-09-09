@@ -133,7 +133,7 @@ export function LifecycleDetailPage() {
           ))}
         </div>
       )}
-      {tab === "delivery" && <DeliveryTab project={project} />}
+      {tab === "delivery" && <DeliveryTab project={project} run={run} />}
     </div>
   );
 }
@@ -325,23 +325,79 @@ function GateView({
   );
 }
 
-function DeliveryTab({ project }: { project: ProductProjectDetail }) {
+function DeliveryTab({ project, run }: { project: ProductProjectDetail; run: (fn: () => Promise<unknown>) => Promise<void> }) {
+  const [waiveReason, setWaiveReason] = useState("");
   const report = project.delivery_report as {
     product_name?: string; git_sha?: string; repo_path?: string;
     stack?: Record<string, string>; decisions?: Array<{ area: string; choice: string; rationale: string }>;
-    requirements?: Array<{ id: string; title: string; status: string }>;
+    requirements?: Array<{ id: string; title: string; status: string;
+      criteria?: Array<{ id: string; status: string; command: string; exit_code: number | null; sha: string }> }>;
     phases?: Array<{ key: string; title: string; status: string; mission_id: string | null }>;
     review_notes?: string[]; recent_toolchain?: string[];
     human_gates?: Array<{ title: string; status: string; resolution: string | null }>;
     env_vars?: string[]; run_instructions?: string;
+    waivers?: Array<{ target: string; reason: string; actor: string; plan_revision: number }>;
   };
   if (project.state !== "DELIVERED" || !report?.git_sha) {
+    const failedCriteria = (project.criterion_results ?? []).filter((c) =>
+      ["FAILED", "UNVERIFIED"].includes(c.status),
+    );
+    const waivedIds = new Set((project.waivers ?? []).map((w) => `${w.target_kind}:${w.target_id}`));
+    const pendingWaivers = failedCriteria.filter((c) => !waivedIds.has(`criterion:${c.criterion_id}`));
     return (
-      <div className="card" style={{ marginTop: 12 }}>
-        <p className="muted">
-          No delivery yet. Acceptance state: <strong>{project.acceptance_state || "PENDING"}</strong>.
-          {project.blocking_reason && <> — {project.blocking_reason}</>}
-        </p>
+      <div style={{ marginTop: 12 }}>
+        <div className="card">
+          <p className="muted">
+            No delivery yet. Acceptance state: <strong>{project.acceptance_state || "PENDING"}</strong>.
+            {project.blocking_reason && <> — {project.blocking_reason}</>}
+          </p>
+        </div>
+        {pendingWaivers.length > 0 && (
+          <div className="card" style={{ marginTop: 8 }} data-testid="waiver-panel">
+            <h4>Failed criteria — authorize a waiver to proceed without them</h4>
+            {pendingWaivers.map((c) => (
+              <div key={c.criterion_id} style={{ fontSize: 13, marginBottom: 4 }}>
+                <span className="mono">{c.criterion_id}</span> — {c.status}
+                <span className="muted"> (exit {c.exit_code ?? "—"})</span>
+              </div>
+            ))}
+            <div className="row" style={{ gap: 8, marginTop: 8 }}>
+              <input
+                placeholder="Waiver reason (required, recorded with plan revision)"
+                value={waiveReason}
+                onChange={(e) => setWaiveReason(e.target.value)}
+                style={{ flex: 1 }}
+                data-testid="waiver-reason"
+              />
+              <button
+                className="primary"
+                disabled={!waiveReason.trim()}
+                onClick={() =>
+                  run(async () => {
+                    for (const c of pendingWaivers) {
+                      await api.lifecycle.waive(project.id, "criterion", c.criterion_id, waiveReason);
+                    }
+                    setWaiveReason("");
+                  })
+                }
+                data-testid="waiver-submit"
+              >
+                Record waiver
+              </button>
+            </div>
+          </div>
+        )}
+        {(project.waivers ?? []).length > 0 && (
+          <div className="card" style={{ marginTop: 8 }}>
+            <h4>Recorded waivers</h4>
+            {project.waivers.map((w) => (
+              <div key={w.id} style={{ fontSize: 12 }}>
+                <span className="mono">{w.target_kind}:{w.target_id}</span> — {w.reason}
+                <span className="muted"> (by {w.actor}, plan rev {w.plan_revision})</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     );
   }
@@ -359,9 +415,27 @@ function DeliveryTab({ project }: { project: ProductProjectDetail }) {
       <div className="card" style={{ marginTop: 8 }}>
         <h4>Requirements</h4>
         {report.requirements?.map((r) => (
-          <div key={r.id} style={{ fontSize: 13 }}><strong>{r.id}</strong> {r.title} — {r.status}</div>
+          <div key={r.id} style={{ fontSize: 13, marginBottom: 6 }}>
+            <strong>{r.id}</strong> {r.title} — {r.status}
+            {r.criteria?.map((c) => (
+              <div key={c.id} className="mono muted" style={{ fontSize: 11, marginLeft: 12 }}>
+                {c.id}: {c.status} (exit {c.exit_code ?? "—"}) {c.sha.slice(0, 8)} — {c.command.slice(0, 90)}
+              </div>
+            ))}
+          </div>
         ))}
       </div>
+      {(report.waivers ?? []).length > 0 && (
+        <div className="card" style={{ marginTop: 8 }}>
+          <h4>Authorized waivers</h4>
+          {report.waivers?.map((w, i) => (
+            <div key={i} style={{ fontSize: 12 }}>
+              <span className="mono">{w.target}</span> — {w.reason}
+              <span className="muted"> (by {w.actor}, plan rev {w.plan_revision})</span>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="card" style={{ marginTop: 8 }}>
         <h4>Review notes</h4>
         {(!report.review_notes || report.review_notes.length === 0) && <p className="muted">No review findings recorded.</p>}
