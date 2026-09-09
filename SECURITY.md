@@ -128,15 +128,47 @@ operations, and workspace escape.
   `.azure`, `.gnupg`, `.config/gh`, `.docker`) are still masked on top of it
   as defense in depth, not the primary control. A second, independent layer
   covers the same class of risk from the other direction: `git_ops.
-  checkpoint()`'s existing content-based secret scan (reusing
-  `security.SECRET_PATTERNS`) runs over every newly-staged file regardless
-  of filename, so even a credential read via some future unenumerated path
-  and copied into an innocuously-named tracked file is excluded from the
-  commit rather than silently persisted into history.
+  checkpoint()`'s content-based secret scan (reusing
+  `security.SECRET_PATTERNS`) runs over every newly-staged file's added
+  content regardless of filename, so even a credential read via some
+  future unenumerated allow-list path and copied into an innocuously-named
+  tracked file is excluded from the commit rather than silently persisted
+  into history. **This scan covers a fixed set of known secret formats
+  only — it is a heuristic, not a guarantee.** Proven live: an unlabeled
+  connection string (`DATABASE_URL=postgres://user:pass@host/db`, no
+  recognized label word) and a base64-encoded token both pass through
+  uncaught, since there is no entropy/decode-based detection. It was also
+  proven, and then fixed, that a token split across two added diff lines
+  was invisible to a per-line-only scan (contiguous added lines within a
+  hunk are now concatenated before matching); an AWS access-key pattern
+  (`AKIA...`) was added after the same review found none existed. Treat
+  this as narrowing the gap the allow-list leaves, not closing it.
 - `run_sandboxed`/`build_sandboxed_argv` refuse to run at all if the target
   repo resolves to the real `$HOME` or an ancestor of it — binding such a
   repo read-write, applied after the credential masks in bwrap's bind
   order, would silently remount over and undo those masks.
+- `_fresh_checkout_verify`'s dependency-install step (`npm ci`/`npm install`/
+  `uv sync` on the freshly cloned, accepted SHA — see `project_engine.py`)
+  runs through the same sandbox with `allow_network=True`: install
+  genuinely needs a registry, so `--unshare-net` is the one confinement
+  this call site can't have, but every other boundary above (PID/IPC/UTS
+  isolation, `--clearenv`, the credential-masked toolchain allow-list, no
+  real-`$HOME` exposure, the ulimit fork-bomb backstop, fail-closed if
+  `bwrap` is missing) is identical. This was the last unsandboxed
+  execution path in the codebase — proven live and now closed: a
+  `pyproject.toml` declaring a malicious PEP 517 build backend could
+  previously write into the real `$HOME` and see real credentials during
+  this step; it's now confined to the sandbox's scratch `$HOME` and the
+  credential-masked toolchain view like everywhere else. **Residual risk,
+  stated plainly, not claimed as closed**: with network reachable, this
+  step can still (a) exfiltrate the target repo's own content over that
+  network — inherent to needing network for install at all, not fixable
+  without disabling install entirely, and the repo's content isn't secret
+  the way host credentials are, and (b) reach any network destination,
+  since only `--unshare-net` is dropped — nothing scopes this to
+  registry-only traffic (a package-registry allow-list would need a
+  network namespace + firewall setup beyond what `bwrap` alone provides;
+  not implemented).
 
 ### Provider autonomy
 - CLIs run with permission bypass flags **inside the user-selected workspace** —

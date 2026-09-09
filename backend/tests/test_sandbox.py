@@ -141,6 +141,43 @@ def test_sandboxed_path_excludes_unbound_host_directories(tmp_path: Path):
     assert fake_unbound not in path_value.split(":")
 
 
+def test_generic_mounts_structurally_precede_every_specific_bind(tmp_path: Path):
+    """Round-9 regression for the ordering bug class (not just the one /tmp
+    case a test happened to catch): the three broad, low-specificity mounts
+    (--proc /proc, --dev /dev, --tmpfs /tmp) must appear before every
+    --ro-bind/--bind pair in the built argv, structurally — not merely by
+    convention at each call site — since bwrap applies binds in order and a
+    later bind silently remounts over an earlier one nested inside it.
+    Credential-mask --tmpfs calls (for .ssh/.aws/etc, added deliberately
+    *after* the broader binds they override) are a different, intentional
+    case and are excluded from this check by their target path.
+    """
+    argv = build_sandboxed_argv(["true"], tmp_path, tmp_path / "scratch")
+
+    def _flag_indices(flag: str, target: str | None = None) -> list[int]:
+        indices = []
+        i = 0
+        while i < len(argv):
+            if argv[i] == flag:
+                if target is None or (i + 1 < len(argv) and argv[i + 1] == target):
+                    indices.append(i)
+            i += 1
+        return indices
+
+    generic_indices = (
+        _flag_indices("--proc", "/proc") + _flag_indices("--dev", "/dev") + _flag_indices("--tmpfs", "/tmp")
+    )
+    assert generic_indices, "expected the three generic bootstrap mounts to be present"
+    last_generic = max(generic_indices)
+
+    bind_indices = _flag_indices("--ro-bind") + _flag_indices("--bind")
+    assert bind_indices, "expected at least one specific bind"
+    assert last_generic < min(bind_indices), (
+        "a specific --ro-bind/--bind precedes the generic /proc,/dev,/tmp mounts — "
+        "it would be silently wiped if its target ever nested under one of them"
+    )
+
+
 def test_refuses_to_sandbox_repo_equal_to_home(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     with pytest.raises(ValueError, match="overlaps the real home directory"):
