@@ -386,7 +386,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             raise HTTPException(409, str(exc)) from exc
 
     @app.put("/api/product-projects/{project_id}/plan")
-    def revise_product_plan(project_id: str, req: RevisePlanRequest) -> dict[str, Any]:
+    async def revise_product_plan(project_id: str, req: RevisePlanRequest) -> dict[str, Any]:
         try:
             result = orchestrator.coordinator.revise_plan(project_id, req.plan, req.reason)
         except KeyError:
@@ -395,6 +395,12 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             raise HTTPException(409, str(exc)) from exc
         if not result.get("ok"):
             raise HTTPException(400, "; ".join(result.get("errors", ["invalid plan"])))
+        # A revision may unblock the roadmap (new phases, changed deps):
+        # re-drive the coordinator so the operator needs no second click.
+        try:
+            await orchestrator.coordinator.advance_project(project_id)
+        except (KeyError, ValueError):
+            pass
         return result
 
     @app.post("/api/product-projects/{project_id}/start")
