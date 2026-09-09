@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.criterion import confined_to_repo, is_executable_command
+from orchestrator.criterion import confined_to_repo, is_executable_command, run_check_command
 
 
 def test_plain_allowlisted_command_passes():
@@ -113,6 +113,19 @@ BYPASS_STRINGS = [
     "make -C/tmp",
     'node --experimental-loader "data:text/javascript,evil" x.js',
     "python3 -m pip install anything",
+    # Round 4 — attached-flag tokens that end in a recognized extension
+    # (`.py`/`.js`) sliding past the extension check into the "run this
+    # script" shape, while the real interpreter parses the same token as a
+    # flag with independent code-execution effects (python -m's dotted
+    # module import runs `__init__.py`; node's --require/--loader preload
+    # runs before Node even looks for a main script).
+    "python3 -mpy.py",
+    "python -mpy.py",
+    "uv run python3 -mpkg.py",
+    "node --require=./x.js",
+    "node -r./x.js",
+    "node --loader=./x.mjs",
+    "uv run node --require=./x.js",
 ]
 
 
@@ -247,3 +260,44 @@ def test_confined_to_repo_rejects_command_that_fails_shape_match():
 @pytest.mark.parametrize("target", ["./...", "."])
 def test_confined_to_repo_handles_go_special_targets(tmp_path: Path, target: str):
     assert confined_to_repo(f"go test {target}", tmp_path) is True
+
+
+# -- end-to-end proof for the two live RCEs proven against round 4 ---------
+#
+# Both bypasses were only visible through the real `run_check_command`
+# production path: the shape-matcher unit check alone doesn't demonstrate
+# that the flag would actually have been interpreted as code-execution by
+# the real interpreter. These reproduce the proof-of-concept payloads and
+# assert (a) is_executable_command already rejects the string outright, and
+# (b) run_check_command refuses to execute it at all — no marker file from
+# the payload is ever created.
+
+
+async def test_python_dash_m_attached_flag_never_executes(tmp_path: Path):
+    payload_pkg = tmp_path / "py"
+    payload_pkg.mkdir()
+    marker = tmp_path / "pwned.txt"
+    (payload_pkg / "__init__.py").write_text(f"open({marker!r}, 'w').write('MALICIOUS __init__.py EXECUTED')\n")
+
+    command = "python3 -mpy.py"
+    ok, _ = is_executable_command(command)
+    assert ok is False
+
+    exit_code, tail = await run_check_command(tmp_path, command)
+    assert exit_code is None
+    assert "resolves outside" in tail or "path argument" in tail
+    assert not marker.exists(), "payload executed despite rejection"
+
+
+async def test_node_require_attached_flag_never_executes(tmp_path: Path):
+    marker = tmp_path / "pwned.txt"
+    (tmp_path / "py.js").write_text(f"require('fs').writeFileSync({marker.as_posix()!r}, 'MALICIOUS py.js EXECUTED')\n")
+
+    command = "node --require=./py.js"
+    ok, _ = is_executable_command(command)
+    assert ok is False
+
+    exit_code, tail = await run_check_command(tmp_path, command)
+    assert exit_code is None
+    assert "resolves outside" in tail or "path argument" in tail
+    assert not marker.exists(), "payload executed despite rejection"

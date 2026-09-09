@@ -99,6 +99,14 @@ def _safe_rel_path(token: str) -> bool:
         return False
     if token.startswith("/") or token.startswith("~"):
         return False
+    if token.startswith("-"):
+        # A leading "-" is never a legitimate path — it's always a disguised
+        # flag. Without this, an attached-flag token that happens to end in
+        # a recognized extension (`-mpy.py`, `--require=./py.js`) slides past
+        # the extension check into the "run this script" shape while the
+        # real interpreter parses it as a flag with code-execution effects
+        # the shape was never meant to permit (python -m, node --require).
+        return False
     parts = token.replace("\\", "/").split("/")
     return ".." not in parts and "" not in parts[1:]
 
