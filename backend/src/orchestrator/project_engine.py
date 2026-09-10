@@ -383,6 +383,23 @@ class ProjectCoordinator:
                     break
                 plan_data = None
         except Exception as exc:
+            # Fail closed on context compilation: no provider run exists, no
+            # plan revision is written. Preserve the compiler error code so
+            # the operator sees WHY planning did not start.
+            from .context_compiler import ContextCompileError as _PlanCCError
+            from .context_compiler import compile_failure_reason as _plan_cc_reason
+
+            if isinstance(exc, _PlanCCError):
+                _reason = _plan_cc_reason(exc, None)
+                ops.finish_operation(
+                    self.db,
+                    op.id,
+                    ops.STATE_FAILED,
+                    error_code=exc.code,
+                    error_detail=_reason[:2000],
+                )
+                self._set_state(project_id, ProductStatus.BLOCKED, reason=_reason[:1000])
+                raise
             ops.finish_operation(
                 self.db,
                 op.id,
@@ -445,6 +462,25 @@ class ProjectCoordinator:
         adapter = self.registry.get_adapter(provider_name)
         if adapter is None:  # pragma: no cover - defensive
             raise RuntimeError(f"planning adapter {provider_name} missing")
+        # Strict compiled context first (Increment 2): a compilation failure
+        # raises before any workdir, provider execution, lease, or run exists.
+        from .context_compiler import ContextCompileSpec, prepare_invocation_context
+
+        _row = self.db.get("product_projects", project_id) or {}
+        _cc_spec = ContextCompileSpec(
+            role="planner",
+            stage=STAGE_PRODUCT_PLANNING,
+            product_project_id=project_id,
+            provider=provider_name,
+            task_objective=f"{_row.get('idea', '')}\n{_row.get('constraints_text', '')}",
+            task_title=str(_row.get("name", project_id)),
+            task_description=str(_row.get("idea", "")),
+            extra_context=prompt,
+            attempt=attempt_index + 1,
+        )
+        _effective_prompt, _plan_ctx = prepare_invocation_context(
+            legacy_prompt=prompt, spec=_cc_spec, db=self.db, config=self.config
+        )
         # Isolated per-run planner directory: never shared /tmp as cwd.
         workdir = Path(tempfile.mkdtemp(prefix="gg-plan-"))
         try:
@@ -456,29 +492,7 @@ class ProjectCoordinator:
             log_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             log_dir = workdir
-        _plan_ctx: dict[str, Any] = {}
-        _effective_prompt = prompt
-        try:
-            from .context_compiler import ContextCompileSpec, prepare_invocation_context
-
-            _row = self.db.get("product_projects", project_id) or {}
-            _cc_spec = ContextCompileSpec(
-                role="planner",
-                stage=STAGE_PRODUCT_PLANNING,
-                product_project_id=project_id,
-                provider=provider_name,
-                task_objective=f"{_row.get('idea', '')}\n{_row.get('constraints_text', '')}",
-                task_title=str(_row.get("name", project_id)),
-                task_description=str(_row.get("idea", "")),
-                extra_context=prompt,
-                attempt=attempt_index + 1,
-            )
-            _effective_prompt, _plan_ctx = prepare_invocation_context(
-                legacy_prompt=prompt, spec=_cc_spec, db=self.db, config=self.config
-            )
-        except Exception:
-            logger.debug("product planning compilation unavailable", exc_info=True)
-            _effective_prompt, _plan_ctx = prompt, {}
+        # _effective_prompt/_plan_ctx are the strict compiled outputs above.
         outcome = await self._invocations().execute(
             InvocationSpec(
                 owner=InvocationOwner(product_project_id=project_id, operation_id=operation_id),

@@ -383,11 +383,18 @@ class MissionEngine:
             self.events.publish(EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value)
             handoff_content = self._make_handoff(role, last_provider, provider_name, ROLE_PROMPTS[role])
             prompt = self._build_prompt(role, mission, handoff_content, extra_context)
-            # Role-specific context compiler (Increment 2): deterministic
-            # projection over requirements/acceptance/architecture/handoffs.
-            # Legacy prompt remains the fallback baseline (legacy-v1).
+            # Role-specific context compiler (Increment 2, strict in compiled
+            # mode): deterministic projection over requirements/acceptance/
+            # architecture/handoffs. Compiled-mode compilation failure records
+            # an honest mission failure; the provider is NEVER invoked with a
+            # degraded prompt (no silent legacy fallback). Provider selection
+            # above is side-effect-free (no lease, no health change).
             _product_id_early, _phase_id_early = self._product_attribution()
             _ctx_meta: dict[str, Any] = {}
+            _constituted_spec: Any = None
+            from .context_compiler import ContextCompileError as _CCError
+            from .context_compiler import compile_failure_reason as _cc_reason
+
             try:
                 from .context_compiler import (
                     ContextCompileSpec,
@@ -441,9 +448,13 @@ class MissionEngine:
                 prompt, _ctx_meta = prepare_invocation_context(
                     legacy_prompt=prompt, spec=_constituted_spec, db=self.db, config=self.config
                 )
-            except Exception:
-                logger.debug("context compilation unavailable, using legacy prompt", exc_info=True)
-                _ctx_meta = {}
+            except Exception as exc:
+                # Fail closed: no provider execution, no lease, no health
+                # change, no provider_run. The mission records why it stopped.
+                _code = exc.code if isinstance(exc, _CCError) else "CONTEXT_COMPILATION_INTERNAL"
+                logger.warning("context compilation failed (%s); mission %s blocked", _code, self.mission_id)
+                self._fail(_cc_reason(exc, _constituted_spec))
+                return None
 
             task = TaskRecord(
                 mission_id=self.mission_id, role=role, status="running", prompt=prompt[-4000:], attempts=1

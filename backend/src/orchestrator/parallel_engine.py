@@ -761,6 +761,10 @@ class ParallelMissionEngine:
         _product_id, _phase_id = self._product_attribution()
         _stage = role.value if role.value in ("review", "repair") else role.value
         _ctx_meta: dict[str, Any] = {}
+        _spec_cc: Any = None
+        from .context_compiler import ContextCompileError as _CCError2
+        from .context_compiler import compile_failure_reason as _cc_reason2
+
         try:
             from .context_compiler import (
                 ContextCompileSpec,
@@ -802,9 +806,14 @@ class ParallelMissionEngine:
             prompt, _ctx_meta = prepare_invocation_context(
                 legacy_prompt=prompt, spec=_spec_cc, db=self.db, config=self.config
             )
-        except Exception:
-            logger.debug("context compilation unavailable, using legacy prompt", exc_info=True)
-            _ctx_meta = {}
+        except Exception as exc:
+            # Fail closed: no provider execution, no lease, no health change,
+            # no provider_run. The mission records why this phase stopped.
+            _code = exc.code if isinstance(exc, _CCError2) else "CONTEXT_COMPILATION_INTERNAL"
+            logger.warning("context compilation failed (%s); mission %s blocked", _code, self.mission_id)
+            self._active_invocation_runs.pop(f"__role_{role.value}", None)
+            self._set_mission_status(MissionStatus.FAILED, blocking_issue=_cc_reason2(exc, _spec_cc))
+            return None
         _pre_run_id = f"run-{_uuid.uuid4().hex[:12]}"
         _track_key = f"__role_{role.value}"
         self._active_invocation_runs[_track_key] = _pre_run_id
@@ -1107,6 +1116,10 @@ class ParallelMissionEngine:
             _plan_run_id = f"run-{_uuid2.uuid4().hex[:12]}"
             self._active_invocation_runs[_plan_key] = _plan_run_id
             _dag_ctx: dict[str, Any] = {}
+            _dag_spec: Any = None
+            from .context_compiler import ContextCompileError as _CCError3
+            from .context_compiler import compile_failure_reason as _cc_reason3
+
             try:
                 from .context_compiler import ContextCompileSpec, prepare_invocation_context
 
@@ -1126,9 +1139,14 @@ class ParallelMissionEngine:
                 _compiled_prompt, _dag_ctx = prepare_invocation_context(
                     legacy_prompt=prompt, spec=_dag_spec, db=self.db, config=self.config
                 )
-            except Exception:
-                logger.debug("dag planning compilation unavailable", exc_info=True)
-                _compiled_prompt, _dag_ctx = prompt, {}
+            except Exception as exc:
+                # Fail closed: planner provider never invoked; mission fails
+                # honestly instead of planning from a degraded prompt.
+                _code = exc.code if isinstance(exc, _CCError3) else "CONTEXT_COMPILATION_INTERNAL"
+                logger.warning("dag planning compilation failed (%s); mission %s blocked", _code, self.mission_id)
+                self._active_invocation_runs.pop(_plan_key, None)
+                self._set_mission_status(MissionStatus.FAILED, blocking_issue=_cc_reason3(exc, _dag_spec))
+                return False
             try:
                 outcome = await self._invocations().execute(
                     InvocationSpec(
@@ -1499,6 +1517,10 @@ class ParallelMissionEngine:
 
         _product_id, _phase_id = self._product_attribution()
         _task_ctx: dict[str, Any] = {}
+        _task_ctx_spec: Any = None
+        from .context_compiler import ContextCompileError as _CCError4
+        from .context_compiler import compile_failure_reason as _cc_reason4
+
         try:
             import json as _json2
 
@@ -1533,9 +1555,30 @@ class ParallelMissionEngine:
             prompt, _task_ctx = prepare_invocation_context(
                 legacy_prompt=prompt, spec=_task_ctx_spec, db=self.db, config=self.config
             )
-        except Exception:
-            logger.debug("task compilation unavailable for %s", task_id, exc_info=True)
-            _task_ctx = {}
+        except Exception as exc:
+            # Fail closed: task never enters provider execution. Dependents
+            # react through the existing failed-dependency rules; no
+            # provider_run, lease, or health change exists for this task.
+            _code = exc.code if isinstance(exc, _CCError4) else "CONTEXT_COMPILATION_INTERNAL"
+            logger.warning("task %s compilation failed (%s); task blocked", task_id, _code)
+            release_provider_reservation(self.db, self.events, task_id)
+            task_locks.release_locks_for_task(self.db, self.events, task_id)
+            self.db.update(
+                "tasks",
+                task_id,
+                {
+                    "status": TaskStatus.FAILED.value,
+                    "blocking_issue": _cc_reason4(exc, _task_ctx_spec)[:1000],
+                    "finished_at": utcnow().isoformat(),
+                },
+            )
+            self.events.publish(
+                EventType.TASK_FAILED,
+                mission_id=self.mission_id,
+                task_id=task_id,
+                reason="context_compilation_failed",
+            )
+            return
         _pre_run_id = f"run-{_uuid.uuid4().hex[:12]}"
         self._active_invocation_runs[task_id] = _pre_run_id
         try:

@@ -311,13 +311,18 @@ def phase_spec(db: Any, phase_id: str | None) -> dict[str, Any] | None:
 
 def mapped_requirements(
     db: Any, product_project_id: str | None, requirement_ids: list[str], phase_id: str | None = None
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Return (mapped req dicts, warnings). Includes globals (non_functional as constraints separately)."""
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Return (mapped req dicts, missing ids, warnings).
+
+    IDs are stably deduplicated (F-04): duplicates must not consume duplicate
+    mandatory budget for one rendered requirement body. Includes globals
+    (non_functional as constraints separately).
+    """
     warnings: list[str] = []
     if not product_project_id:
-        return [], warnings
+        return [], list(dict.fromkeys(requirement_ids)), warnings
     all_reqs = {r.get("id"): r for r in project_requirements(db, product_project_id) if r.get("id")}
-    ids: list[str] = list(requirement_ids)
+    ids: list[str] = list(dict.fromkeys(requirement_ids))
     if phase_id:
         phase = phase_spec(db, phase_id)
         if phase:
@@ -345,13 +350,19 @@ def mapped_requirements(
     missing = [i for i in ids if i not in all_reqs]
     if missing:
         warnings.append("MISSING_REQUIREMENT_MAPPING")
-    return mapped, warnings
+    return mapped, missing, warnings
 
 
 def relevant_architecture(
     db: Any, product_project_id: str | None, requirement_ids: list[str], task_text: str = ""
 ) -> tuple[list[dict[str, str]], list[str]]:
-    """Deterministic relevance: global/critical always, scoped by keyword overlap otherwise."""
+    """Deterministic relevance: global/critical always, scoped by keyword overlap otherwise.
+
+    Known limitation (F-05, deferred): lexical matching can miss plurals and
+    synonyms (payments/payment, checkout/Stripe billing). Safe because
+    global/critical decisions are always included; a future improvement
+    should use explicit deterministic tags/mappings, not an LLM classifier.
+    """
     warnings: list[str] = []
     if not product_project_id:
         return [], warnings
@@ -617,8 +628,16 @@ def build_candidate_blocks(
         )
 
     # Requirement + acceptance projection (mandatory when mapped).
-    mapped, w1 = mapped_requirements(db, spec.product_project_id, spec.requirement_ids, spec.project_phase_id)
+    # Unresolved explicit references fail closed for contract roles (F-02):
+    # legacy may omit the same context compiled mode exists to guarantee.
+    mapped, missing, w1 = mapped_requirements(db, spec.product_project_id, spec.requirement_ids, spec.project_phase_id)
     warnings.extend(w1)
+    if missing and _is_contract_role(role):
+        raise ContextCompileError(
+            "MISSING_REQUIREMENT_MAPPING",
+            f"required requirement reference(s) cannot be resolved: {', '.join(missing)}. "
+            "Provider will NOT be invoked.",
+        )
     aux["mapped_requirement_ids"] = [r.get("id") for r in mapped if r.get("id")]
     for r in mapped:
         rid = str(r.get("id", ""))
@@ -1371,9 +1390,38 @@ def finding_files(db: Any, mission_id: str | None) -> list[str]:
 
 
 # -- integration helper ----------------------------------------------------------
-# Single choke point for legacy/compiled/shadow selection with safe fallback.
-# Compilation itself consumes zero provider quota; failure never silently
-# launches a degraded prompt.
+# Single choke point for legacy/compiled/shadow selection.
+#
+# Mode contract:
+#   legacy   — never compile; execute legacy-v1; record legacy honestly.
+#   shadow   — compile for measurement; ALWAYS execute legacy (exactly one
+#              provider call); compilation failure is observable via
+#              SHADOW_COMPILATION_FAILED + error code, never a fake success.
+#   compiled — STRICT: compilation failure raises; the provider MUST NOT
+#              execute. No silent legacy fallback (F-01/F-02).
+# Compilation itself consumes zero provider quota in every mode.
+
+
+#: Roles that carry a requirement/acceptance task contract. Unresolved
+#: explicit requirement references fail closed for these roles; planner
+#: returns before requirement processing and is unaffected.
+CONTRACT_ROLES = frozenset({"implementer", "implementation", "reviewer", "review", "repairer", "repair", "testing"})
+
+
+def _is_contract_role(role: str) -> bool:
+    return role.lower() in CONTRACT_ROLES
+
+
+def compile_failure_reason(exc: BaseException, spec: ContextCompileSpec | None = None) -> str:
+    """Operator-visible compile-failure reason. Never includes raw context."""
+    code = exc.code if isinstance(exc, ContextCompileError) else "CONTEXT_COMPILATION_INTERNAL"
+    detail = (str(exc)[:300] if str(exc) else code).replace("\n", " ").rstrip(". ")
+    role = spec.role if spec is not None else "?"
+    stage = spec.stage if spec is not None and spec.stage else "?"
+    return (
+        f"Context compilation failed: {code} (role={role} stage={stage}, policy={POLICY_COMPILED_V2}). "
+        f"{detail}. Provider was NOT invoked."
+    )
 
 
 def prepare_invocation_context(
@@ -1404,23 +1452,49 @@ def prepare_invocation_context(
         # Optional refinement stays disabled; interface preserved for future.
         compiled = compiler.compile(spec)
     except ContextCompileError as exc:
-        # Critical missing/overflow blocks the launch; caller must surface.
-        # Non-safety fallback to legacy is explicit and auditable.
-        if exc.code in ("MANDATORY_CONTEXT_OVERFLOW", "MISSING_REQUIREMENT_MAPPING") and legacy_prompt:
-            if exc.code == "MANDATORY_CONTEXT_OVERFLOW":
-                raise
-        logger.warning("context compilation failed (%s), falling back to legacy", exc.code)
-        return legacy_prompt, {
-            "prompt_template_version": TEMPLATE_VERSION_LEGACY,
-            "context_policy_version": CONTEXT_POLICY_LEGACY,
-            "context_blocks_json": None,
-            "context_warnings_json": json.dumps([f"COMPILER_FALLBACK_{exc.code}"]),
-            "context_budget": None,
-            "context_used": None,
-            "context_remaining": None,
-            "context_repeated_ratio": None,
-            "context_plan_revision": spec.plan_revision,
-        }
+        if mode == "shadow":
+            # Shadow explicitly preserves legacy execution for measurement,
+            # but the failure is observable: legacy versions are recorded
+            # (the executed prompt IS legacy) and no compiled success is
+            # claimed. Exactly one provider call happens downstream.
+            logger.warning("shadow context compilation failed (%s); executing legacy", exc.code)
+            return legacy_prompt, {
+                "prompt_template_version": TEMPLATE_VERSION_LEGACY,
+                "context_policy_version": CONTEXT_POLICY_LEGACY,
+                "context_blocks_json": None,
+                "context_warnings_json": json.dumps(
+                    ["SHADOW_COMPILATION_FAILED", exc.code, "SHADOW_MODE_LEGACY_EXECUTED"]
+                ),
+                "context_budget": None,
+                "context_used": None,
+                "context_remaining": None,
+                "context_repeated_ratio": None,
+                "context_plan_revision": spec.plan_revision,
+            }
+        # Compiled mode is strict: mandatory overflow, unresolvable required
+        # requirements, and any other compile failure must NOT silently
+        # execute legacy. Callers record the owner failure; no provider runs.
+        raise
+    except Exception as exc:
+        # Internal compiler bug: never hide behind legacy execution.
+        if mode == "shadow":
+            logger.warning("shadow context compilation crashed; executing legacy", exc_info=True)
+            return legacy_prompt, {
+                "prompt_template_version": TEMPLATE_VERSION_LEGACY,
+                "context_policy_version": CONTEXT_POLICY_LEGACY,
+                "context_blocks_json": None,
+                "context_warnings_json": json.dumps(
+                    ["SHADOW_COMPILATION_FAILED", "CONTEXT_COMPILATION_INTERNAL", "SHADOW_MODE_LEGACY_EXECUTED"]
+                ),
+                "context_budget": None,
+                "context_used": None,
+                "context_remaining": None,
+                "context_repeated_ratio": None,
+                "context_plan_revision": spec.plan_revision,
+            }
+        raise ContextCompileError(
+            "CONTEXT_COMPILATION_INTERNAL", f"compiler bug, refusing to launch degraded prompt: {exc}"
+        ) from exc
     meta: dict[str, Any] = {
         "prompt_template_version": compiled.template_version,
         "context_policy_version": compiled.policy_version,
