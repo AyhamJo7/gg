@@ -43,6 +43,7 @@ Backend modules are under `backend/src/orchestrator/`.
 | `task_worktree.py`, `integration.py`, `git_ops.py` | Worktrees, final integration, checkpoint ledger and secret scanning |
 | `providers/*`, `process.py`, `_spawn_gate.py`, `orphans.py` | CLI argv/output, cooldowns, process groups, identity handshake, owned-process recovery |
 | `invocations.py`, `usage.py`, `context_manifest.py`, `operations.py` | Shared invocation boundary, usage parsers, prompt manifests, durable operations |
+| `context_compiler.py` | Deterministic role-specific context compiler (`compiled-v2` / `context-policy-v2`) |
 | `review.py` | Finding parsing, fingerprints, explicit repair verification |
 | `workspace.py`, `verify.py`, `criterion.py`, `sandbox.py` | Root-manifest toolchain detection and confined objective commands |
 | `events.py`, `security.py` | Durable events, transient output, redaction and path boundaries |
@@ -55,10 +56,11 @@ Missions own tasks, runs, handoffs, findings, reviews, and mission gates.
 DAG edges, reservations, locks, branches, and integrations support parallel work.
 `provider_profiles` exists in the schema but is not used by routing.
 
-`db.py` uses one SQLite connection, WAL, foreign keys and a thread lock. Ten
-numbered migrations are applied at startup (0010 adds invocation
-observability: run attribution/stage/status/model columns, `run_context_manifests`,
-`run_usage`, `invocation_leases`, `orchestration_operations`). Individual database
+`db.py` uses one SQLite connection, WAL, foreign keys and a thread lock. Eleven
+numbered migrations are applied at startup (0010: run attribution/stage/status/
+model columns, `run_context_manifests`, `run_usage`, `invocation_leases`,
+`orchestration_operations`; 0011: compiler manifest columns — budget/used/
+remaining estimates, repeated-context ratio, warnings, plan revision). Individual database
 calls usually commit separately; multi-step lifecycle mutations are not all atomic
 transactions. Run one backend owner per state directory; multi-process scheduling
 is unsupported. Historical runs keep NULL/UNKNOWN telemetry; never zero-filled.
@@ -99,22 +101,31 @@ the audit for evidence and proposals.
 
 ## Prompts, metrics, and security
 
-Prompts are Python string builders (content preserved for baseline). There is no
-context compiler yet; every invocation persists a baseline manifest (sizes, hash,
-`char4-v1` estimate labeled as estimate) and normalized usage with
-source/completeness/basis. Requested vs observed model are stored separately.
-Product phase prompts include tasks/criteria but omit the plan's architecture and
-mapped requirement definitions. Sequential handoffs repeat mission text and short
-summaries. Parallel task prompts contain title/description and generic
-instructions only. CLI-native instructions/tools add context outside these strings.
+All provider prompts go through the deterministic role-specific context
+compiler (`backend/src/orchestrator/context_compiler.py`, no provider calls).
+Per role (planner / implementer / reviewer / repairer / testing) it projects
+only mapped requirements, acceptance criteria, relevant architecture, explicit
+dependency handoffs, bounded failure evidence, and retrieval hints into a
+budgeted prompt (`compiled-v2`, policy `context-policy-v2`), with per-block
+include/compact/omit decisions persisted as manifest metadata (no raw prompt
+or secret text). Reviewer prompts exclude implementer self-assessment;
+repairer prompts carry only the current defect contract. Mandatory blocks
+(requirements, acceptance, safety) can never be silently dropped — overflow
+fails instead. Mode is configurable (`context.mode`: `compiled` default,
+`legacy` for the `legacy-v1` baseline, `shadow` to measure compiled while
+executing legacy). `backend/scripts/compare_context.py` replays representative
+roles without providers to compare legacy vs compiled sizes.
 GG prompt estimates and provider-observed usage are separate metrics; quota and
 cost are not inferred.
 
 Structured events persist in SQLite; provider output is transient with a 500-line
 per-mission replay buffer. Raw stdout/stderr lives below target
 `.orchestrator/logs/` (planning logs under state `logs/`). Analytics keeps its
-mission/finding/provider counts and adds `/api/analytics/usage` coverage plus
-`/api/runs` inspection; unknown telemetry is shown as unknown, never zero.
+mission/finding/provider counts and adds `/api/analytics/usage` coverage,
+`/api/analytics/context` efficiency (avg estimated tokens by policy/role,
+repeated-context ratio, compilation warnings; legacy vs compiled), plus
+`/api/runs` inspection with a read-only Context view (blocks, budget, omissions,
+warnings — never raw prompts); unknown telemetry is shown as unknown, never zero.
 
 Under `make dev`, database/token files live in `backend/.orchestrator/`. Paths are
 cwd-relative; desktop launch can use a different state directory. Verification

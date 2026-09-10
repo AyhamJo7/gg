@@ -95,7 +95,11 @@ never zero.
 - AGY: `UNKNOWN` until a verified fixture proves a schema.
 
 CLI-reported usage is not independently measured provider billing. GG prompt
-estimates exclude CLI-added instructions and internal tool turns. Subscription
+estimates exclude CLI-added instructions and internal tool turns. Since
+`compiled-v2`, the GG estimate measures the role-specific compiled prompt
+(mapped requirements/acceptance, relevant architecture, dependency handoffs,
+bounded evidence); a smaller estimate means less GG-supplied context, not a
+proven subscription saving. Subscription
 quota remaining is unknown unless separately exposed with trustworthy provenance.
 Requested vs observed model are stored separately; unknown stays null.
 

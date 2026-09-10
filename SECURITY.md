@@ -240,7 +240,10 @@ operations, and workspace escape.
   product planning) persists PID/PGID/start identity before the spawn gate
   releases, verifies ownership before signalling, and releases capacity only
   after confirmed exit. Invocation manifests persist sizes/hashes/estimates
-  only — never raw secrets or `.env` content.
+  only — never raw secrets or `.env` content. Compiled-v2 block manifests
+  persist per-block metadata (type, priority, representation, reason, hash)
+  only; prohibited blocks are omitted before budgeting and secret-shaped
+  content is dropped defense-in-depth.
 - `workspace_scope` is a scheduling lock, not a filesystem sandbox: a task
   declares which paths it will touch so conflicting tasks serialize, but the
   provider process itself is not confined to those paths.
