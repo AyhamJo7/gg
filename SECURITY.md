@@ -165,10 +165,31 @@ operations, and workspace escape.
   network — inherent to needing network for install at all, not fixable
   without disabling install entirely, and the repo's content isn't secret
   the way host credentials are, and (b) reach any network destination,
-  since only `--unshare-net` is dropped — nothing scopes this to
-  registry-only traffic (a package-registry allow-list would need a
-  network namespace + firewall setup beyond what `bwrap` alone provides;
-  not implemented).
+  since only `--unshare-net` is dropped: this is the *host's own network
+  namespace*, not a scoped one, so the sandboxed install process can reach
+  `127.0.0.1:<any-port>` — including, when this was reviewed, the
+  orchestrator's own API. That was proven live: with `GET` routes exempt
+  from the bearer-token check, a malicious install-time dependency could
+  read every project's and mission's data (plans, task logs, delivery
+  reports, waiver history) unauthenticated, over the same connection
+  install needs anyway. **Fixed** by requiring the token on `GET` too (see
+  `api/auth.py`'s module docstring) — the install step has no path to the
+  real token (it operates on a fresh clone into a scratch dir; the state
+  directory holding the token is gitignored and absent from that clone), so
+  this closes the specific proven exfiltration path regardless of what
+  `allow_network=True` can reach. What's **not** fixed: `allow_network=True`
+  is still the full host network namespace, so the install step can reach
+  any *other* unauthenticated local/LAN service during that window (a local
+  dev database, another app's debug port, etc.) — lateral movement beyond
+  this application's own API. Scoping this to registry-only traffic would
+  need a private network namespace with outbound NAT and
+  `--disable-host-loopback` (e.g. via `slirp4netns`, confirmed installed and
+  capable of exactly this) instead of the host's namespace; this was
+  evaluated and deferred rather than rushed — wiring bwrap and slirp4netns
+  together correctly requires a ready-fd/FIFO handshake so the payload
+  never execs before the private network is fully configured, and getting
+  that synchronization subtly wrong would be a worse outcome than the
+  currently-documented gap, per this document's own repeated lesson.
 
 ### Provider autonomy
 - CLIs run with permission bypass flags **inside the user-selected workspace** —
@@ -179,12 +200,17 @@ operations, and workspace escape.
 
 ## Known limitations
 
-- `GET` routes and the bearer token itself are not hardened against other
-  local processes reading the token file — a compromised local dependency
-  with filesystem access can still read `.orchestrator/auth_token` and call
-  any route. The token stops a blind network caller, not a co-resident
-  attacker with file access; do not expose the port or run behind a reverse
-  proxy without a stronger auth layer than this single-operator scheme.
+- The bearer token itself is not hardened against other local processes
+  reading the token file — a compromised local dependency with filesystem
+  access can still read `.orchestrator/auth_token` and call any route. The
+  token stops a blind network caller (including, since the fix above, a
+  network-enabled sandboxed subprocess with no path to the token file), not
+  a co-resident attacker with file access; do not expose the port or run
+  behind a reverse proxy without a stronger auth layer than this
+  single-operator scheme. `/api/health` is the sole exception (any method):
+  a minimal liveness probe with no project-specific data, kept open so
+  scripts can detect the backend is up before the token file is guaranteed
+  readable — every other route requires the token, `GET`/`HEAD` included.
 - The `actor` field on acceptance waivers is a self-reported audit label,
   not a verified identity — the shared bearer token proves "holds the
   token," not "is a specific person."
