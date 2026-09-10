@@ -754,6 +754,23 @@ class ParallelMissionEngine:
         prompt = self._build_prompt(role, handoff_content, extra_context)
         commit_before = await git_ops.head_sha(project_path)
 
+        # Exact-SHA write provenance: repair runs must start clean, or prior
+        # dirt would be silently attributed to the repairer.
+        from .provenance import CODE_WRITING_ROLES, capture_write_start
+
+        if role.value in CODE_WRITING_ROLES:
+            _, _dirty, _paths = await capture_write_start(project_path)
+            if _dirty:
+                self._set_mission_status(
+                    MissionStatus.FAILED,
+                    blocking_issue=(
+                        f"workspace has unattributed changes before {role.value} run "
+                        f"({', '.join(_paths[:5])}); commit, discard, or adopt them as human "
+                        "operator, then retry. Provider was NOT invoked."
+                    ),
+                )
+                return None
+
         import uuid as _uuid
 
         from .invocations import InvocationOwner, InvocationSpec
@@ -884,6 +901,32 @@ class ParallelMissionEngine:
             pgid=outcome.pgid,
             gate_refused=outcome.gate_refused,
         )
+        if role.value in CODE_WRITING_ROLES and result.ok:
+            # Checkpoint repair work immediately (mirroring sequential phase
+            # semantics) so the repair run binds to an exact result SHA
+            # instead of dissolving into the final checkpoint.
+            try:
+                max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
+                await git_ops.checkpoint(
+                    project_path,
+                    f"agent({provider_name}): {role.value} checkpoint",
+                    max_file_mb=max_mb,
+                )
+            except git_ops.GitError:
+                logger.debug("repair checkpoint deferred to final checkpoint", exc_info=True)
+            from .provenance import record_provider_write as _record_repair_write
+
+            await _record_repair_write(
+                self.db,
+                workdir=project_path,
+                run_id=run_id,
+                mission_id=self.mission_id,
+                product_project_id=_product_id,
+                phase_id=_phase_id,
+                provider=provider_name,
+                role=role.value,
+                base_sha=commit_before,
+            )
         return result
 
     async def _make_handoff(
@@ -1073,6 +1116,7 @@ class ParallelMissionEngine:
         attempt = 0
         wait_started: float | None = None
         result: ExecutionResult | None = None
+        _plan_prev_run_id: str | None = None
         while attempt < max_attempts:
             if self._cancel.is_set():
                 self._set_mission_status(MissionStatus.CANCELLED)
@@ -1165,6 +1209,7 @@ class ParallelMissionEngine:
                         model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
                         run_id=_plan_run_id,
                         attempt_number=attempt + 1,
+                        retry_of_run_id=_plan_prev_run_id,
                         cancel_event=self._cancel,
                         prompt_template_version=_dag_ctx.get("prompt_template_version"),
                         context_policy_version=_dag_ctx.get("context_policy_version"),
@@ -1183,6 +1228,7 @@ class ParallelMissionEngine:
                 await self._wait_tick()
                 continue
             self._active_invocation_runs.pop(_plan_key, None)
+            _plan_prev_run_id = outcome.run_id
             result = ExecutionResult(
                 state=ProviderState(outcome.provider_state)
                 if outcome.provider_state in ProviderState.__members__.values()
@@ -1513,6 +1559,42 @@ class ParallelMissionEngine:
             commit_before = None
             logger.debug("git head failed for task %s", task_id, exc_info=True)
 
+        # Exact-SHA write provenance: a task worktree must start clean, or
+        # prior dirt (another task's leftovers, human edits) would be
+        # silently attributed to this task's provider.
+        from .provenance import capture_write_start as _capture_task_start
+
+        _, _task_dirty, _task_paths = await _capture_task_start(Path(worktree_path))
+        if _task_dirty:
+            release_provider_reservation(self.db, self.events, task_id)
+            task_locks.release_locks_for_task(self.db, self.events, task_id)
+            self.db.update(
+                "tasks",
+                task_id,
+                {
+                    "status": TaskStatus.FAILED.value,
+                    "blocking_issue": (
+                        f"task worktree has unattributed changes before provider run "
+                        f"({', '.join(_task_paths[:5])}); clean or adopt them, then retry. "
+                        "Provider was NOT invoked."
+                    )[:1000],
+                    "finished_at": utcnow().isoformat(),
+                },
+            )
+            self.events.publish(
+                EventType.TASK_FAILED,
+                mission_id=self.mission_id,
+                task_id=task_id,
+                reason="dirty_worktree_unattributed",
+            )
+            return
+
+        # Retry lineage: link to this task's latest prior run when relaunching.
+        _task_prev_runs = self.db.query(
+            "SELECT id FROM provider_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1", (task_id,)
+        )
+        _task_retry_of = _task_prev_runs[0]["id"] if _task_prev_runs else None
+
         from .invocations import STAGE_TASK, InvocationOwner, InvocationSpec
 
         _product_id, _phase_id = self._product_attribution()
@@ -1600,6 +1682,7 @@ class ParallelMissionEngine:
                     model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
                     run_id=_pre_run_id,
                     cancel_event=self._cancel,
+                    retry_of_run_id=_task_retry_of,
                     prompt_template_version=_task_ctx.get("prompt_template_version"),
                     context_policy_version=_task_ctx.get("context_policy_version"),
                     context_blocks_json=_task_ctx.get("context_blocks_json"),
@@ -1710,6 +1793,21 @@ class ParallelMissionEngine:
                     "provider_run_id": run_id,
                     "checkpoint_after": checkpoint_sha,
                 },
+            )
+            # Bind this task run to its checkpoint SHA (P-02).
+            from .provenance import record_provider_write as _record_task_write
+
+            await _record_task_write(
+                self.db,
+                workdir=Path(worktree_path),
+                run_id=run_id,
+                mission_id=self.mission_id,
+                task_id=task_id,
+                product_project_id=_product_id,
+                phase_id=_phase_id,
+                provider=provider_name,
+                role=role.value,
+                base_sha=commit_before,
             )
             self.events.publish(
                 EventType.TASK_COMPLETED,

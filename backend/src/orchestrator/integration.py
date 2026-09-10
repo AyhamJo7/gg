@@ -104,6 +104,7 @@ async def run_integration(
                 continue
 
             # Attempt merge
+            _pre_merge = await git_ops.head_sha(project_path)
             merge_res = await git_ops._spawn_git(project_path, "merge", "--no-commit", "--no-ff", branch)
 
             if merge_res.returncode != 0:
@@ -165,6 +166,26 @@ async def run_integration(
 
             merged_commit = await git_ops.head_sha(project_path)
             summary_parts.append(f"integrated {branch}")
+            # SYSTEM integration commit: constituent provider writers are
+            # preserved via ancestry (their task checkpoints are parents of
+            # this merge), never collapsed into "GG wrote it".
+            try:
+                from .provenance import ACTOR_SYSTEM, record_write
+
+                record_write(
+                    db,
+                    run_id=None,
+                    mission_id=mission_id,
+                    task_id=task_id,
+                    actor_type=ACTOR_SYSTEM,
+                    actor_detail=f"integrate {branch}",
+                    provider=None,
+                    role="integration",
+                    base_sha=_pre_merge,
+                    result_sha=merged_commit,
+                )
+            except Exception:
+                logger.debug("integration provenance insert failed for %s", branch, exc_info=True)
 
     except git_ops.GitError as exc:
         logger.exception("integration failed")
