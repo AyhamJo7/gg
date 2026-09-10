@@ -765,12 +765,14 @@ class ParallelMissionEngine:
         commit_before = await git_ops.head_sha(project_path)
 
         # Exact-SHA write provenance: repair runs must start clean, or prior
-        # dirt would be silently attributed to the repairer.
+        # dirt would be silently attributed to the repairer. Skipped while
+        # checkpointing itself is broken (the exhaustion path owns that).
         from .provenance import CODE_WRITING_ROLES, capture_write_start
 
         if role.value in CODE_WRITING_ROLES:
             _, _dirty, _paths = await capture_write_start(project_path)
-            if _dirty:
+            _ckpt_failures = int((self._mission().get("checkpoint_failures") or 0))
+            if _dirty and _ckpt_failures == 0:
                 self._set_mission_status(
                     MissionStatus.FAILED,
                     blocking_issue=(
@@ -914,14 +916,30 @@ class ParallelMissionEngine:
         if role.value in CODE_WRITING_ROLES and result.ok:
             # Checkpoint repair work immediately (mirroring sequential phase
             # semantics) so the repair run binds to an exact result SHA
-            # instead of dissolving into the final checkpoint.
+            # instead of dissolving into the final checkpoint. Skipped when
+            # clean so checkpoint-failure accounting stays with real ones.
             try:
-                max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
-                await git_ops.checkpoint(
-                    project_path,
-                    f"agent({provider_name}): {role.value} checkpoint",
-                    max_file_mb=max_mb,
-                )
+                _repair_st = await git_ops.status(project_path)
+                if not _repair_st.is_clean:
+                    max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
+                    _repair_sha = await git_ops.checkpoint(
+                        project_path,
+                        f"agent({provider_name}): {role.value} checkpoint",
+                        max_file_mb=max_mb,
+                    )
+                    if _repair_sha:
+                        _mission_row = self._mission()
+                        self.db.insert(
+                            "checkpoints",
+                            {
+                                "id": f"ckpt-{utcnow().timestamp()}".replace(".", ""),
+                                "mission_id": self.mission_id,
+                                "project_id": _mission_row.get("project_id"),
+                                "commit_sha": _repair_sha,
+                                "message": f"agent({provider_name}): {role.value} checkpoint",
+                                "created_at": utcnow().isoformat(),
+                            },
+                        )
             except git_ops.GitError:
                 logger.debug("repair checkpoint deferred to final checkpoint", exc_info=True)
             from .provenance import record_provider_write as _record_repair_write
@@ -1295,11 +1313,14 @@ class ParallelMissionEngine:
             task.mission_id = self.mission_id
         namespace_dag_ids(self.mission_id, tasks)
         # Checkpoint planner-side files (if any) so later task checkpoints
-        # cannot silently absorb unattributed planner output.
+        # cannot silently absorb unattributed planner output. Skipped when
+        # clean so checkpoint-failure accounting stays with real checkpoints.
         try:
-            max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
-            await git_ops.checkpoint(project_path, f"agent({provider_name}): planning checkpoint",
-                                     max_file_mb=max_mb)
+            _plan_st = await git_ops.status(project_path)
+            if not _plan_st.is_clean:
+                max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
+                await git_ops.checkpoint(project_path, f"agent({provider_name}): planning checkpoint",
+                                         max_file_mb=max_mb)
         except git_ops.GitError:
             logger.debug("planning checkpoint skipped", exc_info=True)
         try:
@@ -1579,11 +1600,13 @@ class ParallelMissionEngine:
 
         # Exact-SHA write provenance: a task worktree must start clean, or
         # prior dirt (another task's leftovers, human edits) would be
-        # silently attributed to this task's provider.
+        # silently attributed to this task's provider. Skipped while
+        # checkpointing itself is broken (exhaustion path owns that).
         from .provenance import capture_write_start as _capture_task_start
 
         _, _task_dirty, _task_paths = await _capture_task_start(Path(worktree_path))
-        if _task_dirty:
+        _task_ckpt_failures = int(((self.db.get("missions", self.mission_id) or {}).get("checkpoint_failures") or 0))
+        if _task_dirty and _task_ckpt_failures == 0:
             release_provider_reservation(self.db, self.events, task_id)
             task_locks.release_locks_for_task(self.db, self.events, task_id)
             self.db.update(

@@ -394,7 +394,12 @@ class MissionEngine:
 
             if role.value in CODE_WRITING_ROLES:
                 _, _write_dirty, _write_paths = await capture_write_start(self.project_path)
-                if _write_dirty:
+                if _write_dirty and self._checkpoint_failure_count() == 0:
+                    # Checkpointing works, so this dirt appeared outside GG's
+                    # checkpoint flow (human/external mid-mission edit) — it
+                    # must not be silently attributed to this provider run.
+                    # (When checkpointing itself is broken, the exhaustion
+                    # path below owns the outcome instead.)
                     _paths = ", ".join(_write_paths[:5])
                     self._fail(
                         f"workspace has unattributed changes before {role.value} run "
@@ -850,6 +855,10 @@ class MissionEngine:
     async def run(self) -> None:
         self.project_path = self._project_path()
         mission = self._mission()
+        # Observe an already-requested stop before doing any startup work
+        # (pause/resume/cancel can arrive in the same tick as the launch).
+        if self._check_pause_cancel():
+            return
         # Resume/recovery may start mid-sequence (skipping ANALYZING), which
         # used to leave workspace unset and silently disable ALL checkpoints
         # (evidence loss). Re-inspect read-only so checkpoint/verify paths
@@ -859,6 +868,10 @@ class MissionEngine:
                 self.workspace = await inspect_workspace(self.project_path, self.config.allowed_roots())
             except Exception:
                 logger.debug("workspace re-inspection failed", exc_info=True)
+            # Re-check after the (yielding) inspection: a stop requested
+            # during startup must win over phase execution.
+            if self._check_pause_cancel():
+                return
         start_phase = mission.current_phase or MissionStatus.ANALYZING
         if mission.status in (MissionStatus.RECOVERING, MissionStatus.WAITING_FOR_PROVIDER):
             start_phase = mission.current_phase or MissionStatus.ANALYZING

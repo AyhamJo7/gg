@@ -224,7 +224,11 @@ def test_transient_checkpoint_failure_retries_on_rerun(
     calls = {"n": 0}
 
     async def fail_once(root: Path, message: str, max_file_mb: int = 5) -> str | None:
-        if Path(root) == proj and calls["n"] == 0:
+        # Target the FINAL checkpoint only: mid-mission bookkeeping
+        # checkpoints (e.g. immediate repair attribution) absorb transient
+        # blips by design and defer to final; this test pins final-checkpoint
+        # failure accounting (stall, not terminal; retry completes).
+        if Path(root) == proj and "final verified state" in message and calls["n"] == 0:
             calls["n"] += 1
             raise git_ops.GitCheckpointError("transient failure")
         return await real_checkpoint(root, message, max_file_mb=max_file_mb)
