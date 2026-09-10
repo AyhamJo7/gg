@@ -327,7 +327,8 @@ class MissionEngine:
 
             writers, _complete = mission_provider_writers(self.db, self.mission_id, INDEPENDENCE_ROLES)
             if not writers:
-                writers = {self._last_provider_for(Role.IMPLEMENTATION)} - {None}
+                _last_impl = self._last_provider_for(Role.IMPLEMENTATION)
+                writers = {_last_impl} if _last_impl is not None else set()
             alternatives = [p for p in eligible if p not in writers]
             if alternatives:
                 eligible = alternatives

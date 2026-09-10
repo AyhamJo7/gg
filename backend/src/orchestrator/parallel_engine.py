@@ -771,7 +771,7 @@ class ParallelMissionEngine:
 
         if role.value in CODE_WRITING_ROLES:
             _, _dirty, _paths = await capture_write_start(project_path)
-            _ckpt_failures = int((self._mission().get("checkpoint_failures") or 0))
+            _ckpt_failures = int(self._mission().get("checkpoint_failures") or 0)
             if _dirty and _ckpt_failures == 0:
                 self._set_mission_status(
                     MissionStatus.FAILED,
@@ -1085,7 +1085,8 @@ class ParallelMissionEngine:
 
             _writers, _ = mission_provider_writers(self.db, self.mission_id, INDEPENDENCE_ROLES)
             if not _writers:
-                _writers = {self._last_provider_for(Role.IMPLEMENTATION)} - {None}
+                _last_impl = self._last_provider_for(Role.IMPLEMENTATION)
+                _writers = {_last_impl} if _last_impl is not None else set()
             alternatives = [p for p in eligible if p not in _writers]
             if alternatives:
                 eligible = alternatives
@@ -1605,7 +1606,7 @@ class ParallelMissionEngine:
         from .provenance import capture_write_start as _capture_task_start
 
         _, _task_dirty, _task_paths = await _capture_task_start(Path(worktree_path))
-        _task_ckpt_failures = int(((self.db.get("missions", self.mission_id) or {}).get("checkpoint_failures") or 0))
+        _task_ckpt_failures = int((self.db.get("missions", self.mission_id) or {}).get("checkpoint_failures") or 0)
         if _task_dirty and _task_ckpt_failures == 0:
             release_provider_reservation(self.db, self.events, task_id)
             task_locks.release_locks_for_task(self.db, self.events, task_id)

@@ -37,13 +37,13 @@ _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 def valid_sha(value: str | None) -> bool:
     """Full commit SHA syntax only. Never trust abbreviated or LLM-supplied strings blindly."""
-    return bool(value) and bool(_FULL_SHA.fullmatch(value.strip().lower()))
+    return bool(value) and bool(_FULL_SHA.fullmatch(str(value).strip().lower()))
 
 
 def normalize_sha(value: str | None) -> str | None:
-    if not valid_sha(value):
+    if not value or not valid_sha(value):
         return None
-    return str(value).strip().lower()
+    return value.strip().lower()
 
 
 def repo_key(project_id: str | None, common_dir: str) -> str:
@@ -680,7 +680,7 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
         return out
 
     # Writers over the full range.
-    full = (
+    full: dict[str, Any] = (
         await range_writers(db, assert_path(inputs.repo), inputs.oldest_base_sha, candidate)
         if repo_ok
         else {"writers": [], "unattributed": [], "complete": False, "checked": False}
@@ -774,9 +774,9 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
         # acceptance bookkeeping with their own provenance rows).
         if repo_ok and review_state == STATE_VALID:
             tips = [normalize_sha(p.candidate_sha) for p in inputs.phases]
-            tips = [t for t in tips if t]
-            if tips and candidate not in tips:
-                extra = await git_ops.rev_list(assert_path(inputs.repo), tips[-1], candidate)
+            tip_strs = [t for t in tips if t]
+            if tip_strs and candidate not in tip_strs:
+                extra = await git_ops.rev_list(assert_path(inputs.repo), tip_strs[-1], candidate)
                 uncovered = [s for s in extra if not _sha_has_provenance(db, s)]
                 if uncovered:
                     review_state = STATE_STALE
