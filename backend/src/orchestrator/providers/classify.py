@@ -117,26 +117,25 @@ def classify_output(
 
     tail = combined_output[-8000:]
 
-    # 1. Structured success markers (adapter hook or standard schemas)
-    if adapter and hasattr(adapter, "is_success_marker") and adapter.is_success_marker(tail):
-        return FailureClass.NONE
+    # Terminal precedence: an intermediate success-like event must never
+    # override a later failure. Explicit terminal failure evidence and a
+    # non-zero process exit therefore take precedence over any success
+    # marker appearing anywhere in the tail.
+    for failure_class, pattern in _BLOCKING_SIGNALS:
+        if pattern.search(tail):
+            return failure_class
 
-    normalized = tail.replace(" ", "")
-    if exit_code == 0 and (
-        '"subtype":"success"' in normalized
-        or '"status":"SUCCESS"' in normalized
-        or ('"type":"result"' in normalized and '"is_error":true' not in normalized)
-        or '"turn.completed"' in normalized
-        or '"type":"finish"' in normalized
-    ):
-        return FailureClass.NONE
-
-    # 2. Exit code 0 is success unless an explicit positive blocking signal is present
-    if exit_code == 0:
-        for failure_class, pattern in _BLOCKING_SIGNALS:
-            if pattern.search(tail):
-                return failure_class
-        return FailureClass.NONE
+    # Non-zero exit is failure even when an earlier success marker exists.
+    if exit_code is not None and exit_code != 0:
+        pass  # fall through to specific failure classification below
+    else:
+        # exit_code == 0: success unless a blocking signal was present
+        # (checked above). Structured success markers only confirm success;
+        # they are never needed to override a failure.
+        if exit_code == 0:
+            return FailureClass.NONE
+        # exit_code None without cancel/timeout/refusal: no outcome below
+        # may claim success; continue to pattern checks then CRASH.
 
     # 3. Human input prompt (only triggered for non-zero exit codes or exit code None)
     if _HUMAN_INPUT_PATTERNS.search(tail):
@@ -153,5 +152,10 @@ def classify_output(
         return FailureClass.OVERLOADED
 
     if exit_code not in (0, None):
+        return FailureClass.CRASH
+    # exit_code None without cancel/timeout/refusal carries no successful
+    # process outcome; success markers elsewhere in the tail must not
+    # promote it to success.
+    if exit_code is None:
         return FailureClass.CRASH
     return FailureClass.NONE

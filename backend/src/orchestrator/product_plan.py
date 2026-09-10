@@ -160,13 +160,30 @@ def validate_product_plan(data: dict[str, Any]) -> list[str]:
     dupes = sorted({r for r in req_ids if req_ids.count(r) > 1})
     if dupes:
         errors.append(f"duplicate requirement ids: {', '.join(dupes)}")
+    seen_criteria: dict[str, str] = {}
     for r in plan.requirements:
         if not r.acceptance:
             errors.append(f"requirement {r.id} has no acceptance criteria")
         for a in r.acceptance:
+            if not a.id.strip():
+                errors.append(f"requirement {r.id} has a criterion with a blank id")
+            elif a.id in seen_criteria:
+                errors.append(
+                    f"duplicate criterion id: {a.id} (in {seen_criteria[a.id]} and {r.id})"
+                )
+            else:
+                seen_criteria[a.id] = r.id
             ok, _ = is_executable_command(a.verify)
             if not ok:
                 errors.append(f"criterion {a.id} verify is not an executable allowlisted command: {a.verify[:100]!r}")
+    for p in plan.phases:
+        for a in p.acceptance:
+            if not a.id.strip():
+                errors.append(f"phase {p.key} has a criterion with a blank id")
+            elif a.id in seen_criteria:
+                errors.append(f"duplicate criterion id: {a.id} (already used; phase {p.key})")
+            else:
+                seen_criteria[a.id] = f"phase:{p.key}"
     if not plan.phases:
         errors.append("at least one phase is required")
     phase_keys = [p.key for p in plan.phases]
