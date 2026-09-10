@@ -42,7 +42,7 @@ export function EvidencePanel({ projectId }: { projectId: string }) {
     total: number; passed: number; stale: number; failed: number; missing: number; waived: number;
   };
   const writers = (evidence.writers ?? []) as Array<{
-    actor_type: string; provider: string | null; result_sha: string;
+    actor_type: string; provider: string | null; run_id: string | null; result_sha: string;
   }>;
   const attempts = (evidence.phase_attempts ?? []) as Array<Record<string, unknown>>;
 
@@ -74,6 +74,7 @@ export function EvidencePanel({ projectId }: { projectId: string }) {
           <div key={i} className="mono" style={{ fontSize: 12 }}>
             {w.actor_type}
             {w.provider ? ` · ${w.provider}` : ""} · {short(w.result_sha)}
+            {w.run_id ? <span className="muted"> · run {w.run_id.slice(0, 12)} (see Runs)</span> : null}
           </div>
         ))}
         <h4 style={{ marginTop: 8 }}>

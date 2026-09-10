@@ -76,6 +76,11 @@ export const api = {
       req<{ status: string }>(`/api/missions/${id}/${action}`, { method: "POST" }),
     retry: (id: string) =>
       req<Mission>(`/api/missions/${id}/retry`, { method: "POST" }),
+    adoptChanges: (id: string, message?: string) =>
+      req<{ adopted: boolean; result_sha?: string | null }>(`/api/missions/${id}/adopt-changes`, {
+        method: "POST",
+        body: JSON.stringify({ message: message ?? "human: adopt workspace changes" }),
+      }),
     resolveGate: (missionId: string, gateId: string, resolution: string) =>
       req<{ status: string }>(`/api/missions/${missionId}/gates/${gateId}/resolve`, {
         method: "POST",
