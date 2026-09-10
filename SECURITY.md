@@ -48,18 +48,25 @@ operations, and workspace escape.
 - Backend binds to `127.0.0.1` only. CORS allows the Vite dev origin and Tauri.
 - Zero telemetry. Analytics are computed from the local database.
 - WebSocket streams redacted lines only.
-- Mutating HTTP routes (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/`) and both
-  WebSocket routes require a shared-secret bearer token, generated once per
-  checkout and persisted to `.orchestrator/auth_token` (0600). There is no
-  network route to fetch it — the frontend gets it out-of-band (Vite embeds
-  it at dev/build time; the Tauri shell reads the file via IPC) — see
-  `backend/src/orchestrator/api/auth.py`.
-- This is deliberate, not exhaustive: **`GET` routes stay unauthenticated by
-  design**, reachable by any local process on the machine (the trust model
-  this whole tool already assumes — see Threat model above). Treat the
-  token as raising "anything on the machine can call these routes" to
-  "anything that can read this user's files," not as isolating GG from
-  other locally-running software.
+- Every `/api/` route (`GET`/`HEAD` included, `/api/health` the sole
+  exception — see Known limitations) and both WebSocket routes require a
+  shared-secret bearer token, generated once per checkout and persisted to
+  `.orchestrator/auth_token` (0600). There is no network route to fetch it —
+  the frontend gets it out-of-band (Vite embeds it at dev/build time; the
+  Tauri shell reads the file via IPC) — see `backend/src/orchestrator/api/auth.py`.
+  GET was not originally covered by this check; it was widened after a
+  network-enabled sandboxed subprocess (see the install-step entry below)
+  was proven able to reach the orchestrator's own API and read cross-project
+  data through the gap.
+- The WebSocket token travels as a `Sec-WebSocket-Protocol` handshake header
+  rather than a URL query parameter — a query param lands in uvicorn's
+  access-log request line on every (re)connect (proven leaking the token
+  into stdout at the production entrypoint's default `log_level="info"`); the
+  subprotocol header does not.
+- Treat the token as raising "anything on the machine can call these routes"
+  to "anything that can read this user's files," not as isolating GG from
+  other locally-running software — see Known limitations for what that does
+  and doesn't cover.
 
 ### Planner-authored command execution (acceptance criteria, gate validation)
 - Acceptance-criterion `verify` commands and external-prerequisite gate
