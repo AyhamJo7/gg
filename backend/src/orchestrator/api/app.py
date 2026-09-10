@@ -831,15 +831,23 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return {"status": "ok", "time": utcnow().isoformat()}
 
     # ---------------- websocket ----------------
-    def _ws_token_ok(websocket: WebSocket) -> bool:
+    def _ws_auth_token(websocket: WebSocket) -> str | None:
         # The pre-existing Origin check only stops browser clients — it is
         # skipped entirely when Origin is absent, which any non-browser
         # client (curl, a script, a compromised local process — exactly the
         # threat class the REST bearer-token check targets) can simply omit.
-        # WebSocket has no header mechanism from the browser API, so the
-        # token travels as a query param instead.
-        token = websocket.query_params.get("token")
-        return is_authorized(app.state.auth_token, f"Bearer {token}" if token else None)
+        # WebSocket has no Authorization-header mechanism from the browser
+        # API, so the token travels as a WS subprotocol instead (RFC 6455
+        # Sec-WebSocket-Protocol) rather than a URL query param — a query
+        # param lands in the request line uvicorn's access logger records on
+        # every connect/reconnect, which leaked the token into stdout on the
+        # default `log_level="info"` production entrypoint. Subprotocols
+        # travel as a handshake header, which access logging never captures.
+        subprotocols = websocket.scope.get("subprotocols") or []
+        token = subprotocols[0] if subprotocols else None
+        if not is_authorized(app.state.auth_token, f"Bearer {token}" if token else None):
+            return None
+        return token
 
     @app.websocket("/ws/missions/{mission_id}")
     async def mission_ws(websocket: WebSocket, mission_id: str) -> None:
@@ -847,10 +855,14 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         if origin and origin not in ALLOWED_ORIGINS:
             await websocket.close(code=1008)
             return
-        if not _ws_token_ok(websocket):
+        token = _ws_auth_token(websocket)
+        if token is None:
             await websocket.close(code=1008)
             return
-        await websocket.accept()
+        # Echo back the accepted subprotocol: RFC 6455 requires a server that
+        # received a subprotocol offer to select one in its handshake
+        # response, or some clients treat the connection as failed.
+        await websocket.accept(subprotocol=token)
         queue = orchestrator.events.subscribe()
         try:
             # Replay: durable structured history (authoritative) + bounded
@@ -875,10 +887,11 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         if origin and origin not in ALLOWED_ORIGINS:
             await websocket.close(code=1008)
             return
-        if not _ws_token_ok(websocket):
+        token = _ws_auth_token(websocket)
+        if token is None:
             await websocket.close(code=1008)
             return
-        await websocket.accept()
+        await websocket.accept(subprotocol=token)
         queue = orchestrator.events.subscribe()
         try:
             while True:

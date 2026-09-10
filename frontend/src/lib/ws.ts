@@ -79,14 +79,16 @@ export function useMissionEvents(missionId: string | null) {
         ? "ws://127.0.0.1:8787"
         : `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`;
       const wsBase = (import.meta.env.VITE_WS_BASE as string | undefined) ?? defaultWsBase;
-      // WebSocket has no header mechanism — the token travels as a query
-      // param instead (see backend/src/orchestrator/api/app.py's WS routes,
-      // which check it before accept() since the pre-existing Origin check
-      // is trivially bypassed by any non-browser client that omits Origin).
+      // WebSocket has no Authorization-header mechanism from the browser
+      // API, so the token travels as a WS subprotocol instead (see
+      // backend/src/orchestrator/api/app.py's WS routes, which check it
+      // before accept() since the pre-existing Origin check is trivially
+      // bypassed by any non-browser client that omits Origin). A query
+      // param would land in the server's access-log request line on every
+      // (re)connect; the subprotocol handshake header does not.
       const token = await getAuthToken();
       if (disposed) return; // unmounted while awaiting the token
-      const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
-      ws = new WebSocket(`${wsBase}/ws/missions/${missionId}${tokenQuery}`);
+      ws = new WebSocket(`${wsBase}/ws/missions/${missionId}`, token ? [token] : undefined);
       ws.onopen = () => {
         if (disposed) return;
         attempt = 0;

@@ -191,7 +191,7 @@ async def test_websocket_replays_history(client: httpx.AsyncClient, workspace: P
 
     app = client.app  # type: ignore[attr-defined]
     with TestClient(client._transport.app) as tc:  # type: ignore[union-attr]
-        with tc.websocket_connect(f"/ws/missions/{mission['id']}?token={app.state.auth_token}") as ws:
+        with tc.websocket_connect(f"/ws/missions/{mission['id']}", subprotocols=[app.state.auth_token]) as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "MISSION_CREATED"
 
@@ -233,7 +233,9 @@ async def test_f13_websocket_origin_check(client: httpx.AsyncClient, workspace: 
         # Untrusted origin rejected with 1008
         try:
             with tc.websocket_connect(
-                f"/ws/missions/{mission['id']}?token={token}", headers={"origin": "http://evil.example"}
+                f"/ws/missions/{mission['id']}",
+                subprotocols=[token],
+                headers={"origin": "http://evil.example"},
             ) as ws:
                 ws.receive_text()
                 pytest.fail("untrusted origin was accepted")
@@ -242,7 +244,9 @@ async def test_f13_websocket_origin_check(client: httpx.AsyncClient, workspace: 
 
         # Trusted origin accepted
         with tc.websocket_connect(
-            f"/ws/missions/{mission['id']}?token={token}", headers={"origin": "http://localhost:5173"}
+            f"/ws/missions/{mission['id']}",
+            subprotocols=[token],
+            headers={"origin": "http://localhost:5173"},
         ) as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "MISSION_CREATED"
@@ -271,14 +275,14 @@ async def test_websocket_requires_token(client: httpx.AsyncClient, workspace: Pa
 
         # Wrong token — also rejected.
         try:
-            with tc.websocket_connect(f"/ws/missions/{mission['id']}?token=wrong") as ws:
+            with tc.websocket_connect(f"/ws/missions/{mission['id']}", subprotocols=["wrong"]) as ws:
                 ws.receive_text()
                 pytest.fail("wrong token was accepted")
         except WebSocketDisconnect as exc:
             assert exc.code == 1008
 
         # Correct token, no Origin header — accepted.
-        with tc.websocket_connect(f"/ws/missions/{mission['id']}?token={app.state.auth_token}") as ws:
+        with tc.websocket_connect(f"/ws/missions/{mission['id']}", subprotocols=[app.state.auth_token]) as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "MISSION_CREATED"
 

@@ -14,10 +14,12 @@ class MockWebSocket {
   onerror: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
   url: string;
+  protocols: string[];
   closed = false;
 
-  constructor(url: string) {
+  constructor(url: string, protocols?: string | string[]) {
     this.url = url;
+    this.protocols = protocols ? (Array.isArray(protocols) ? protocols : [protocols]) : [];
     MockWebSocket.instances.push(this);
   }
   open() {
@@ -39,8 +41,8 @@ class MockWebSocket {
 }
 
 // connect() is async (it awaits getAuthToken() before constructing the
-// WebSocket, since the token now travels as a query param — see ws.ts), so
-// socket creation lands a microtask tick after render/reconnect-timer-fire
+// WebSocket, since the token now travels as a WS subprotocol — see ws.ts),
+// so socket creation lands a microtask tick after render/reconnect-timer-fire
 // rather than synchronously. Flush that tick before asserting on instances.
 async function flush() {
   await act(async () => {
