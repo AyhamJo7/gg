@@ -72,8 +72,17 @@ TRACKED_WRITE_ROLES = frozenset({"planning", "implementation", "testing", "repai
 CODE_WRITING_ROLES = TRACKED_WRITE_ROLES
 
 
-async def capture_write_start(workdir: Path | None) -> tuple[str | None, bool, list[str]]:
-    """Capture (base_sha, dirty, dirty_paths≤10) before a code-writing run. Never raises."""
+async def capture_write_start(
+    workdir: Path | None, max_untracked_bytes: int = 5 * 1024 * 1024
+) -> tuple[str | None, bool, list[str]]:
+    """Capture (base_sha, blocking_dirt, blocking_paths≤10) before a code-writing run.
+
+    Never raises. Ignores GG bookkeeping (.orchestrator/, gitignored by
+    checkpoint policy) and untracked files the checkpoint would refuse
+    (oversized — they can never be silently absorbed into a commit).
+    Everything else unattributed blocks the run: it would otherwise be
+    swept into the provider's checkpoint commit.
+    """
     from . import git_ops
 
     if workdir is None:
@@ -88,8 +97,20 @@ async def capture_write_start(workdir: Path | None) -> tuple[str | None, bool, l
     except Exception:
         logger.debug("write-start status capture failed", exc_info=True)
         return base, False, []
-    paths = list((st.modified or []) + (st.added or []) + (st.deleted or []) + (st.untracked or []))[:10]
-    return base, not st.is_clean, paths
+    if st.is_clean:
+        return base, False, []
+    blocking: list[str] = []
+    blocking.extend(p for p in list(st.modified or []) + list(st.added or []) + list(st.deleted or []))
+    for path in list(st.untracked or [])[:50]:
+        if path.startswith(".orchestrator/") or path == ".orchestrator":
+            continue
+        try:
+            if (workdir / path).is_file() and (workdir / path).stat().st_size > max_untracked_bytes:
+                continue
+        except OSError:
+            pass
+        blocking.append(path)
+    return base, bool(blocking), blocking[:10]
 
 
 async def record_provider_write(
@@ -738,6 +759,14 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
                 )
                 review_state = STATE_FAILED
                 blocking.append(f"phase {phase.phase_key or phase.phase_id} reviewer is a candidate writer")
+            elif not full["complete"]:
+                entry.update(
+                    state=STATE_FAILED,
+                    detail="writer provenance incomplete for the reviewed range (cannot certify)",
+                    reviewer=rev.get("review_provider"),
+                )
+                review_state = STATE_FAILED
+                blocking.append(f"phase {phase.phase_key or phase.phase_id} writer provenance incomplete")
             else:
                 entry.update(state=STATE_VALID, reviewer=rev.get("review_provider"), reviewed_sha=csha)
             review_detail["phases"].append(entry)
