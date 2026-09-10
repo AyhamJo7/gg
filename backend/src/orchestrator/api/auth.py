@@ -19,6 +19,23 @@ reads it at dev-server/build time and embeds it as `VITE_AUTH_TOKEN`, and the
 Tauri-packaged app reads the same file via Tauri's scoped fs IPC at startup
 — neither path is reachable from arbitrary web content the way a GET route
 would be.
+
+GET/HEAD requests require the token too, same as mutating ones. An earlier
+draft exempted them, reasoning "read-only" was lower risk — that reasoning
+broke when the fresh-checkout install step (project_engine._install) gained
+a network-enabled sandbox mode (sandbox.run_sandboxed(..., allow_network=True)):
+a malicious/compromised dependency pulled in during install runs inside the
+host's network namespace (bwrap has no per-destination firewall), can reach
+127.0.0.1:<port>, and — with GET exempt — could have read every project's
+and mission's data (plans, task logs, delivery reports, waiver history)
+unauthenticated. The install step has no path to the real token (it operates
+on a fresh git clone into a scratch dir; .orchestrator/ is gitignored and
+absent from the clone), so requiring the token uniformly closes this: an
+unauthenticated GET now gets 401 regardless of what network access a
+sandboxed subprocess happens to have. /api/health stays exempt (see
+UNAUTHENTICATED_PATHS) as a minimal liveness probe that reveals nothing
+project-specific — scripts poll it to detect the backend is up before the
+token file is guaranteed readable.
 """
 
 from __future__ import annotations
@@ -32,8 +49,12 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 TOKEN_FILENAME = "auth_token"  # noqa: S105 - a filename, not a credential value
 
-#: Mutating requests under these paths are exempt (health only — there is no
-#: token bootstrap route; see docs/token delivery in Makefile/vite.config.ts).
+#: Requests (any method) under these paths are exempt from the token check.
+#: /api/health only: a minimal liveness probe with no project-specific data,
+#: polled by scripts to detect the backend is up (see ui-dogfood.sh) before
+#: the token file is guaranteed readable. There is no token bootstrap route
+#: (see docs/token delivery in Makefile/vite.config.ts) — every other route
+#: requires the token, GET/HEAD included (see module docstring).
 UNAUTHENTICATED_PATHS = frozenset({"/api/health"})
 
 
@@ -83,7 +104,7 @@ class AuthMiddleware:
         self.token = token
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS"):
+        if scope["type"] != "http" or scope["method"] == "OPTIONS":
             await self.app(scope, receive, send)
             return
         path = scope["path"]

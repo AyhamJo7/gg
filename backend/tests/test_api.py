@@ -45,11 +45,16 @@ async def test_mutating_route_requires_bearer_token(client: httpx.AsyncClient, w
             "/api/projects", json={"path": str(workspace)}, headers={"Authorization": "Bearer wrong-token"}
         )
         assert resp.status_code == 401
-        # GET routes stay open (no token needed) — including health.
+        # /api/health stays open (a minimal liveness probe, no project data).
+        # Every other route requires the token, GET included — see
+        # api/auth.py's module docstring for why (the fresh-checkout
+        # install step's network-enabled sandbox mode gave an
+        # unauthenticated GET a real, proven path to read this app's
+        # cross-project data).
         resp = await anon.get("/api/health")
         assert resp.status_code == 200
         resp = await anon.get("/api/projects")
-        assert resp.status_code == 200
+        assert resp.status_code == 401
     # There is no network bootstrap route for the token (would defeat the
     # whole scheme — any local process could just fetch it); the token is
     # generated at process-launch time and injected out-of-band into the

@@ -41,7 +41,12 @@ describe("api client bearer-token attachment", () => {
     expect(headers.Authorization).toBe("Bearer test-token-abc");
   });
 
-  it("does not attach Authorization on a GET request even when a token is available", async () => {
+  it("attaches Authorization on a GET request too, not just mutating ones", async () => {
+    // The backend requires the token on every /api/** route, GET included
+    // (except /api/health) — see backend/.../api/auth.py's module docstring:
+    // an earlier version exempted GET, which the network-enabled install
+    // sandbox (allow_network=True) turned into a real, proven path to read
+    // this app's cross-project data unauthenticated.
     mockedGetAuthToken.mockResolvedValue("test-token-abc");
     const fetchMock = stubFetch([]);
 
@@ -50,8 +55,19 @@ describe("api client bearer-token attachment", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const headers = init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer test-token-abc");
+  });
+
+  it("does not attach Authorization (or consult getAuthToken) for /api/health", async () => {
+    mockedGetAuthToken.mockResolvedValue("test-token-abc");
+    const fetchMock = stubFetch({ status: "ok" });
+
+    await api.health();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
     expect(headers.Authorization).toBeUndefined();
-    // getAuthToken must not even be consulted for GETs.
     expect(mockedGetAuthToken).not.toHaveBeenCalled();
   });
 
