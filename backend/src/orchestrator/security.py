@@ -36,6 +36,8 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "[REDACTED_GH_TOKEN]"),
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED_GH_PAT]"),
     (re.compile(r"AIza[0-9A-Za-z_\-]{20,}"), "[REDACTED_GOOGLE_KEY]"),
+    (re.compile(r"hf_[A-Za-z0-9]{20,}"), "[REDACTED_HF_TOKEN]"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED_AWS_ACCESS_KEY]"),
     (re.compile(r"eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"), "[REDACTED_JWT]"),
     (
         re.compile(
@@ -127,13 +129,30 @@ def is_sensitive_file(relative_path: str) -> bool:
 # System trees that must never become AI workspaces, even if a caller
 # manages to construct a path under an allowed root that reaches them.
 SYSTEM_TREE_PREFIXES = (
-    "/etc", "/usr", "/var", "/bin", "/sbin", "/boot", "/dev",
-    "/proc", "/sys", "/lib", "/lib64", "/opt", "/snap", "/run",
+    "/etc",
+    "/usr",
+    "/var",
+    "/bin",
+    "/sbin",
+    "/boot",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/snap",
+    "/run",
 )
 
 # Sensitive directory names that must never become AI workspaces (F-16).
 DENIED_WORKSPACE_PARTS = {
-    ".ssh", ".gnupg", ".aws", ".config", ".local", ".claude",
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".config",
+    ".local",
+    ".claude",
 }
 
 

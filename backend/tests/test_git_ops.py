@@ -31,6 +31,52 @@ async def test_checkpoint_excludes_secrets(tmp_path):
     assert ".env" in st.untracked
 
 
+async def test_checkpoint_excludes_secret_content_regardless_of_filename(tmp_path):
+    """Content-based scan is the independent second layer against a
+    credential read anywhere in the pipeline (e.g. a sandbox allow-list
+    gap) being laundered into permanent git history via an innocuous
+    filename — the filename-pattern check above only catches known-bad
+    *names*, not secret-shaped *content* under an unremarkable name."""
+    await git_ops.init_repo(tmp_path)
+    (tmp_path / "README.md").write_text("hf_AmUxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    (tmp_path / "app.py").write_text("print('x')")
+    sha = await git_ops.checkpoint(tmp_path, "test: checkpoint")
+    assert sha
+    out = await git_ops._git(tmp_path, "show", "--name-only", "--format=", "HEAD")
+    assert "app.py" in out
+    assert "README.md" not in out
+    st = await git_ops.status(tmp_path)
+    assert "README.md" in st.untracked
+
+
+async def test_checkpoint_excludes_secret_wrapped_across_lines(tmp_path):
+    """Round-9 regression: a per-line-only scan was proven to miss a token
+    deliberately split across two added diff lines. The scan must
+    concatenate contiguous added lines before matching, not check each
+    line in isolation."""
+    await git_ops.init_repo(tmp_path)
+    (tmp_path / "README.md").write_text("hf_AmUxxxxxxxxxxx\nxxxxxxxxxxxxxxxxxxxxxx")
+    (tmp_path / "app.py").write_text("print('x')")
+    sha = await git_ops.checkpoint(tmp_path, "test: checkpoint")
+    assert sha
+    out = await git_ops._git(tmp_path, "show", "--name-only", "--format=", "HEAD")
+    assert "app.py" in out
+    assert "README.md" not in out
+    st = await git_ops.status(tmp_path)
+    assert "README.md" in st.untracked
+
+
+async def test_checkpoint_excludes_aws_access_key(tmp_path):
+    await git_ops.init_repo(tmp_path)
+    (tmp_path / "notes.txt").write_text("AKIAABCDEFGHIJKLMNOP")
+    (tmp_path / "app.py").write_text("print('x')")
+    sha = await git_ops.checkpoint(tmp_path, "test: checkpoint")
+    assert sha
+    out = await git_ops._git(tmp_path, "show", "--name-only", "--format=", "HEAD")
+    assert "app.py" in out
+    assert "notes.txt" not in out
+
+
 async def test_checkpoint_no_changes_returns_none(tmp_path):
     await git_ops.init_repo(tmp_path)
     (tmp_path / "a.txt").write_text("a")
@@ -65,4 +111,3 @@ async def test_f01_git_command_contract_and_spawn_git(tmp_path):
     sha = await git_ops.checkpoint(tmp_path, "commit 1")
     assert sha
     assert await git_ops.head_sha(tmp_path) == sha
-

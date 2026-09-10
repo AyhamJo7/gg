@@ -13,17 +13,20 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ._spawn_gate import GATE_RELEASE_BYTE
 from .security import redact
 
 logger = logging.getLogger(__name__)
 
 GRACEFUL_TERMINATE_SECONDS = 5.0
 MAX_TAIL_LINES = 4000
+_GATE_SHIM = str(Path(__file__).with_name("_spawn_gate.py"))
 
 OutputCallback = Callable[[str, str], None]  # (stream, line)
 SpawnCallback = Callable[[int, int, float], None]  # (pid, pgid, start_time)
@@ -39,6 +42,11 @@ class ProcessResult:
     stderr_tail: list[str] = field(default_factory=list)
     pid: int | None = None
     pgid: int | None = None
+    #: True when the spawn gate was never released (on_spawn raised, identity
+    #: never persisted) — the child exited GATE_REFUSED_EXIT without ever
+    #: exec'ing the real program. Distinguishes this from a genuine process
+    #: exit at the same code.
+    gate_refused: bool = False
 
     @property
     def combined_tail(self) -> str:
@@ -104,16 +112,34 @@ async def run_process(
             if on_output:
                 on_output(name, safe)
 
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=str(cwd),
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-        start_new_session=True,  # own process group → reliable tree kill
-    )
+    # Spawn handshake: the child starts in _spawn_gate.py blocked on a pipe
+    # and only execs the real program after we release it. Release happens
+    # strictly after the verified identity is persisted via on_spawn, so a
+    # backend death at any earlier point yields EOF and the child exits
+    # without ever writing. Hence pid recorded == writer exists, and
+    # pid missing == nothing ever executed.
+    gate_r, gate_w = os.pipe()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            _GATE_SHIM,
+            str(gate_r),
+            *argv,
+            cwd=str(cwd),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=True,  # own process group → reliable tree kill
+            pass_fds=(gate_r,),
+        )
+    except BaseException:
+        os.close(gate_r)
+        os.close(gate_w)
+        raise
+    os.close(gate_r)
     if proc.stdout is None or proc.stderr is None:
+        os.close(gate_w)
         raise RuntimeError("subprocess pipes not captured")
 
     spawn_pid = proc.pid
@@ -122,11 +148,19 @@ async def run_process(
     except Exception:
         spawn_pgid = proc.pid
     spawn_time = time.time()
+    released = on_spawn is None
     if on_spawn:
         try:
             on_spawn(spawn_pid, spawn_pgid, spawn_time)
+            released = True
         except Exception:
-            logger.debug("on_spawn callback failed", exc_info=True)
+            logger.warning("on_spawn callback failed; holding spawn gate", exc_info=True)
+    if released:
+        try:
+            os.write(gate_w, GATE_RELEASE_BYTE)
+        except OSError:
+            logger.debug("spawn gate release failed", exc_info=True)
+    os.close(gate_w)
 
     pumps = [
         asyncio.create_task(_pump(proc.stdout, "stdout", stdout_tail, stdout_fh)),
@@ -172,4 +206,5 @@ async def run_process(
         stderr_tail=stderr_tail,
         pid=spawn_pid,
         pgid=spawn_pgid,
+        gate_refused=not released,
     )

@@ -4,6 +4,16 @@ Runs the project's real toolchain (detected by workspace.inspect_workspace),
 records every command + exit code, and never trusts agent self-reporting.
 Commands run via argv arrays; each string from the detector is split with
 shlex (safe — no shell interpretation, word-splitting only).
+
+Detected commands are fixed strings (e.g. "npm test", "cargo build"), but
+their *behavior* is driven by the target repo's own manifest content, which
+is exactly as attacker/AI-influenceable as the criterion/gate-validation
+text executed elsewhere in this codebase — a repo's package.json/Cargo.toml
+can redirect what "npm test"/"cargo build" actually does regardless of the
+literal command string. Execution therefore goes through the same
+bwrap-sandboxed boundary as criterion.py/project_engine's gate validation
+(see sandbox.py's module docstring) rather than running directly on the
+host — there is no unsandboxed fallback.
 """
 
 from __future__ import annotations
@@ -15,7 +25,7 @@ from pathlib import Path
 from .db import Database
 from .events import EventBus
 from .models import EventType
-from .process import run_process
+from .sandbox import run_sandboxed, sandbox_available
 from .workspace import WorkspaceInfo
 
 VERIFY_TIMEOUT_S = 600.0
@@ -66,12 +76,25 @@ async def run_verification(
     if include_build:
         commands.extend(workspace.build_commands)
 
+    sandbox_ok = sandbox_available()
     for command in commands:
         argv = shlex.split(command)
         if not argv:
             continue
         events.publish(EventType.TEST_STARTED, mission_id, command=command)
-        result = await run_process(argv, cwd=workdir, timeout_s=VERIFY_TIMEOUT_S)
+        if not sandbox_ok:
+            report.results.append(
+                CommandResult(
+                    command=command,
+                    exit_code=None,
+                    passed=False,
+                    duration_s=0.0,
+                    tail="sandboxed execution unavailable on this platform — bubblewrap (bwrap) not found",
+                )
+            )
+            events.publish(EventType.TEST_FAILED, mission_id, command=command, exit_code=None)
+            continue
+        result = await run_sandboxed(argv, workdir, timeout_s=VERIFY_TIMEOUT_S)
         passed = result.exit_code == 0 and not result.timed_out
         report.results.append(
             CommandResult(

@@ -4,6 +4,7 @@
   "description": "Default permissions for GG Orchestrator shell",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "allow-get-auth-token"
   ]
 }

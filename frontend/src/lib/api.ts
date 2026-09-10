@@ -1,13 +1,22 @@
 /** Typed API client. All requests go through Vite's dev proxy in dev,
  * or the backend directly in the Tauri shell. */
 
-const isTauri = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || window.location.origin.startsWith("tauri://"));
+import { getAuthToken, isTauri } from "./auth";
+
 export const BASE: string = (import.meta.env.VITE_API_BASE as string | undefined) ?? (isTauri ? "http://127.0.0.1:8787" : "");
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  // The backend requires the bearer token on every /api/** route, GET
+  // included (except /api/health) — see backend/.../api/auth.py's module
+  // docstring for why GET used to be exempt and isn't anymore.
+  if (path !== "/api/health") {
+    const token = await getAuthToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }
   const resp = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...init,
+    headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
   });
   if (!resp.ok) {
     const body = await resp.text();
@@ -26,6 +35,8 @@ import type {
   MissionDag,
   MissionDetail,
   PriorityMatrix,
+  ProductProjectDetail,
+  ProductProjectSummary,
   Project,
   ProviderHealth,
   TaskLogsResponse,
@@ -110,6 +121,48 @@ export const api = {
   },
   analytics: () => req<Analytics>("/api/analytics"),
   health: () => req<{ status: string }>("/api/health"),
+  lifecycle: {
+    list: () => req<ProductProjectSummary[]>("/api/product-projects"),
+    create: (body: {
+      name: string;
+      idea: string;
+      constraints?: string;
+      auto_execute?: boolean;
+      require_plan_approval?: boolean;
+      target_repo_path?: string;
+    }) => req<ProductProjectDetail>("/api/product-projects", { method: "POST", body: JSON.stringify(body) }),
+    get: (id: string) => req<ProductProjectDetail>(`/api/product-projects/${id}`),
+    plan: (id: string) =>
+      req<{ ok: boolean; revision?: number; plan?: unknown; errors?: string[] }>(
+        `/api/product-projects/${id}/plan`,
+        { method: "POST" },
+      ),
+    revisePlan: (id: string, plan: unknown, reason: string) =>
+      req<{ ok: boolean; revision: number }>(`/api/product-projects/${id}/plan`, {
+        method: "PUT",
+        body: JSON.stringify({ plan, reason }),
+      }),
+    start: (id: string) => req<ProductProjectDetail>(`/api/product-projects/${id}/start`, { method: "POST" }),
+    advance: (id: string) => req<Record<string, unknown>>(`/api/product-projects/${id}/advance`, { method: "POST" }),
+    pause: (id: string) => req<{ status: string }>(`/api/product-projects/${id}/pause`, { method: "POST" }),
+    cancel: (id: string) => req<{ status: string }>(`/api/product-projects/${id}/cancel`, { method: "POST" }),
+    retryPhase: (id: string, phaseKey: string) =>
+      req<{ ok: boolean }>(`/api/product-projects/${id}/phases/${phaseKey}/retry`, { method: "POST" }),
+    resolveGate: (id: string, gateId: string, resolution: string) =>
+      req<{ ok: boolean }>(`/api/product-projects/${id}/gates/${gateId}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ resolution }),
+      }),
+    acceptance: (id: string) =>
+      req<{ ok: boolean; sha?: string; findings?: string[] }>(`/api/product-projects/${id}/acceptance`, {
+        method: "POST",
+      }),
+    waive: (id: string, target_kind: string, target_id: string, reason: string) =>
+      req<{ ok: boolean }>(`/api/product-projects/${id}/waivers`, {
+        method: "POST",
+        body: JSON.stringify({ target_kind, target_id, reason }),
+      }),
+  },
 };
 
 export function missionWsUrl(missionId: string): string {

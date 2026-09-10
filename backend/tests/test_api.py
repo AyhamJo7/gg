@@ -19,8 +19,11 @@ async def client(tmp_path: Path, workspace: Path):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=["fake-a"]), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as c:
         c.orchestrator = orch  # type: ignore[attr-defined]
+        c.app = app  # type: ignore[attr-defined]
         yield c
     await orch.shutdown()
 
@@ -29,6 +32,57 @@ async def test_health(client: httpx.AsyncClient):
     resp = await client.get("/api/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+async def test_mutating_route_requires_bearer_token(client: httpx.AsyncClient, workspace: Path):
+    """F-LIFE-01 hardening: mutating routes reject requests without the token."""
+    app = client.app  # type: ignore[attr-defined]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as anon:
+        resp = await anon.post("/api/projects", json={"path": str(workspace)})
+        assert resp.status_code == 401
+        resp = await anon.post(
+            "/api/projects", json={"path": str(workspace)}, headers={"Authorization": "Bearer wrong-token"}
+        )
+        assert resp.status_code == 401
+        # /api/health stays open (a minimal liveness probe, no project data).
+        # Every other route requires the token, GET included — see
+        # api/auth.py's module docstring for why (the fresh-checkout
+        # install step's network-enabled sandbox mode gave an
+        # unauthenticated GET a real, proven path to read this app's
+        # cross-project data).
+        resp = await anon.get("/api/health")
+        assert resp.status_code == 200
+        resp = await anon.get("/api/projects")
+        assert resp.status_code == 401
+    # There is no network bootstrap route for the token (would defeat the
+    # whole scheme — any local process could just fetch it); the token is
+    # generated at process-launch time and injected out-of-band into the
+    # frontend build/IPC, so tests reach it the same in-process way real
+    # non-browser callers (Node e2e drivers) read it: from the token file.
+    fetched = (app.state.db.parent / "auth_token").read_text().strip()
+    assert fetched == app.state.auth_token
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {fetched}"}
+    ) as authed:
+        resp = await authed.post("/api/projects", json={"path": str(workspace)})
+        assert resp.status_code in (200, 201), resp.text
+
+
+async def test_auth_rejection_carries_cors_headers_for_allowed_origin(client: httpx.AsyncClient, workspace: Path):
+    """AuthMiddleware must run inside CORSMiddleware, not outside it — otherwise
+    a 401 to a legitimate cross-origin-allowed caller arrives as an opaque CORS
+    failure in the browser instead of a readable 401 body."""
+    app = client.app  # type: ignore[attr-defined]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as anon:
+        resp = await anon.post(
+            "/api/projects",
+            json={"path": str(workspace)},
+            headers={"Origin": "http://localhost:5173"},
+        )
+        assert resp.status_code == 401
+        assert resp.headers.get("access-control-allow-origin") == "http://localhost:5173"
 
 
 async def test_project_crud(client: httpx.AsyncClient, workspace: Path):
@@ -96,9 +150,7 @@ async def test_priority_settings(client: httpx.AsyncClient):
     matrix = resp.json()
     assert "planning" in matrix
 
-    resp = await client.post(
-        "/api/settings/priority", json={"role": "review", "providers": ["fake-a"]}
-    )
+    resp = await client.post("/api/settings/priority", json={"role": "review", "providers": ["fake-a"]})
     assert resp.status_code == 200
     assert resp.json()["review"] == ["fake-a"]
 
@@ -137,8 +189,9 @@ async def test_websocket_replays_history(client: httpx.AsyncClient, workspace: P
     project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
     mission = orch.create_mission(project["id"], "m", "t", "AUTONOMOUS", "balanced")
 
+    app = client.app  # type: ignore[attr-defined]
     with TestClient(client._transport.app) as tc:  # type: ignore[union-attr]
-        with tc.websocket_connect(f"/ws/missions/{mission['id']}") as ws:
+        with tc.websocket_connect(f"/ws/missions/{mission['id']}", subprotocols=[app.state.auth_token]) as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "MISSION_CREATED"
 
@@ -174,11 +227,15 @@ async def test_f13_websocket_origin_check(client: httpx.AsyncClient, workspace: 
     project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
     mission = orch.create_mission(project["id"], "m", "t", "AUTONOMOUS", "balanced")
 
+    app = client.app  # type: ignore[attr-defined]
+    token = app.state.auth_token
     with TestClient(client._transport.app) as tc:  # type: ignore[union-attr]
         # Untrusted origin rejected with 1008
         try:
             with tc.websocket_connect(
-                f"/ws/missions/{mission['id']}", headers={"origin": "http://evil.example"}
+                f"/ws/missions/{mission['id']}",
+                subprotocols=[token],
+                headers={"origin": "http://evil.example"},
             ) as ws:
                 ws.receive_text()
                 pytest.fail("untrusted origin was accepted")
@@ -187,8 +244,45 @@ async def test_f13_websocket_origin_check(client: httpx.AsyncClient, workspace: 
 
         # Trusted origin accepted
         with tc.websocket_connect(
-            f"/ws/missions/{mission['id']}", headers={"origin": "http://localhost:5173"}
+            f"/ws/missions/{mission['id']}",
+            subprotocols=[token],
+            headers={"origin": "http://localhost:5173"},
         ) as ws:
+            first = json.loads(ws.receive_text())
+            assert first["type"] == "MISSION_CREATED"
+
+
+async def test_websocket_requires_token(client: httpx.AsyncClient, workspace: Path):
+    """F-LIFE-01 hardening: the pre-existing Origin check is skipped when
+    Origin is absent (any non-browser client) — the token check must still
+    reject the connection in that case, and accept it with a valid token."""
+    from starlette.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    orch = client.orchestrator  # type: ignore[attr-defined]
+    app = client.app  # type: ignore[attr-defined]
+    project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
+    mission = orch.create_mission(project["id"], "m", "t", "AUTONOMOUS", "balanced")
+
+    with TestClient(client._transport.app) as tc:  # type: ignore[union-attr]
+        # No token at all — a raw non-browser client sends no Origin either.
+        try:
+            with tc.websocket_connect(f"/ws/missions/{mission['id']}") as ws:
+                ws.receive_text()
+                pytest.fail("missing token was accepted")
+        except WebSocketDisconnect as exc:
+            assert exc.code == 1008
+
+        # Wrong token — also rejected.
+        try:
+            with tc.websocket_connect(f"/ws/missions/{mission['id']}", subprotocols=["wrong"]) as ws:
+                ws.receive_text()
+                pytest.fail("wrong token was accepted")
+        except WebSocketDisconnect as exc:
+            assert exc.code == 1008
+
+        # Correct token, no Origin header — accepted.
+        with tc.websocket_connect(f"/ws/missions/{mission['id']}", subprotocols=[app.state.auth_token]) as ws:
             first = json.loads(ws.receive_text())
             assert first["type"] == "MISSION_CREATED"
 
@@ -219,4 +313,3 @@ async def test_f15_priority_persisted_to_settings(client: httpx.AsyncClient):
     row = orch.db.get("settings", "priority.planning", key="key")
     assert row is not None
     assert json.loads(row["value"]) == ["fake-a"]
-

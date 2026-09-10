@@ -40,6 +40,7 @@ class GitError(RuntimeError):
 
 class GitCheckpointError(GitError):
     """Fatal: checkpoint retry limit exhausted — mission must not reach COMPLETED."""
+
     pass
 
 
@@ -115,25 +116,25 @@ async def status(root: Path) -> GitStatus:
     branch = await _git(root, "branch", "--show-current", check=False)
     head = await head_sha(root)
     result = GitStatus(is_repo=True, branch=branch, head=head)
-    
+
     res = await _spawn_git(root, "status", "--porcelain=v1", "-z")
     if res.returncode != 0:
         raise GitError(f"git status failed: {res.err_text[:400]}")
-    
+
     raw = res.stdout.decode(errors="replace")
     parts = raw.split("\x00")
-    
+
     i = 0
     while i < len(parts):
         part = parts[i]
         if not part:
             i += 1
             continue
-            
+
         code = part[:2]
         path = part[3:]
         x, y = code[0], code[1]
-        
+
         if x in "RC" or y in "RC":
             new_path = path
             i += 1
@@ -151,7 +152,7 @@ async def status(root: Path) -> GitStatus:
                 if x == "D" or y == "D":
                     result.deleted.append(path)
         i += 1
-        
+
     return result
 
 
@@ -165,6 +166,35 @@ async def diff(root: Path, stat_only: bool = False) -> str:
 async def recent_commits(root: Path, count: int = 10) -> list[str]:
     raw = await _git(root, "log", f"-{count}", "--oneline", check=False)
     return [line for line in raw.splitlines() if line]
+
+
+def _patch_adds_secret(patch: str) -> bool:
+    """True if a `git diff -U0` patch adds content matching SECRET_PATTERNS.
+
+    Contiguous added (`+`-prefixed) lines are concatenated with no separator
+    before matching, not checked one line at a time: a secret-scanning
+    heuristic that only ever looks at one line in isolation is trivially
+    defeated by wrapping a token across a line break (proven live in
+    round-9 review — a token split across two `+` lines was invisible to a
+    per-line regex). This is still an enumerated-format heuristic, not a
+    guarantee — see SECURITY.md.
+    """
+    run: list[str] = []
+
+    def _run_has_secret() -> bool:
+        if not run:
+            return False
+        joined = "".join(run)
+        return any(pat.search(joined) for pat, _ in SECRET_PATTERNS)
+
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            run.append(line[1:])
+            continue
+        if _run_has_secret():
+            return True
+        run = []
+    return _run_has_secret()
 
 
 async def checkpoint(root: Path, message: str, max_file_mb: int = 5) -> str | None:
@@ -194,17 +224,7 @@ async def checkpoint(root: Path, message: str, max_file_mb: int = 5) -> str | No
     remaining_staged = [p.strip() for p in staged_raw.splitlines() if p.strip()]
     for path in remaining_staged:
         patch = await _git(root, "diff", "--cached", "-U0", "--", path, check=False)
-        has_secret = False
-        for line in patch.splitlines():
-            if line.startswith("+") and not line.startswith("+++"):
-                added_text = line[1:]
-                for pat, _ in SECRET_PATTERNS:
-                    if pat.search(added_text):
-                        has_secret = True
-                        break
-            if has_secret:
-                break
-        if has_secret:
+        if _patch_adds_secret(patch):
             await _git(root, "reset", "-q", "--", path, check=False)
         else:
             try:
@@ -212,7 +232,9 @@ async def checkpoint(root: Path, message: str, max_file_mb: int = 5) -> str | No
                 if fp.is_file() and fp.stat().st_size > max_file_mb * 1024 * 1024:
                     logger.warning(
                         "Excluding large file from auto-checkpoint: %s (%d bytes, limit %dMB)",
-                        path, fp.stat().st_size, max_file_mb,
+                        path,
+                        fp.stat().st_size,
+                        max_file_mb,
                     )
                     await _git(root, "reset", "-q", "--", path, check=False)
             except OSError:

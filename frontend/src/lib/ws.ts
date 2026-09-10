@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { getAuthToken, isTauri } from "./auth";
 import type { OrchestratorEvent } from "./types";
 
 const MAX_TERMINAL_LINES = 2000;
@@ -72,14 +73,22 @@ export function useMissionEvents(missionId: string | null) {
       }, backoff + jitter);
     };
 
-    const connect = () => {
+    const connect = async () => {
       if (disposed) return;
-      const isTauri = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || window.location.origin.startsWith("tauri://"));
       const defaultWsBase = isTauri
         ? "ws://127.0.0.1:8787"
         : `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`;
       const wsBase = (import.meta.env.VITE_WS_BASE as string | undefined) ?? defaultWsBase;
-      ws = new WebSocket(`${wsBase}/ws/missions/${missionId}`);
+      // WebSocket has no Authorization-header mechanism from the browser
+      // API, so the token travels as a WS subprotocol instead (see
+      // backend/src/orchestrator/api/app.py's WS routes, which check it
+      // before accept() since the pre-existing Origin check is trivially
+      // bypassed by any non-browser client that omits Origin). A query
+      // param would land in the server's access-log request line on every
+      // (re)connect; the subprotocol handshake header does not.
+      const token = await getAuthToken();
+      if (disposed) return; // unmounted while awaiting the token
+      ws = new WebSocket(`${wsBase}/ws/missions/${missionId}`, token ? [token] : undefined);
       ws.onopen = () => {
         if (disposed) return;
         attempt = 0;

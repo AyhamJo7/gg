@@ -89,11 +89,17 @@ class ProviderRegistry:
                     if row["state"] != ProviderState.RATE_LIMITED.value:
                         row["state"] = "COOLDOWN"
                 else:
-                    # cooldown expired → provider becomes eligible again
+                    # cooldown expired → provider becomes eligible again.
+                    # AVAILABLE is included so a clear_busy_without_penalty
+                    # cooldown (state already AVAILABLE, just a short delay
+                    # before real re-eligibility) gets its stale
+                    # cooldown_until cleared too, not just the exponential
+                    # reliability-cooldown states.
                     expired = (
                         ProviderState.RATE_LIMITED.value,
                         ProviderState.TIMED_OUT.value,
                         ProviderState.CRASHED.value,
+                        ProviderState.AVAILABLE.value,
                     )
                     if row["state"] in expired:
                         self._db.execute(
@@ -124,12 +130,15 @@ class ProviderRegistry:
             if datetime.now(UTC) < until:
                 return False
             # Cooldown expired — lazily reconcile state so eligibility never
-            # depends on a scheduler tick having run health() first.
+            # depends on a scheduler tick having run health() first. AVAILABLE
+            # is included so a clear_busy_without_penalty cooldown's stale
+            # cooldown_until gets cleared here too, not only in health().
             if row["state"] in (
                 ProviderState.RATE_LIMITED.value,
                 ProviderState.TIMED_OUT.value,
                 ProviderState.CRASHED.value,
                 ProviderState.UNAVAILABLE.value,
+                ProviderState.AVAILABLE.value,
             ):
                 self._db.execute(
                     "UPDATE providers SET state=?, cooldown_until=NULL WHERE name=?",
@@ -155,6 +164,25 @@ class ProviderRegistry:
             (ProviderState.AVAILABLE.value, runtime_s, name),
         )
 
+    def clear_busy_without_penalty(self, name: str) -> None:
+        """Reset a provider to AVAILABLE after an orchestrator-internal
+        failure (a spawn-handshake refusal — see ExecutionResult.gate_refused)
+        that is not evidence about the provider itself. Unlike
+        record_failure, this does not increment consecutive_failures or use
+        the exponential reliability cooldown — mark_busy() alone would
+        otherwise leave the provider permanently ineligible (is_eligible only
+        admits AVAILABLE). It does apply one small fixed cooldown, distinct
+        from and much shorter than the reliability cooldown: if the
+        underlying on_spawn failure is persistent rather than a one-off
+        (disk full, DB corruption, permission failure), an immediate re-spawn
+        with zero delay would otherwise fire on the very next attempt."""
+        cooldown_s = float(self._config.get("orchestration.gate_refused_cooldown_seconds", 5))
+        cooldown_until = (datetime.now(UTC) + timedelta(seconds=cooldown_s)).isoformat()
+        self._db.execute(
+            "UPDATE providers SET state=?, cooldown_until=? WHERE name=?",
+            (ProviderState.AVAILABLE.value, cooldown_until, name),
+        )
+
     def record_failure(self, name: str, failure: FailureClass, runtime_s: float, error: str) -> ProviderState:
         """Apply exponential cooldown. Returns the recorded state."""
         base = float(self._config.get("orchestration.cooldown_base_seconds", 60))
@@ -177,8 +205,12 @@ class ProviderRegistry:
         }
         state = state_by_failure.get(failure, ProviderState.AVAILABLE)
         cooldown_until: str | None = None
-        if state in (ProviderState.RATE_LIMITED, ProviderState.TIMED_OUT, ProviderState.CRASHED,
-            ProviderState.UNAVAILABLE):
+        if state in (
+            ProviderState.RATE_LIMITED,
+            ProviderState.TIMED_OUT,
+            ProviderState.CRASHED,
+            ProviderState.UNAVAILABLE,
+        ):
             cooldown_until = (datetime.now(UTC) + timedelta(seconds=cooldown_s)).isoformat()
         rate_inc = 1 if failure in (FailureClass.RATE_LIMIT, FailureClass.QUOTA_EXHAUSTED) else 0
         self._db.execute(

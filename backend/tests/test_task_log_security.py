@@ -25,15 +25,15 @@ async def client(tmp_path: Path, workspace: Path):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=["fake-a"]), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as c:
         c.orchestrator = orch  # type: ignore[attr-defined]
         yield c
     await orch.shutdown()
 
 
-async def _seed(
-    client: httpx.AsyncClient, workspace: Path, title: str, log_body: str
-) -> tuple[str, str, Path]:
+async def _seed(client: httpx.AsyncClient, workspace: Path, title: str, log_body: str) -> tuple[str, str, Path]:
     project = (await client.post("/api/projects", json={"path": str(workspace)})).json()
     mission = (
         await client.post(
@@ -111,9 +111,7 @@ async def test_log_secrets_redacted(client: httpx.AsyncClient, workspace: Path):
     assert "[REDACTED_API_KEY]" in body["run"]["summary"]
 
 
-async def test_log_tail_is_bounded_and_line_aligned(
-    client: httpx.AsyncClient, workspace: Path
-):
+async def test_log_tail_is_bounded_and_line_aligned(client: httpx.AsyncClient, workspace: Path):
     lines = "".join(f"line {i:04d} padding-padding-padding\n" for i in range(200))
     mid, tid, _ = await _seed(client, workspace, "logs-tail", lines)
     resp = await client.get(f"/api/missions/{mid}/tasks/{tid}/logs?tail_bytes=1024")
@@ -215,9 +213,7 @@ async def test_log_mismatched_ids_404(client: httpx.AsyncClient, workspace: Path
         await client.post(
             "/api/missions",
             json={
-                "project_id": (
-                    await client.post("/api/projects", json={"path": str(workspace)})
-                ).json()["id"],
+                "project_id": (await client.post("/api/projects", json={"path": str(workspace)})).json()["id"],
                 "title": "logs-other",
                 "task": "other",
                 "autonomy": "AUTONOMOUS",

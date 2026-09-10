@@ -17,8 +17,10 @@ from ..config import Config
 from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
 from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
+from ..project_engine import ProductValidationError
 from ..security import read_redacted_tail, redact, validate_workspace_path
 from ..workspace import inspect_workspace
+from .auth import AuthMiddleware, is_authorized, load_or_create_token
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,30 @@ class ProviderToggleRequest(BaseModel):
     enabled: bool
 
 
+class CreateProductProjectRequest(BaseModel):
+    name: str
+    idea: str
+    constraints: str = ""
+    auto_execute: bool = False
+    require_plan_approval: bool = True
+    target_repo_path: str = ""
+
+
+class RevisePlanRequest(BaseModel):
+    plan: dict[str, Any]
+    reason: str
+
+
+class WaiverRequest(BaseModel):
+    target_kind: str
+    target_id: str
+    reason: str
+    # Self-reported label for the audit trail, not a verified identity — the
+    # bearer token proves "holds the token," not "is a specific person."
+    # Anyone able to call this route can set this to any string.
+    actor: str = "operator"
+
+
 def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
     for key in ("providers_used", "providers_failed", "choices", "payload", "command"):
         if isinstance(row.get(key), str):
@@ -79,13 +105,28 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         await orchestrator.shutdown()
 
     app = FastAPI(title="GG Orchestrator", version="0.1.0", lifespan=lifespan)
+    app.state.db = db_path
+    app.state.auth_token = load_or_create_token(db_path.parent)
+    # Registration order matters: Starlette builds the middleware stack by
+    # prepending each add_middleware call and iterating in reverse, so the
+    # LAST middleware added ends up OUTERMOST. CORS must be outermost so a
+    # 401 from AuthMiddleware still carries CORS headers for allowed origins
+    # — otherwise a legitimate cross-origin-allowed caller sees an opaque
+    # CORS/network failure instead of a readable 401 body.
+    app.add_middleware(AuthMiddleware, token=app.state.auth_token)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "tauri://localhost", "http://tauri.localhost"],
+        allow_origins=[
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5174",
+            "tauri://localhost",
+            "http://tauri.localhost",
+        ],
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.state.db = db_path
 
     # ---------------- projects ----------------
     @app.get("/api/projects")
@@ -181,8 +222,9 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     @app.get("/api/missions")
     def list_missions(project_id: str | None = None) -> list[dict[str, Any]]:
         if project_id:
-            rows = orchestrator.db.query("SELECT * FROM missions WHERE project_id=? ORDER BY created_at DESC",
-                (project_id,))
+            rows = orchestrator.db.query(
+                "SELECT * FROM missions WHERE project_id=? ORDER BY created_at DESC", (project_id,)
+            )
         else:
             rows = orchestrator.db.query("SELECT * FROM missions ORDER BY created_at DESC LIMIT 200")
         return [_jsonable(r) for r in rows]
@@ -211,15 +253,14 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         )
         mission["gates"] = [
             _jsonable(g)
-            for g in orchestrator.db.query("SELECT * FROM human_gates WHERE mission_id=? ORDER BY created_at DESC",
-                (mission_id,))
+            for g in orchestrator.db.query(
+                "SELECT * FROM human_gates WHERE mission_id=? ORDER BY created_at DESC", (mission_id,)
+            )
         ]
         mission["findings"] = orchestrator.db.query(
             "SELECT * FROM review_findings WHERE mission_id=? ORDER BY created_at", (mission_id,)
         )
-        reviews = orchestrator.db.query(
-            "SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at", (mission_id,)
-        )
+        reviews = orchestrator.db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at", (mission_id,))
         mission["reviews"] = reviews
         latest_review = reviews[-1] if reviews else None
         mission["latest_review"] = latest_review
@@ -295,6 +336,161 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         except IllegalMissionTransitionError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"status": "resolved"}
+
+    # ---------------- product lifecycle (idea-to-product) ----------------
+    @app.get("/api/product-projects")
+    def list_product_projects() -> list[dict[str, Any]]:
+        return orchestrator.coordinator.list_projects()
+
+    @app.post("/api/product-projects", status_code=201)
+    def create_product_project(req: CreateProductProjectRequest) -> dict[str, Any]:
+        try:
+            return orchestrator.coordinator.create_project(
+                req.name,
+                req.idea,
+                req.constraints,
+                req.auto_execute,
+                req.require_plan_approval,
+                req.target_repo_path,
+            )
+        except ProductValidationError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/api/product-projects/{project_id}")
+    def get_product_project(project_id: str) -> dict[str, Any]:
+        project = orchestrator.coordinator.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "product project not found")
+        for row in project.get("phases", []):
+            for key in ("depends_on", "acceptance_json", "evidence_json"):
+                if isinstance(row.get(key), str):
+                    try:
+                        row[key] = json.loads(row[key])
+                    except json.JSONDecodeError:
+                        pass
+        for row in project.get("gates", []):
+            if isinstance(row.get("required_vars"), str):
+                try:
+                    row["required_vars"] = json.loads(row["required_vars"])
+                except json.JSONDecodeError:
+                    pass
+        for row in project.get("evidence", []):
+            if isinstance(row.get("evidence_json"), str):
+                try:
+                    row["evidence_json"] = json.loads(row["evidence_json"])
+                except json.JSONDecodeError:
+                    pass
+        if isinstance(project.get("delivery_report"), str):
+            try:
+                project["delivery_report"] = json.loads(project["delivery_report"])
+            except json.JSONDecodeError:
+                project["delivery_report"] = {}
+        return project
+
+    @app.post("/api/product-projects/{project_id}/plan")
+    async def generate_product_plan(project_id: str) -> dict[str, Any]:
+        try:
+            return await orchestrator.coordinator.generate_plan(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.put("/api/product-projects/{project_id}/plan")
+    async def revise_product_plan(project_id: str, req: RevisePlanRequest) -> dict[str, Any]:
+        try:
+            result = orchestrator.coordinator.revise_plan(project_id, req.plan, req.reason)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not result.get("ok"):
+            raise HTTPException(400, "; ".join(result.get("errors", ["invalid plan"])))
+        # A revision may unblock the roadmap (new phases, changed deps):
+        # re-drive the coordinator so the operator needs no second click.
+        try:
+            await orchestrator.coordinator.advance_project(project_id)
+        except (KeyError, ValueError):
+            pass
+        return result
+
+    @app.post("/api/product-projects/{project_id}/start")
+    async def start_product_project(project_id: str) -> dict[str, Any]:
+        try:
+            project = orchestrator.coordinator.start_project(project_id)
+            await orchestrator.coordinator.advance_project(project_id)
+            return project
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        except ProductValidationError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/product-projects/{project_id}/advance")
+    async def advance_product_project(project_id: str) -> dict[str, Any]:
+        try:
+            return await orchestrator.coordinator.advance_project(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+
+    @app.post("/api/product-projects/{project_id}/pause")
+    async def pause_product_project(project_id: str) -> dict[str, str]:
+        try:
+            await orchestrator.coordinator.pause_project(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        return {"status": "pausing"}
+
+    @app.post("/api/product-projects/{project_id}/cancel")
+    async def cancel_product_project(project_id: str) -> dict[str, str]:
+        try:
+            await orchestrator.coordinator.cancel_project(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        return {"status": "cancelled"}
+
+    @app.post("/api/product-projects/{project_id}/phases/{phase_key}/retry")
+    async def retry_product_phase(project_id: str, phase_key: str) -> dict[str, Any]:
+        try:
+            result = orchestrator.coordinator.retry_phase(project_id, phase_key)
+            await orchestrator.coordinator.advance_project(project_id)
+            return result
+        except KeyError:
+            raise HTTPException(404, "product project or phase not found") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/product-projects/{project_id}/gates/{gate_id}/resolve")
+    async def resolve_product_gate(project_id: str, gate_id: str, req: GateResolutionRequest) -> dict[str, Any]:
+        try:
+            result = await orchestrator.coordinator.resolve_gate(project_id, gate_id, req.resolution)
+        except KeyError:
+            raise HTTPException(404, "product project or gate not found") from None
+        if not result.get("ok"):
+            raise HTTPException(400, result.get("error", "gate not resolved"))
+        await orchestrator.coordinator.advance_project(project_id)
+        return result
+
+    @app.post("/api/product-projects/{project_id}/acceptance")
+    async def run_product_acceptance(project_id: str) -> dict[str, Any]:
+        try:
+            return await orchestrator.coordinator.run_acceptance(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+
+    @app.post("/api/product-projects/{project_id}/waivers")
+    async def create_product_waiver(project_id: str, req: WaiverRequest) -> dict[str, Any]:
+        try:
+            return await orchestrator.coordinator.create_waiver(
+                project_id, req.target_kind, req.target_id, req.reason, actor=req.actor
+            )
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        except (ProductValidationError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     # ---------------- DAG / parallel task endpoints ----------------
     @app.get("/api/missions/{mission_id}/dag")
@@ -619,7 +815,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     @app.get("/api/settings/profiles")
     def list_profiles() -> dict[str, Any]:
         rows = orchestrator.db.query("SELECT key, value FROM settings WHERE key LIKE 'profile.%'")
-        return {r["key"][len("profile."):]: json.loads(r["value"]) for r in rows}
+        return {r["key"][len("profile.") :]: json.loads(r["value"]) for r in rows}
 
     # ---------------- events / analytics ----------------
     @app.get("/api/missions/{mission_id}/events")
@@ -635,13 +831,38 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return {"status": "ok", "time": utcnow().isoformat()}
 
     # ---------------- websocket ----------------
+    def _ws_auth_token(websocket: WebSocket) -> str | None:
+        # The pre-existing Origin check only stops browser clients — it is
+        # skipped entirely when Origin is absent, which any non-browser
+        # client (curl, a script, a compromised local process — exactly the
+        # threat class the REST bearer-token check targets) can simply omit.
+        # WebSocket has no Authorization-header mechanism from the browser
+        # API, so the token travels as a WS subprotocol instead (RFC 6455
+        # Sec-WebSocket-Protocol) rather than a URL query param — a query
+        # param lands in the request line uvicorn's access logger records on
+        # every connect/reconnect, which leaked the token into stdout on the
+        # default `log_level="info"` production entrypoint. Subprotocols
+        # travel as a handshake header, which access logging never captures.
+        subprotocols = websocket.scope.get("subprotocols") or []
+        token = subprotocols[0] if subprotocols else None
+        if not is_authorized(app.state.auth_token, f"Bearer {token}" if token else None):
+            return None
+        return token
+
     @app.websocket("/ws/missions/{mission_id}")
     async def mission_ws(websocket: WebSocket, mission_id: str) -> None:
         origin = websocket.headers.get("origin")
         if origin and origin not in ALLOWED_ORIGINS:
             await websocket.close(code=1008)
             return
-        await websocket.accept()
+        token = _ws_auth_token(websocket)
+        if token is None:
+            await websocket.close(code=1008)
+            return
+        # Echo back the accepted subprotocol: RFC 6455 requires a server that
+        # received a subprotocol offer to select one in its handshake
+        # response, or some clients treat the connection as failed.
+        await websocket.accept(subprotocol=token)
         queue = orchestrator.events.subscribe()
         try:
             # Replay: durable structured history (authoritative) + bounded
@@ -666,7 +887,11 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         if origin and origin not in ALLOWED_ORIGINS:
             await websocket.close(code=1008)
             return
-        await websocket.accept()
+        token = _ws_auth_token(websocket)
+        if token is None:
+            await websocket.close(code=1008)
+            return
+        await websocket.accept(subprotocol=token)
         queue = orchestrator.events.subscribe()
         try:
             while True:

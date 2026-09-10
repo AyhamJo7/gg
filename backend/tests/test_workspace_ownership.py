@@ -109,17 +109,22 @@ def test_ownership_survives_restart(tmp_path: Path, workspace: Path):
         orch.start_mission(b["id"])
         await _wait_status(orch, b["id"], {"WAITING_FOR_WORKSPACE"})
 
-        # hard crash
+        # hard crash: stop the original scheduler first so only the restarted
+        # instance drives recovery (no dual-scheduler race on the same rows)
         orch._engine_tasks[a["id"]].cancel()
         try:
             await orch._engine_tasks[a["id"]]
         except asyncio.CancelledError:
             pass
+        await orch.shutdown()
 
         # restart: A recovers and owns; B must remain queued (no double writer)
         orch2 = make_orchestrator(tmp_path, {"fake-a": FakeAdapter("fake-a", ["ok"])}, config)
         await orch2.start()
-        await asyncio.sleep(0.3)
+        for _ in range(int(10 / 0.05)):
+            if a["id"] in orch2._engines:
+                break
+            await asyncio.sleep(0.05)
         assert a["id"] in orch2._engines, "active mission A was not recovered"
         assert b["id"] not in orch2._engines or orch2.db.get("missions", b["id"])["status"] == "WAITING_FOR_WORKSPACE"
         # A completes → B releases

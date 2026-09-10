@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from typing import Any
 
 from ..models import FailureClass, ProviderState
 from .base import ExecutionRequest, ExecutionResult, OutputHandler, ProviderAdapter
@@ -39,6 +40,7 @@ class FakeAdapter(ProviderAdapter):
         await asyncio.sleep(0.01)
         if request.on_spawn:
             import os
+
             try:
                 pgid = os.getpgrp() if hasattr(os, "getpgrp") else os.getpid()
             except Exception:
@@ -79,6 +81,9 @@ class FakeAdapter(ProviderAdapter):
             "quota": (ProviderState.RATE_LIMITED, FailureClass.QUOTA_EXHAUSTED, 1),
             "crash": (ProviderState.CRASHED, FailureClass.CRASH, 2),
             "auth": (ProviderState.AUTH_REQUIRED, FailureClass.AUTH, 1),
+            # Simulates a spawn-handshake refusal (see _spawn_gate.py) — an
+            # orchestrator-internal failure, not evidence about the provider.
+            "gate_refused": (ProviderState.CRASHED, FailureClass.CRASH, 42),
         }
         state, failure, code = result_map.get(behavior, (ProviderState.COMPLETED, FailureClass.NONE, 0))
         if behavior == "ratelimit":
@@ -98,6 +103,7 @@ class FakeAdapter(ProviderAdapter):
             stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
             raw_tail=raw_tail,
             assistant_text=assistant_text,
+            gate_refused=behavior == "gate_refused",
         )
 
 
@@ -225,4 +231,184 @@ class CrashAfterWriteProvider(FakeAdapter):
             stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
             raw_tail="crash after write",
             assistant_text="crash after write",
+        )
+
+
+class PlanProvider(FakeAdapter):
+    """Deterministic product-plan planner for lifecycle tests.
+
+    Emits ``PRODUCT_PLAN_JSON: <plan>`` where plan is either the injected
+    dict or a default two-phase plan. Script entries control per-call
+    behavior: ``malformed`` emits garbage once (exercises bounded repair),
+    ``ok`` emits the valid plan.
+    """
+
+    executable = "true"
+
+    def __init__(
+        self,
+        name: str = "fake-planner",
+        script: list[str] | None = None,
+        plan: dict[str, Any] | None = None,
+    ):
+        super().__init__(name, script or ["ok"])
+        self.plan = plan or default_test_plan()
+
+    def build_command(self, request: ExecutionRequest) -> list[str]:
+        return ["true"]
+
+    async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
+        import json as _json
+
+        idx = min(self.calls, len(self.script) - 1)
+        behavior = self.script[idx]
+        self.calls += 1
+        on_output(f"[{self.name}] starting role={request.role} behavior={behavior}")
+        if request.role != "planning":
+            return await super().execute(request, on_output)
+        if behavior == "malformed":
+            text = "here is some prose without any JSON block at all"
+        else:
+            text = "PRODUCT_PLAN_JSON:\n```json\n" + _json.dumps(self.plan) + "\n```"
+        on_output(text[:200])
+        return ExecutionResult(
+            state=ProviderState.COMPLETED,
+            failure_class=FailureClass.NONE,
+            exit_code=0,
+            duration_s=0.01,
+            summary=f"fake plan {behavior}",
+            stdout_path=Path(request.log_dir / f"{request.run_id}.stdout.log"),
+            stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
+            raw_tail=text[-2000:],
+            assistant_text=text,
+        )
+
+
+def _req(rid: str, title: str) -> dict[str, Any]:
+    return {
+        "id": rid,
+        "title": title,
+        "description": f"{title} description",
+        "kind": "functional",
+        "acceptance": [{"id": f"{rid}-A1", "description": f"{title} works", "verify": "npm run test"}],
+    }
+
+
+def _phase(
+    key: str, title: str, reqs: list[str], deps: list[str] | None = None, prereqs: list[str] | None = None
+) -> dict[str, Any]:
+    return {
+        "key": key,
+        "title": title,
+        "goal": f"achieve {title}",
+        "deliverables": [f"{title} deliverable"],
+        "tasks": [f"{title} task 1", f"{title} task 2"],
+        "depends_on": deps or [],
+        "workspace_scopes": ["all"],
+        "suggested_providers": [],
+        "acceptance": [{"id": f"{key}-A1", "description": f"{title} done", "verify": "npm run test"}],
+        "requirement_ids": reqs,
+        "verify_commands": ["npm run test"],
+        "human_prerequisites": prereqs or [],
+        "effort": "S",
+    }
+
+
+def default_test_plan() -> dict[str, Any]:
+    return {
+        "product_name": "Test Product",
+        "goal": "prove the lifecycle coordinator",
+        "users": "testers",
+        "journeys": ["run the suite"],
+        "requirements": [_req("R1", "Foundation works"), _req("R2", "Feature works")],
+        "non_functional": ["fast tests"],
+        "assumptions": ["none"],
+        "out_of_scope": ["world domination"],
+        "risks": ["flakes"],
+        "architecture": {
+            "frontend": "none",
+            "backend": "none",
+            "database": "none",
+            "auth": "none",
+            "api_design": "none",
+            "integrations": [],
+            "deployment": "local",
+            "testing_strategy": "node scripts",
+            "security_notes": "none",
+            "repo_structure": "flat",
+            "dependency_strategy": "npm",
+            "decisions": [{"area": "runtime", "choice": "node", "rationale": "tests run anywhere"}],
+        },
+        "phases": [
+            _phase("foundation", "Foundation", ["R1"]),
+            _phase("feature", "Feature", ["R2"], deps=["foundation"]),
+        ],
+        "external_prerequisites": [],
+    }
+
+
+def gated_test_plan() -> dict[str, Any]:
+    plan = default_test_plan()
+    plan["external_prerequisites"] = [
+        {
+            "key": "test-token",
+            "title": "Configure TEST_TOKEN",
+            "what_required": "TEST_TOKEN value",
+            "why_required": "feature phase test needs it",
+            "human_action": "add TEST_TOKEN=... to the target repo .env",
+            "where_to_provide": "target repo .env",
+            "validation": "presence of TEST_TOKEN in .env",
+            "required_vars": ["TEST_TOKEN"],
+        }
+    ]
+    plan["phases"][1]["human_prerequisites"] = ["test-token"]
+    return plan
+
+
+class FindingsProvider(FakeAdapter):
+    """Deterministic reviewer: emits scripted findings per review call.
+
+    findings_script[i] is the findings list for the i-th review call; later
+    calls repeat the last entry. Non-review roles behave like ``ok``/``work``.
+    An optional verified_script[i] appends a VERIFIED_FIXED_JSON line.
+    """
+
+    executable = "true"
+
+    def __init__(
+        self,
+        name: str = "fake-reviewer",
+        findings_script: list[list[dict[str, Any]]] | None = None,
+        verified_script: list[list[dict[str, Any]]] | None = None,
+    ):
+        super().__init__(name, ["ok"])
+        self.findings_script = findings_script or [[]]
+        self.verified_script = verified_script or []
+        self.review_calls = 0
+
+    def build_command(self, request: ExecutionRequest) -> list[str]:
+        return ["true"]
+
+    async def execute(self, request: ExecutionRequest, on_output: OutputHandler) -> ExecutionResult:
+        import json as _json
+
+        if request.role != "review":
+            return await super().execute(request, on_output)
+        idx = min(self.review_calls, len(self.findings_script) - 1)
+        self.review_calls += 1
+        items = self.findings_script[idx]
+        text = "REVIEW_FINDINGS_JSON: " + _json.dumps(items)
+        if idx < len(self.verified_script) and self.verified_script[idx]:
+            text += "\nVERIFIED_FIXED_JSON: " + _json.dumps(self.verified_script[idx])
+        on_output(text[:300])
+        return ExecutionResult(
+            state=ProviderState.COMPLETED,
+            failure_class=FailureClass.NONE,
+            exit_code=0,
+            duration_s=0.01,
+            summary=f"fake review {len(items)} findings",
+            stdout_path=Path(request.log_dir / f"{request.run_id}.stdout.log"),
+            stderr_path=Path(request.log_dir / f"{request.run_id}.stderr.log"),
+            raw_tail=text[-2000:],
+            assistant_text=text,
         )

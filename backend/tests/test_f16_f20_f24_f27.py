@@ -16,10 +16,12 @@ from orchestrator.git_ops import checkpoint, init_repo
 from orchestrator.models import MissionStatus
 from orchestrator.providers.fake import FakeAdapter
 from orchestrator.review import (
+    finding_fingerprint,
     mark_findings_repair_attempted,
     open_blockers,
     persist_findings,
     resolve_repaired_findings,
+    unverified_findings,
 )
 
 
@@ -29,7 +31,9 @@ async def client(tmp_path: Path, workspace: Path):
     await orch.registry.detect_all()
     app = create_app(tmp_path / "api.db", make_config(providers=["fake-a"]), orch)
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", headers={"Authorization": f"Bearer {app.state.auth_token}"}
+    ) as c:
         c.orchestrator = orch  # type: ignore[attr-defined]
         yield c
     await orch.shutdown()
@@ -37,13 +41,15 @@ async def client(tmp_path: Path, workspace: Path):
 
 @pytest.mark.asyncio
 async def test_f19_review_repair_lifecycle(tmp_path: Path) -> None:
-    """F-19: Findings become repair_attempted during repair, and resolved after successful review."""
+    """F-19/F-LIFE-02: omission never resolves; only re-flag or explicit verification changes state."""
     db_path = tmp_path / "test.db"
     db = Database(db_path)
     proj_id = "proj-f19"
     mission_id = "test-mission-f19"
 
-    db.insert("projects", {"id": proj_id, "name": "test-p", "path": str(tmp_path), "created_at": "2026-09-05T00:00:00Z"})
+    db.insert(
+        "projects", {"id": proj_id, "name": "test-p", "path": str(tmp_path), "created_at": "2026-09-05T00:00:00Z"}
+    )
     db.insert(
         "missions",
         {
@@ -62,6 +68,7 @@ async def test_f19_review_repair_lifecycle(tmp_path: Path) -> None:
     parsed_ok, findings = persist_findings(db, mission_id, raw_review)
     assert parsed_ok is True
     assert len(findings) == 1
+    assert findings[0].id
     assert open_blockers(db, mission_id)
 
     # When repair phase starts, open findings transition to repair_attempted
@@ -71,10 +78,36 @@ async def test_f19_review_repair_lifecycle(tmp_path: Path) -> None:
     stored = db.query("SELECT status FROM review_findings WHERE mission_id=?", (mission_id,))
     assert stored[0]["status"] == "repair_attempted"
 
-    # When next review verifies fix (no blockers found), resolve_repaired_findings resolves them
-    resolve_repaired_findings(db, mission_id)
-    stored_final = db.query("SELECT status FROM review_findings WHERE mission_id=?", (mission_id,))
-    assert stored_final[0]["status"] == "resolved"
+    # A later review that OMITS the finding resolves nothing (F-LIFE-02).
+    parsed_ok, _ = persist_findings(db, mission_id, "REVIEW_FINDINGS_JSON: []")
+    assert parsed_ok is True
+    resolve_repaired_findings(db, mission_id)  # legacy no-op
+    assert db.query("SELECT status FROM review_findings WHERE mission_id=?", (mission_id,))[0]["status"] == (
+        "repair_attempted"
+    )
+    assert len(unverified_findings(db, mission_id)) == 1
+
+    # A re-flagged defect reopens the same row (stable identity, no duplicate).
+    parsed_ok, findings = persist_findings(db, mission_id, raw_review)
+    assert parsed_ok is True
+    assert len(db.query("SELECT id FROM review_findings WHERE mission_id=?", (mission_id,))) == 1
+    assert open_blockers(db, mission_id)
+
+    # Explicit verification with evidence resolves it.
+    mark_findings_repair_attempted(db, mission_id)
+    fid = db.query("SELECT id FROM review_findings WHERE mission_id=?", (mission_id,))[0]["id"]
+    verified = (
+        "REVIEW_FINDINGS_JSON: []\n"
+        f'VERIFIED_FIXED_JSON: [{{"finding_id": "{fid}", "evidence": "added null check, tests/edge passes"}}]'
+    )
+    persist_findings(db, mission_id, verified)
+    row = db.query("SELECT status, verified_by FROM review_findings WHERE mission_id=?", (mission_id,))[0]
+    assert row["status"] == "resolved"
+    assert "null check" in (row["verified_by"] or "")
+    assert finding_fingerprint("BLOCKER", "bug", None, "Null pointer")
+    assert finding_fingerprint("BLOCKER", "bug", None, "Null pointer") == finding_fingerprint(
+        "blocker", "BUG", None, "  null   pointer "
+    )
 
 
 @pytest.mark.asyncio

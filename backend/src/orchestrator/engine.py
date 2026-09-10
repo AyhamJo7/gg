@@ -41,7 +41,6 @@ from .review import (
     mark_findings_repair_attempted,
     open_blockers,
     persist_findings,
-    resolve_repaired_findings,
 )
 from .security import ensure_gitignore_protections, redact
 from .verify import run_verification
@@ -229,9 +228,7 @@ class MissionEngine:
                             "updated_at": utcnow(),
                         },
                     )
-                    raise git_ops.GitCheckpointError(
-                        f"git checkpoint failed repeatedly ({failures}x): {exc}"
-                    ) from exc
+                    raise git_ops.GitCheckpointError(f"git checkpoint failed repeatedly ({failures}x): {exc}") from exc
                 return None
         if sha:
             self.db.insert(
@@ -386,6 +383,7 @@ class MissionEngine:
             if self.project_path is None:
                 raise RuntimeError("engine project path not initialized")
             log_dir = self.project_path / ".orchestrator" / "logs"
+
             def on_spawn(pid: int, pgid: int, start_ts: float, r_id: str = run_id) -> None:
                 self.db.update(
                     "provider_runs",
@@ -488,9 +486,19 @@ class MissionEngine:
                 return result
 
             # failure path
-            state = self.registry.record_failure(
-                provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
-            )
+            if result.gate_refused:
+                # Spawn-handshake refusal is orchestrator-internal (identity
+                # persistence failed before exec) — not evidence about the
+                # provider itself, so it must not cost it a reliability
+                # cooldown the way a genuine crash/timeout does. Still must
+                # clear the BUSY state mark_busy() set, or is_eligible()
+                # leaves this provider permanently unselectable.
+                self.registry.clear_busy_without_penalty(provider_name)
+                state = ProviderState.AVAILABLE
+            else:
+                state = self.registry.record_failure(
+                    provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
+                )
             self.db.update(
                 "tasks", task.id, {"status": "failed", "summary": result.raw_tail[-300:], "finished_at": utcnow()}
             )
@@ -823,13 +831,33 @@ class MissionEngine:
         )
         return rows[0]["cnt"] if rows else 0
 
+    def _prior_findings_context(self) -> str:
+        """List prior findings with stable IDs so the reviewer can re-flag or verify each one."""
+        rows = self.db.query(
+            "SELECT id, severity, status, file, description, fingerprint FROM review_findings "
+            "WHERE mission_id=? AND status IN ('open','repair_attempted') ORDER BY created_at ASC",
+            (self.mission_id,),
+        )
+        if not rows:
+            return ""
+        lines = [
+            "## Prior findings (re-flag if still present, or verify fixed with evidence)",
+            "Omission without verification leaves a finding UNVERIFIED.",
+        ]
+        lines.extend(
+            f"- id={r['id']} fp={r.get('fingerprint') or '-'} [{r['severity']}/{r['status']}] "
+            f"{r['file'] or ''}: {r['description'][:300]}"
+            for r in rows
+        )
+        return "\n".join(lines)
+
     async def _phase_review_loop(self) -> bool:
         if not self.config.get("orchestration.review_required", True):
             return True
         max_cycles = int(self.config.get("orchestration.max_repair_cycles", 3))
         max_unparseable_attempts = int(self.config.get("orchestration.max_unparseable_review_attempts", 2))
         while True:
-            result = await self._run_provider_phase(Role.REVIEW)
+            result = await self._run_provider_phase(Role.REVIEW, extra_context=self._prior_findings_context())
             if result is None:
                 return False
             review_input = result.assistant_text + "\n" + result.summary
@@ -855,7 +883,6 @@ class MissionEngine:
 
             blockers = open_blockers(self.db, self.mission_id)
             if not blockers:
-                resolve_repaired_findings(self.db, self.mission_id)
                 return True
             cycles = self._mission().repair_cycles
             if cycles >= max_cycles:
@@ -870,7 +897,8 @@ class MissionEngine:
             # recovery after restart re-enters the review loop correctly.
             self._set_status(MissionStatus.REPAIRING)
             findings_text = "\n".join(
-                f"- [{f['severity']}] {f['file'] or ''}: {f['description']} → {f['recommended_fix']}" for f in blockers
+                f"- [{f['severity']}] id={f['id']} {f['file'] or ''}: {f['description']} → {f['recommended_fix']}"
+                for f in blockers
             )
             repair = await self._run_provider_phase(
                 Role.REPAIR, extra_context=f"## Open findings to fix\n{findings_text}"

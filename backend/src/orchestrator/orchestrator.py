@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from pathlib import Path
 from typing import Any
 
 from .config import Config
@@ -30,6 +29,7 @@ from .models import (
 )
 from .notifications import Notifier, default_notifier
 from .parallel_engine import ParallelMissionEngine
+from .project_engine import ProjectCoordinator
 from .providers.base import ProviderAdapter
 from .providers.registry import ProviderRegistry
 
@@ -62,12 +62,14 @@ class Orchestrator:
         self._engine_tasks: dict[str, asyncio.Task[None]] = {}
         self._scheduler_task: asyncio.Task[None] | None = None
         self._shutdown = asyncio.Event()
+        self.coordinator = ProjectCoordinator(self)
 
     # -- lifecycle ------------------------------------------------------------
     async def start(self) -> None:
         await self.registry.detect_all()
         self._reap_orphaned_processes()
         await self._recover_missions()
+        await self.coordinator.recover()
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     async def shutdown(self) -> None:
@@ -88,91 +90,16 @@ class Orchestrator:
         provider: str,
     ) -> bool:
         """Verify a recorded PID still belongs to our provider process.
-        
-        Returns True only when we can positively identify the process as ours.
-        On any doubt, returns False to prevent killing unrelated processes.
-        """
-        import os
-        proc_path = Path(f"/proc/{pid}")
-        if not proc_path.exists():
-            return False
-        
-        # 1. Verify PGID matches
-        try:
-            actual_pgid = os.getpgid(pid)
-            if actual_pgid != pgid:
-                logger.warning(
-                    "PID %d PGID mismatch: recorded=%d actual=%d — not killing",
-                    pid, pgid, actual_pgid,
-                )
-                return False
-        except (ProcessLookupError, PermissionError):
-            return False
-        
-        # 2. Verify start time if we have a recorded timestamp
-        if started_at_ts is not None:
-            try:
-                stat_data = (proc_path / "stat").read_text()
-                # /proc/[pid]/stat format: pid (comm) state ... field22=starttime
-                # comm can contain spaces/parens, so find the closing ')' first
-                close_paren = stat_data.rfind(')')
-                if close_paren == -1:
-                    return False
-                fields = stat_data[close_paren + 2:].split()
-                # starttime is field 22 (1-indexed), but after stripping pid+comm+state,
-                # it's at index 19 in the remaining fields (state=0, ppid=1, ...)
-                proc_starttime = int(fields[19])  # starttime in clock ticks
-                
-                # Convert our recorded time.time() to clock ticks for comparison
-                # Read system boot time from /proc/stat
-                boot_time = None
-                with open('/proc/stat') as f:
-                    for line in f:
-                        if line.startswith('btime '):
-                            boot_time = int(line.split()[1])
-                            break
-                if boot_time is not None:
-                    clk_tck = os.sysconf('SC_CLK_TCK')  
-                    expected_starttime_ticks = int((started_at_ts - boot_time) * clk_tck)
-                    # Allow 2-second tolerance for timing jitter
-                    if abs(proc_starttime - expected_starttime_ticks) > 2 * clk_tck:
-                        logger.warning(
-                            "PID %d start time mismatch: recorded=%.1f proc_start=%d expected_ticks=%d — not killing",
-                            pid, started_at_ts, proc_starttime, expected_starttime_ticks,
-                        )
-                        return False
-            except (OSError, ValueError, IndexError):
-                # Cannot verify start time — err on the side of NOT killing
-                logger.warning("PID %d: could not verify start time — not killing", pid)
-                return False
-        
-        # 3. Verify command line contains provider-related token
-        try:
-            cmdline_bytes = (proc_path / "cmdline").read_bytes()
-            if not cmdline_bytes:
-                logger.warning("PID %d: empty cmdline — not killing", pid)
-                return False
-            cmdline = cmdline_bytes.replace(b"\x00", b" ").decode(errors="replace").lower()
-            provider_token = provider.replace("-", "").replace("_", "").lower()
-            if provider_token not in cmdline:
-                logger.warning(
-                    "PID %d cmdline does not contain provider token '%s': %s — not killing",
-                    pid,
-                    provider_token,
-                    cmdline[:200],
-                )
-                return False
-        except OSError as exc:
-            logger.warning("PID %d: cannot read cmdline (%s) — not killing", pid, exc)
-            return False
 
-        return True
+        Delegates to the shared orphans helper (same strict policy).
+        """
+        from .orphans import verify_process_ownership
+
+        return verify_process_ownership(pid, pgid, started_at_ts, provider)
 
     def _reap_orphaned_processes(self) -> None:
         """Find and terminate any provider processes left running by an abnormal backend exit."""
-        import os
-        import signal
-        import time
+        from .orphans import kill_process_tree
 
         unreaped = self.db.query(
             """SELECT pr.id, pr.mission_id, pr.provider, pr.pid, pr.pgid, pr.started_at_ts
@@ -188,8 +115,6 @@ class Orchestrator:
                 continue
 
             is_ours = self._verify_process_ownership(pid, pgid, row.get("started_at_ts"), row["provider"])
-            
-            proc_path = Path(f"/proc/{pid}")
 
             if is_ours:
                 logger.warning(
@@ -199,16 +124,7 @@ class Orchestrator:
                     run_id,
                     row["provider"],
                 )
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                time.sleep(0.05)
-                if proc_path.exists():
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                kill_process_tree(pgid)
 
             self.db.update(
                 "provider_runs",
@@ -273,6 +189,7 @@ class Orchestrator:
                 self.registry.health()  # expires cooldowns
                 for engine in list(self._engines.values()):
                     engine.wake()
+                await self.coordinator.advance_all()
                 # re-launch missions that are waiting (provider availability or
                 # workspace ownership) when their constraint clears
                 waiting = self.db.query(

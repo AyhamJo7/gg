@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
 
-cd /home/adam/projects/gg
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
 # Setup disposable repo
 REPO="/tmp/gg-ui-dogfood-$(date +%s)"
@@ -43,7 +44,7 @@ git commit -m "initial"
 uv sync
 git add uv.lock
 git commit -m "add uv.lock"
-cd /home/adam/projects/gg
+cd "$REPO_ROOT"
 
 # Clean up any existing DB
 rm -f /tmp/gg-ui-dogfood.db
@@ -62,10 +63,17 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
+# Mutating routes require the bearer token (see backend/src/orchestrator/api/auth.py).
+# There is no network route to fetch it — read it straight from the file the
+# backend just wrote (guaranteed present once /api/health responds, since
+# create_app() generates it before uvicorn starts serving).
+AUTH_TOKEN=$(cat "$REPO_ROOT/backend/.orchestrator/auth_token")
+
 # Create project
 echo "Creating project..."
 PROJECT_RESP=$(curl -s -X POST http://127.0.0.1:8787/api/projects \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
   -d "{\"path\":\"$REPO\",\"name\":\"ui-dogfood\"}")
 PROJECT_ID=$(echo "$PROJECT_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 echo "Project ID: $PROJECT_ID"
@@ -74,12 +82,13 @@ echo "Project ID: $PROJECT_ID"
 echo "Creating mission..."
 MISSION_RESP=$(curl -s -X POST http://127.0.0.1:8787/api/missions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
   -d "{\"project_id\":\"$PROJECT_ID\",\"title\":\"UI Dogfood Parallel\",\"task\":\"Create greeting and farewell modules\",\"autonomy\":\"BALANCED\",\"profile\":\"balanced\",\"scheduling_mode\":\"PARALLEL_SAFE\",\"start\":true}")
 MISSION_ID=$(echo "$MISSION_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 echo "Mission ID: $MISSION_ID"
 
 # Start frontend in background
-cd /home/adam/projects/gg/frontend
+cd "$REPO_ROOT/frontend"
 npm run dev -- --port 5173 &
 FRONTEND_PID=$!
 
@@ -94,7 +103,7 @@ for i in $(seq 1 30); do
 done
 
 # Run Playwright screenshot script from frontend dir
-cd /home/adam/projects/gg/frontend
+cd "$REPO_ROOT/frontend"
 node -e "
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -124,7 +133,7 @@ fs.mkdirSync(shots, { recursive: true });
 
 # Get final mission state
 echo "Final mission state:"
-curl -s "http://127.0.0.1:8787/api/missions/$MISSION_ID" | python3 -m json.tool
+curl -s -H "Authorization: Bearer $AUTH_TOKEN" "http://127.0.0.1:8787/api/missions/$MISSION_ID" | python3 -m json.tool
 
 # Cleanup
 kill $BACKEND_PID $FRONTEND_PID 2>/dev/null || true

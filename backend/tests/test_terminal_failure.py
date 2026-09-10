@@ -62,6 +62,75 @@ def test_exhaustion_persists_failed_not_active(tmp_path: Path, workspace: Path):
     asyncio.run(main())
 
 
+def test_gate_refused_failure_does_not_penalize_provider(tmp_path: Path, workspace: Path):
+    """A spawn-handshake refusal is orchestrator-internal (identity persistence
+    failed before exec, see _spawn_gate.py) — not evidence the provider itself
+    is unhealthy. It must not cost the provider a reliability cooldown the way
+    a genuine crash/timeout does, unlike an ordinary crash (contrasted below)."""
+
+    async def main() -> None:
+        orch = _failing_orch(tmp_path, behavior="gate_refused")
+        await orch.registry.detect_all()
+        _seed_project(orch, workspace)
+        mission = orch.create_mission("p1", "m", "t", "AUTONOMOUS", "balanced")
+        await _run(orch, mission["id"])
+        final = orch.db.get("missions", mission["id"])
+        assert final["status"] == MissionStatus.FAILED.value  # still fails the mission — no free pass on the task
+
+        row = orch.db.get("providers", "fake-a", key="name")
+        assert row["consecutive_failures"] == 0
+        # A short fixed cooldown is applied (distinct from the exponential
+        # reliability cooldown below) — not zero, but bounded and unrelated
+        # to failure count, so it never compounds like a real penalty would.
+        assert row["cooldown_until"] is not None
+        assert row["state"] != "CRASHED"
+        await orch.shutdown()
+
+    asyncio.run(main())
+
+
+def test_gate_refused_cooldown_is_short_and_expires(tmp_path: Path, workspace: Path):
+    """The gate_refused exemption still applies a small fixed cooldown (not
+    the exponential reliability one) so a persistent internal fault can't
+    cause an immediate zero-delay respawn loop. Verify it directly against
+    the registry: not eligible right after, eligible again once it elapses."""
+
+    async def main() -> None:
+        orch = _failing_orch(tmp_path, behavior="gate_refused")
+        await orch.registry.detect_all()
+        orch.registry.clear_busy_without_penalty("fake-a")
+        assert orch.registry.is_eligible("fake-a") is False
+        await asyncio.sleep(0.1)  # > the 0.05s test-config gate_refused_cooldown_seconds
+        assert orch.registry.is_eligible("fake-a") is True
+        # is_eligible's lazy reconcile clears the now-expired cooldown_until
+        # out of the DB too (not just eligibility-correct) — otherwise
+        # health()'s dashboard payload shows a perpetually-stale timestamp.
+        row = orch.db.get("providers", "fake-a", key="name")
+        assert row["cooldown_until"] is None
+        await orch.shutdown()
+
+    asyncio.run(main())
+
+
+def test_ordinary_crash_still_penalizes_provider(tmp_path: Path, workspace: Path):
+    """Contrast case for the gate_refused exemption above: an ordinary crash
+    (gate_refused=False) must still record a real reliability penalty."""
+
+    async def main() -> None:
+        orch = _failing_orch(tmp_path, behavior="crash")
+        await orch.registry.detect_all()
+        _seed_project(orch, workspace)
+        mission = orch.create_mission("p1", "m", "t", "AUTONOMOUS", "balanced")
+        await _run(orch, mission["id"])
+
+        row = orch.db.get("providers", "fake-a", key="name")
+        assert row["consecutive_failures"] > 0
+        assert row["cooldown_until"] is not None
+        await orch.shutdown()
+
+    asyncio.run(main())
+
+
 def test_exhaustion_at_every_provider_phase(tmp_path: Path):
     """Exhaustion must persist FAILED regardless of which phase it occurs in."""
 
@@ -127,7 +196,10 @@ def test_restart_never_recovers_failed_mission(tmp_path: Path, workspace: Path):
             assert mission["id"] not in orch2._engines
             for a in adapters2.values():
                 assert a.calls == 0, f"restart {i}: provider was invoked!"
-            assert len(orch2.db.query("SELECT id FROM provider_runs WHERE mission_id=?", (mission["id"],))) == runs_after_failure
+            assert (
+                len(orch2.db.query("SELECT id FROM provider_runs WHERE mission_id=?", (mission["id"],)))
+                == runs_after_failure
+            )
             assert orch2.db.get("missions", mission["id"])["status"] == MissionStatus.FAILED.value
             await orch2.shutdown()
 
@@ -291,4 +363,3 @@ def test_f02_terminal_state_transitions_rejected_domain(tmp_path: Path, workspac
             orch.cancel_mission("nonexistent-mission")
 
     asyncio.run(main())
-
