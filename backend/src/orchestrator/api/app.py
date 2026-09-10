@@ -962,6 +962,14 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             except json.JSONDecodeError:
                 manifest["blocks"] = []
             manifest.pop("blocks_json", None)
+        warnings_raw = manifest.get("warnings_json")
+        if isinstance(warnings_raw, str):
+            try:
+                manifest["warnings"] = json.loads(warnings_raw)
+            except json.JSONDecodeError:
+                manifest["warnings"] = []
+            manifest.pop("warnings_json", None)
+        # Manifests carry metadata only (no raw prompt/secret text) by design.
         return manifest
 
     @app.get("/api/analytics/usage")
@@ -996,6 +1004,86 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return {
             "by_provider": rows,
             "note": "token totals include only runs with captured usage; unknown runs are excluded, never zero-filled",
+        }
+
+    @app.get("/api/analytics/context")
+    def analytics_context(
+        product_project_id: str | None = None,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Context efficiency (Increment 2): GG prompt estimates vs provider usage.
+
+        GG prompt estimates (char4-v1) are always distinct from
+        provider-observed usage. Unknown telemetry stays UNKNOWN.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if product_project_id:
+            clauses.append("r.product_project_id=?")
+            params.append(product_project_id)
+        if mission_id:
+            clauses.append("r.mission_id=?")
+            params.append(mission_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        try:
+            by_policy = orchestrator.db.query(
+                f"""SELECT r.context_policy_version as policy,
+                    COUNT(*) as runs,
+                    AVG(m.estimated_prompt_tokens) as avg_estimated_tokens,
+                    AVG(m.repeated_context_ratio) as avg_repeated_ratio
+                    FROM provider_runs r LEFT JOIN run_context_manifests m ON m.run_id=r.id
+                    {where} GROUP BY r.context_policy_version""",  # noqa: S608
+                tuple(params),
+            )
+        except Exception:
+            by_policy = []
+        try:
+            by_role = orchestrator.db.query(
+                f"""SELECT r.role as role,
+                    COUNT(*) as runs,
+                    AVG(m.estimated_prompt_tokens) as avg_estimated_tokens,
+                    AVG(m.repeated_context_ratio) as avg_repeated_ratio
+                    FROM provider_runs r LEFT JOIN run_context_manifests m ON m.run_id=r.id
+                    {where} GROUP BY r.role""",  # noqa: S608
+                tuple(params),
+            )
+        except Exception:
+            by_role = []
+        try:
+            warnings_rows = orchestrator.db.query(
+                f"""SELECT m.warnings_json as warnings_json FROM run_context_manifests m
+                    JOIN provider_runs r ON r.id=m.run_id {where}""",  # noqa: S608
+                tuple(params),
+            )
+        except Exception:
+            warnings_rows = []
+        warning_counts: dict[str, int] = {}
+        for row in warnings_rows:
+            raw = row.get("warnings_json") or "[]"
+            try:
+                import json as _json
+
+                items = _json.loads(raw) if isinstance(raw, str) else []
+            except Exception:
+                items = []
+            for w in items if isinstance(items, list) else []:
+                warning_counts[str(w)] = warning_counts.get(str(w), 0) + 1
+        # Legacy vs compiled comparison on estimated GG prompt tokens.
+        legacy_avg: float | None = None
+        compiled_avg: float | None = None
+        for row in by_policy:
+            if row.get("policy") in ("legacy-v1", "legacy_v1", ""):
+                legacy_avg = row.get("avg_estimated_tokens")
+            if row.get("policy") in ("context-policy-v2", "compiled-v2"):
+                compiled_avg = row.get("avg_estimated_tokens")
+        return {
+            "by_policy": by_policy,
+            "by_role": by_role,
+            "warning_counts": warning_counts,
+            "legacy_avg_estimated_tokens": legacy_avg,
+            "compiled_avg_estimated_tokens": compiled_avg,
+            "note": "GG prompt estimates (char4-v1) are distinct from provider-observed usage; "
+            "unknown provider telemetry is excluded, never zero-filled.",
         }
 
     @app.post("/api/product-projects/{project_id}/planning-operations", status_code=202)
