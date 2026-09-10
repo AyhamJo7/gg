@@ -319,10 +319,16 @@ class MissionEngine:
                 priorities = stored[role.value]
         eligible = [p for p in priorities if self.registry.is_eligible(p)]
 
-        # Separation of duties: reviewer should differ from implementer when possible.
+        # Separation of duties: the reviewer must be outside the FULL
+        # candidate provider-writer set (not merely != last implementer) —
+        # repairers join the writer set once they write.
         if role == Role.REVIEW and len(eligible) > 1:
-            implementer = self._last_provider_for(Role.IMPLEMENTATION)
-            alternatives = [p for p in eligible if p != implementer]
+            from .provenance import mission_provider_writers
+
+            writers, _complete = mission_provider_writers(self.db, self.mission_id)
+            if not writers:
+                writers = {self._last_provider_for(Role.IMPLEMENTATION)} - {None}
+            alternatives = [p for p in eligible if p not in writers]
             if alternatives:
                 eligible = alternatives
         if role == Role.REPAIR and len(eligible) > 1:
@@ -844,6 +850,15 @@ class MissionEngine:
     async def run(self) -> None:
         self.project_path = self._project_path()
         mission = self._mission()
+        # Resume/recovery may start mid-sequence (skipping ANALYZING), which
+        # used to leave workspace unset and silently disable ALL checkpoints
+        # (evidence loss). Re-inspect read-only so checkpoint/verify paths
+        # always observe the true workspace.
+        if self.workspace is None and self.project_path is not None:
+            try:
+                self.workspace = await inspect_workspace(self.project_path, self.config.allowed_roots())
+            except Exception:
+                logger.debug("workspace re-inspection failed", exc_info=True)
         start_phase = mission.current_phase or MissionStatus.ANALYZING
         if mission.status in (MissionStatus.RECOVERING, MissionStatus.WAITING_FOR_PROVIDER):
             start_phase = mission.current_phase or MissionStatus.ANALYZING
@@ -953,52 +968,24 @@ class MissionEngine:
             self._tests_run.append(f"provider testing phase: {result.summary[:150]}")
         return True
 
-    def _record_review_provenance(self, review_parsed: bool = True) -> None:
+    async def _record_review_provenance(self, review_parsed: bool = True) -> dict[str, Any] | None:
         """Persist who reviewed vs. who implemented, with truthful independence.
 
         Self-review is an accepted V1 degraded mode when no alternative provider
         is eligible — but it is always recorded and disclosed, never presented
-        as independent review.
+        as independent review. The attempt is bound to its exact reviewed SHA
+        range plus the full candidate writer set (Increment 3).
         """
-        implementer = self._last_provider_for(Role.IMPLEMENTATION)
-        rows = self.db.query(
-            "SELECT provider FROM provider_runs WHERE mission_id=? AND role='review' AND failure_class='NONE' "
-            "ORDER BY started_at DESC LIMIT 1",
-            (self.mission_id,),
-        )
-        if not rows:
-            return
-        reviewer = rows[0]["provider"]
-        if implementer is None:
-            independent = False
-            reason = "implementation provider unknown (cannot prove independence)"
-        elif reviewer == implementer:
-            independent = False
-            reason = "no alternative provider eligible; reviewer is the implementer (self-review)"
-        else:
-            independent = True
-            reason = None
-        self.db.insert(
-            "reviews",
-            {
-                "id": f"rev-{utcnow().timestamp()}".replace(".", ""),
-                "mission_id": self.mission_id,
-                "implementation_provider": implementer,
-                "review_provider": reviewer,
-                "independent": int(independent),
-                "degradation_reason": reason,
-                "review_parsed": int(review_parsed),
-                "created_at": utcnow(),
-            },
-        )
-        self.events.publish(
-            EventType.REVIEW_RECORDED,
-            self.mission_id,
-            review_provider=reviewer,
-            implementation_provider=implementer,
-            independent=independent,
-            degradation_reason=reason,
-        )
+        from .provenance import record_review_attempt
+
+        repo = self.project_path
+        try:
+            return await record_review_attempt(
+                self.db, self.events, mission_id=self.mission_id, repo=repo, review_parsed=review_parsed
+            )
+        except Exception:
+            logger.debug("review attempt recording failed", exc_info=True)
+            return None
 
     def _unparseable_review_count(self) -> int:
         """Count unparseable reviews from persisted state (survives restart)."""
@@ -1039,7 +1026,17 @@ class MissionEngine:
                 return False
             review_input = result.assistant_text + "\n" + result.summary
             parsed_ok, findings = persist_findings(self.db, self.mission_id, review_input)
-            self._record_review_provenance(review_parsed=parsed_ok)
+            review_row = await self._record_review_provenance(review_parsed=parsed_ok)
+            if review_row:
+                from .provenance import attach_finding_lineage
+
+                attach_finding_lineage(
+                    self.db,
+                    self.mission_id,
+                    str(review_row.get("id")),
+                    review_row.get("reviewed_head_sha"),
+                    [f.id for f in findings],
+                )
             for f in findings:
                 self.events.publish(
                     EventType.REVIEW_FINDING_CREATED,

@@ -61,11 +61,15 @@ def _new_id(prefix: str) -> str:
 
 # -- write provenance ----------------------------------------------------------
 
-#: Roles whose provider runs are expected to change code and therefore get
-#: checkpoint linkage. Planning/review/testing runs are not code-writing
-#: attempts; stray commits they leave behind surface as UNKNOWN_EXTERNAL in
-#: range analysis instead of being misattributed.
-CODE_WRITING_ROLES = frozenset({"implementation", "repair"})
+#: Roles whose provider runs are checkpoint-linked. Planning/testing runs can
+#: genuinely emit files (fake "ok" writes agent_work.txt; testing may fix
+#: failures), so they are tracked too — only review is excluded (a reviewer
+#: must not write code; its stray writes surface as UNKNOWN_EXTERNAL).
+#: Joining this set only ever *widens* reviewer exclusion, never narrows it.
+TRACKED_WRITE_ROLES = frozenset({"planning", "implementation", "testing", "repair"})
+
+#: Backwards-compatible alias (Increment 3 seal used this name).
+CODE_WRITING_ROLES = TRACKED_WRITE_ROLES
 
 
 async def capture_write_start(workdir: Path | None) -> tuple[str | None, bool, list[str]]:
@@ -264,6 +268,40 @@ def provider_writers(writers: list[dict[str, Any]]) -> set[str]:
     return {str(w["provider"]) for w in writers if w.get("actor_type") == ACTOR_PROVIDER and w.get("provider")}
 
 
+#: Stages whose provider runs are expected to have write rows.
+WRITE_STAGES = frozenset({"product_plan", "mission_plan", "dag_plan", "implementation", "repair", "task", "testing"})
+
+
+def mission_provider_writers(db: Any, mission_id: str) -> tuple[set[str], bool]:
+    """(provider writers, complete) for one mission, from write_provenance.
+
+    Complete is False when a successful code-writing run has no write row
+    (legacy/unlinked) or when dirt/unknown actors were captured — in that
+    case independence cannot be certified.
+    """
+    rows = db.query(
+        "SELECT DISTINCT provider FROM write_provenance WHERE mission_id=? AND actor_type=? AND provider IS NOT NULL",
+        (mission_id, ACTOR_PROVIDER),
+    )
+    writers = {str(r["provider"]) for r in rows}
+    runs = db.query(
+        "SELECT id FROM provider_runs WHERE mission_id=? AND failure_class='NONE' AND stage IN"
+        " ('product_plan','mission_plan','dag_plan','implementation','repair','task','testing')",
+        (mission_id,),
+    )
+    if not runs:
+        return writers, True
+    linked = db.query(
+        "SELECT COUNT(*) as n FROM write_provenance WHERE mission_id=? AND run_id IS NOT NULL", (mission_id,)
+    )
+    tainted = db.query(
+        "SELECT id FROM write_provenance WHERE mission_id=? AND (dirty_before=1 OR actor_type=?) LIMIT 1",
+        (mission_id, ACTOR_UNKNOWN),
+    )
+    complete = int((linked[0].get("n") if linked else 0) or 0) >= len(runs) and not tainted
+    return writers, complete
+
+
 # -- phase attempts -------------------------------------------------------------
 
 
@@ -328,6 +366,145 @@ def finish_phase_attempt(
 def latest_review_for_mission(db: Any, mission_id: str) -> dict[str, Any] | None:
     rows = db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,))
     return dict(rows[0]) if rows else None
+
+
+async def record_review_attempt(
+    db: Any,
+    events: Any,
+    *,
+    mission_id: str,
+    product_project_id: str | None = None,
+    phase_id: str | None = None,
+    repo: Path | None = None,
+    review_parsed: bool = True,
+) -> dict[str, Any] | None:
+    """Persist one immutable review attempt bound to its exact reviewed range.
+
+    Independence rule: reviewer ∉ full candidate provider-writer set, and
+    writer provenance must be complete (no UNKNOWN/dirty). Self-review stays
+    possible but is recorded independent=0, never certified.
+    """
+    import json as _json
+
+    runs = db.query(
+        "SELECT * FROM provider_runs WHERE mission_id=? AND role='review' AND failure_class='NONE' "
+        "ORDER BY started_at DESC LIMIT 1",
+        (mission_id,),
+    )
+    if not runs:
+        return None
+    run = runs[0]
+    reviewer = str(run.get("provider") or "")
+    reviewed_head = normalize_sha(run.get("git_commit_before")) or normalize_sha(run.get("git_commit_after"))
+
+    impl_rows = db.query(
+        "SELECT provider FROM provider_runs WHERE mission_id=? AND role='implementation'"
+        " AND failure_class='NONE' ORDER BY started_at DESC LIMIT 1",
+        (mission_id,),
+    )
+    implementer = str(impl_rows[0]["provider"]) if impl_rows else None
+
+    writers, complete = mission_provider_writers(db, mission_id)
+    earliest_base: str | None = None
+    if writers or complete:
+        bases = db.query(
+            "SELECT base_sha FROM write_provenance WHERE mission_id=? AND base_sha IS NOT NULL"
+            " ORDER BY created_at ASC LIMIT 1",
+            (mission_id,),
+        )
+        if bases:
+            earliest_base = normalize_sha(bases[0].get("base_sha"))
+    reviewed_base = earliest_base or reviewed_head
+
+    # Exact range writers when the repo is available (stronger than the
+    # mission-wide approximation above).
+    range_provider_writers = set(writers)
+    range_complete = complete
+    if repo is not None and reviewed_base and reviewed_head:
+        from . import git_ops
+
+        if await git_ops.commit_exists(repo, reviewed_head) and (
+            reviewed_base == reviewed_head or await git_ops.commit_exists(repo, reviewed_base)
+        ):
+            exact = await range_writers(db, repo, reviewed_base, reviewed_head)
+            if exact["checked"]:
+                range_provider_writers = provider_writers(exact["writers"])
+                range_complete = bool(exact["complete"])
+
+    if not reviewer:
+        independent, reason = False, "reviewer unknown"
+    elif implementer is None and not writers:
+        independent, reason = False, "implementation provider unknown (cannot prove independence)"
+    elif not range_complete:
+        independent, reason = False, "writer provenance incomplete (cannot certify independence)"
+    elif implementer is not None and reviewer == implementer:
+        independent, reason = False, f"reviewer {reviewer} is the implementer (self-review)"
+    elif reviewer in range_provider_writers:
+        independent, reason = False, f"reviewer {reviewer} is in the candidate writer set (self-review)"
+    else:
+        independent, reason = True, None
+
+    writer_set = sorted(range_provider_writers)
+    review_id = _new_id("rev")
+    db.insert(
+        "reviews",
+        {
+            "id": review_id,
+            "mission_id": mission_id,
+            "implementation_provider": implementer,
+            "review_provider": reviewer,
+            "independent": int(independent),
+            "degradation_reason": reason,
+            "review_parsed": int(review_parsed),
+            "reviewed_base_sha": reviewed_base,
+            "reviewed_head_sha": reviewed_head,
+            "writer_set_json": _json.dumps(writer_set),
+            "created_at": _now(),
+        },
+    )
+    try:
+        from .models import EventType as _EventType
+
+        events.publish(
+            _EventType.REVIEW_RECORDED,
+            mission_id,
+            review_provider=reviewer,
+            implementation_provider=implementer,
+            independent=independent,
+            degradation_reason=reason,
+        )
+    except Exception:
+        logger.debug("review event publish failed", exc_info=True)
+    row = db.get("reviews", review_id)
+    return dict(row) if row else {"id": review_id}
+
+
+def attach_finding_lineage(
+    db: Any, mission_id: str, review_id: str, origin_sha: str | None, new_finding_ids: list[str]
+) -> None:
+    """Bind this cycle's findings to their origin review/SHA (P-21).
+
+    Reopened rows keep their ORIGINAL origin; only NULL origins are set.
+    Findings resolved in this cycle record the resolving review/SHA (P-22).
+    """
+    if new_finding_ids:
+        placeholders = ",".join("?" for _ in new_finding_ids)
+        try:
+            db.execute(
+                f"UPDATE review_findings SET origin_review_id=?, origin_sha=? WHERE mission_id=?"  # noqa: S608
+                f" AND id IN ({placeholders}) AND origin_review_id IS NULL",
+                (review_id, origin_sha, mission_id, *new_finding_ids),
+            )
+        except Exception:
+            logger.debug("finding origin backfill failed", exc_info=True)
+    try:
+        db.execute(
+            "UPDATE review_findings SET resolved_review_id=?, resolved_sha=? WHERE mission_id=?"
+            " AND status='resolved' AND resolved_review_id IS NULL",
+            (review_id, origin_sha, mission_id),
+        )
+    except Exception:
+        logger.debug("finding resolution lineage failed", exc_info=True)
 
 
 # -- evidence evaluation ----------------------------------------------------------

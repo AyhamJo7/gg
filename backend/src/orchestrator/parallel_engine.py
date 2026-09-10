@@ -671,7 +671,17 @@ class ParallelMissionEngine:
                 return False
             review_input = result.assistant_text + "\n" + result.summary
             parsed_ok, findings = persist_findings(self.db, self.mission_id, review_input)
-            self._record_review_provenance(review_parsed=parsed_ok)
+            review_row = await self._record_review_provenance(review_parsed=parsed_ok)
+            if review_row:
+                from .provenance import attach_finding_lineage
+
+                attach_finding_lineage(
+                    self.db,
+                    self.mission_id,
+                    str(review_row.get("id")),
+                    review_row.get("reviewed_head_sha"),
+                    [f.id for f in findings],
+                )
             for f in findings:
                 self.events.publish(
                     EventType.REVIEW_FINDING_CREATED,
@@ -1015,46 +1025,21 @@ class ParallelMissionEngine:
             },
         )
 
-    def _record_review_provenance(self, review_parsed: bool = True) -> None:
-        implementer = self._last_provider_for(Role.IMPLEMENTATION)
-        rows = self.db.query(
-            "SELECT provider FROM provider_runs WHERE mission_id=? AND role='review' AND failure_class='NONE' "
-            "ORDER BY started_at DESC LIMIT 1",
-            (self.mission_id,),
-        )
-        if not rows:
-            return
-        reviewer = rows[0]["provider"]
-        if implementer is None:
-            independent = False
-            reason = "implementation provider unknown (cannot prove independence)"
-        elif reviewer == implementer:
-            independent = False
-            reason = "no alternative provider eligible; reviewer is the implementer (self-review)"
-        else:
-            independent = True
-            reason = None
-        self.db.insert(
-            "reviews",
-            {
-                "id": f"rev-{utcnow().timestamp()}".replace(".", ""),
-                "mission_id": self.mission_id,
-                "implementation_provider": implementer,
-                "review_provider": reviewer,
-                "independent": int(independent),
-                "degradation_reason": reason,
-                "review_parsed": int(review_parsed),
-                "created_at": utcnow().isoformat(),
-            },
-        )
-        self.events.publish(
-            EventType.REVIEW_RECORDED,
-            self.mission_id,
-            review_provider=reviewer,
-            implementation_provider=implementer,
-            independent=independent,
-            degradation_reason=reason,
-        )
+    async def _record_review_provenance(self, review_parsed: bool = True) -> dict[str, Any] | None:
+        """Immutable review attempt bound to its exact reviewed SHA range (Increment 3)."""
+        from .provenance import record_review_attempt
+
+        try:
+            return await record_review_attempt(
+                self.db,
+                self.events,
+                mission_id=self.mission_id,
+                repo=self._require_project_path(),
+                review_parsed=review_parsed,
+            )
+        except Exception:
+            logger.debug("review attempt recording failed", exc_info=True)
+            return None
 
     def _unparseable_review_count(self) -> int:
         rows = self.db.query(
@@ -1078,8 +1063,12 @@ class ParallelMissionEngine:
         eligible = [p for p in priorities if self.registry.is_eligible(p)]
 
         if role == Role.REVIEW and len(eligible) > 1:
-            implementer = self._last_provider_for(Role.IMPLEMENTATION)
-            alternatives = [p for p in eligible if p != implementer]
+            from .provenance import mission_provider_writers
+
+            _writers, _ = mission_provider_writers(self.db, self.mission_id)
+            if not _writers:
+                _writers = {self._last_provider_for(Role.IMPLEMENTATION)} - {None}
+            alternatives = [p for p in eligible if p not in _writers]
             if alternatives:
                 eligible = alternatives
         if role == Role.REPAIR and len(eligible) > 1:
@@ -1305,6 +1294,35 @@ class ParallelMissionEngine:
         for task in tasks:
             task.mission_id = self.mission_id
         namespace_dag_ids(self.mission_id, tasks)
+        # Checkpoint planner-side files (if any) so later task checkpoints
+        # cannot silently absorb unattributed planner output.
+        try:
+            max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
+            await git_ops.checkpoint(project_path, f"agent({provider_name}): planning checkpoint",
+                                     max_file_mb=max_mb)
+        except git_ops.GitError:
+            logger.debug("planning checkpoint skipped", exc_info=True)
+        try:
+            from .provenance import record_provider_write as _record_plan_write
+
+            _plan_run_rows = self.db.query(
+                "SELECT id FROM provider_runs WHERE mission_id=? AND stage='dag_plan'"
+                " AND failure_class='NONE' ORDER BY started_at DESC LIMIT 1",
+                (self.mission_id,),
+            )
+            if _plan_run_rows:
+                await _record_plan_write(
+                    self.db,
+                    workdir=project_path,
+                    run_id=_plan_run_rows[0]["id"],
+                    mission_id=self.mission_id,
+                    product_project_id=_product_id,
+                    phase_id=_phase_id,
+                    provider=provider_name,
+                    role="planning",
+                )
+        except Exception:
+            logger.debug("planning provenance insert failed", exc_info=True)
         for task in tasks:
             self.db.insert(
                 "tasks",
