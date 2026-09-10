@@ -73,27 +73,34 @@ def test_reap_does_not_kill_mismatched_process(mock_killpg, orchestrator):
 
     try:
         time.sleep(0.1)
-        orchestrator.db.query.return_value = [
-            {
-                "id": "run_1",
-                "mission_id": "mission_1",
-                "provider": "sleep",
-                "pid": pid,
-                "pgid": pgid,
-                "started_at_ts": started_at_ts,
-            }
-        ]
+        run_row = {
+            "id": "run_1",
+            "mission_id": "mission_1",
+            "provider": "sleep",
+            "pid": pid,
+            "pgid": pgid,
+            "started_at_ts": started_at_ts,
+        }
+        # First query serves unfinished runs; second serves operations recovery.
+        orchestrator.db.query.side_effect = [[run_row], []]
 
         orchestrator._reap_orphaned_processes()
 
         mock_killpg.assert_not_called()
 
-        orchestrator.db.update.assert_called_once()
-        args, kwargs = orchestrator.db.update.call_args
-        assert args[0] == "provider_runs"
-        assert args[1] == "run_1"
-        assert args[2]["failure_class"] == FailureClass.CRASH.value
-        assert args[2]["provider_state"] == ProviderState.CRASHED.value
+        # Atomic terminal-safe reconciliation, not the legacy generic update.
+        execute_calls = orchestrator.db.execute.call_args_list
+        run_updates = [c for c in execute_calls if "UPDATE provider_runs" in str(c.args[0])]
+        assert run_updates, "expected atomic provider_runs reconciliation via db.execute"
+        sql, params = run_updates[0].args[0], run_updates[0].args[1]
+        assert "WHERE id=? AND finished_at IS NULL" in sql
+        assert "run_1" in params
+        assert FailureClass.CRASH.value in params
+        assert ProviderState.CRASHED.value in params
+        # Lease/capacity is reconciled according to the current contract.
+        lease_updates = [c for c in execute_calls if "invocation_leases" in str(c.args[0])]
+        assert lease_updates, "expected lease reconciliation via db.execute"
+        orchestrator.db.update.assert_not_called()
     finally:
         proc.kill()
         proc.wait()
