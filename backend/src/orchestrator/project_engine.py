@@ -40,7 +40,6 @@ from .models import (
     TERMINAL_STATUSES,
     AcceptanceState,
     EventType,
-    FailureClass,
     MissionStatus,
     ProductStatus,
     ProjectPhaseStatus,
@@ -55,7 +54,6 @@ from .product_plan import (
     extract_product_plan,
     validate_product_plan,
 )
-from .providers.base import ExecutionRequest, ExecutionResult
 from .sandbox import run_sandboxed, sandbox_available
 from .security import redact, validate_workspace_path
 from .verify import run_verification
@@ -91,6 +89,7 @@ class ProjectCoordinator:
         self.registry = orchestrator.registry
         self.config: Config = orchestrator.config
         self._advance_lock = asyncio.Lock()
+        self._invocation_service: Any = None
 
     # -- project CRUD ------------------------------------------------------
     def create_project(
@@ -330,38 +329,88 @@ class ProjectCoordinator:
         )
         return {f"{r['target_kind']}:{r['target_id']}": r.get("content_hash") or "" for r in rows}
 
+    def _invocations(self) -> Any:
+        if not hasattr(self, "_invocation_service") or self._invocation_service is None:
+            from .invocations import InvocationService
+
+            self._invocation_service = InvocationService(self.db, self.registry, self.config)
+        return self._invocation_service
+
     async def generate_plan(self, project_id: str) -> dict[str, Any]:
-        """Run the planning provider with bounded repair; persist a revision."""
+        """Run the planning provider with bounded repair; persist a revision.
+
+        Durable operation: one active PLAN operation per product. A second
+        concurrent Generate Plan attaches (409) instead of racing. Every
+        provider attempt is a durable invocation; stale results never
+        overwrite a newer revision.
+        """
+        from . import operations as ops
+
         row = self.db.get("product_projects", project_id)
         if not row:
             raise KeyError(f"product project {project_id} not found")
         if row["state"] in {s.value for s in TERMINAL_PRODUCT_STATUSES}:
             raise ValueError(f"project {project_id} is terminal ({row['state']})")
+        op, created = ops.create_or_attach_operation(self.db, project_id, ops.KIND_PLAN)
+        if not created:
+            raise ValueError(f"planning already in progress (operation {op.id})")
         self._set_state(project_id, ProductStatus.PLANNING, reason="")
         prompt = build_planner_prompt(row["idea"], row.get("constraints_text") or "")
         raw_output = ""
         errors: list[str] = ["no planner output yet"]
         plan_data: dict[str, Any] | None = None
-        for attempt in range(MAX_PLAN_ATTEMPTS):
-            if attempt > 0:
-                prompt = build_plan_repair_prompt(raw_output, errors)
-            raw_output = await self._run_planning_provider(prompt, project_id)
-            plan_data = extract_product_plan(raw_output)
-            if plan_data is None:
-                errors = ["planner output contained no PRODUCT_PLAN_JSON block"]
-                continue
-            errors = validate_product_plan(plan_data)
-            if not errors:
-                break
-            plan_data = None
+        try:
+            for attempt in range(MAX_PLAN_ATTEMPTS):
+                # Cooperative cancellation + stale guard each attempt.
+                _op_row = self.db.get("orchestration_operations", op.id)
+                if _op_row and int(_op_row.get("cancel_requested") or 0):
+                    ops.finish_operation(self.db, op.id, ops.STATE_CANCELLED, error_code="CANCELLED")
+                    _rev = int((self.db.get("product_projects", project_id) or {}).get("plan_revision") or 0)
+                    _restore = ProductStatus.PLAN_READY if _rev > 0 else ProductStatus.DRAFT
+                    self._set_state(project_id, _restore, reason="planning cancelled")
+                    return {"ok": False, "errors": ["planning cancelled"], "operation_id": op.id}
+                if attempt > 0:
+                    prompt = build_plan_repair_prompt(raw_output, errors)
+                raw_output, _outcome = await self._run_planning_provider(
+                    prompt, project_id, op.id, attempt
+                )
+                # Provider-level failure is truthful invocation history, not
+                # a successful plan. Still attempt repair within budget.
+                plan_data = extract_product_plan(raw_output)
+                if plan_data is None:
+                    errors = ["planner output contained no PRODUCT_PLAN_JSON block"]
+                    continue
+                errors = validate_product_plan(plan_data)
+                if not errors:
+                    break
+                plan_data = None
+        except Exception as exc:
+            ops.finish_operation(
+                self.db,
+                op.id,
+                ops.STATE_FAILED,
+                error_code="ORCHESTRATOR_FAILURE",
+                error_detail=str(exc)[:500],
+            )
+            raise
         if plan_data is None:
+            ops.finish_operation(self.db, op.id, ops.STATE_FAILED, error_code="PLAN_INVALID")
             self._set_state(
                 project_id,
                 ProductStatus.BLOCKED,
                 reason=f"planner failed after {MAX_PLAN_ATTEMPTS} attempts: {'; '.join(errors)}",
             )
-            return {"ok": False, "errors": errors}
-        revision = int(row.get("plan_revision") or 0) + 1
+            return {"ok": False, "errors": errors, "operation_id": op.id}
+        # Stale-result protection: never commit over a newer revision or a
+        # cancelled/terminal operation.
+        if ops.is_stale_result(self.db, op.id, project_id):
+            ops.finish_operation(self.db, op.id, ops.STATE_CANCELLED, error_code="STALE_RESULT")
+            return {"ok": False, "errors": ["stale planning result rejected"], "operation_id": op.id}
+        fresh = self.db.get("product_projects", project_id) or {}
+        if fresh.get("state") in {s.value for s in TERMINAL_PRODUCT_STATUSES}:
+            ops.finish_operation(self.db, op.id, ops.STATE_CANCELLED, error_code="STALE_RESULT")
+            return {"ok": False, "errors": ["project became terminal during planning"], "operation_id": op.id}
+        revision = int(fresh.get("plan_revision") or 0) + 1
         self.db.insert(
             "plan_revisions",
             {
@@ -375,35 +424,64 @@ class ProjectCoordinator:
             },
         )
         self.db.update("product_projects", project_id, {"plan_revision": revision, "updated_at": utcnow()})
+        ops.finish_operation(self.db, op.id, ops.STATE_SUCCEEDED)
         self._set_state(project_id, ProductStatus.PLAN_READY, reason="")
         self.events.publish(EventType.PRODUCT_PLAN_READY, None, product_project_id=project_id, revision=revision)
-        return {"ok": True, "revision": revision, "plan": plan_data}
+        return {"ok": True, "revision": revision, "plan": plan_data, "operation_id": op.id}
 
-    async def _run_planning_provider(self, prompt: str, project_id: str) -> str:
+    async def _run_planning_provider(
+        self, prompt: str, project_id: str, operation_id: str, attempt_index: int = 0
+    ) -> tuple[str, Any]:
+        """One durable planning invocation. Returns (text, outcome).
+
+        Health, usage, and run persistence are owned by InvocationService.
+        A failed invocation returns its (error) text for bounded repair;
+        it is never recorded as provider success.
+        """
+        from . import operations as ops
+        from .invocations import STAGE_PRODUCT_PLANNING, InvocationOwner, InvocationSpec
+
         provider_name = self._select_planning_provider()
         if provider_name is None:
             raise RuntimeError("no planning provider available")
         adapter = self.registry.get_adapter(provider_name)
         if adapter is None:  # pragma: no cover - defensive
             raise RuntimeError(f"planning adapter {provider_name} missing")
-        workdir = Path(tempfile.gettempdir())
-        request = ExecutionRequest(
-            prompt=prompt,
-            workdir=workdir,
-            role=Role.PLANNING.value,
-            timeout_s=self.config.provider_timeout_s(provider_name),
-            run_id=f"plan-{uuid.uuid4().hex[:8]}",
-            log_dir=workdir,
-        )
-        collected: list[str] = []
-        self.registry.mark_busy(provider_name)
+        # Isolated per-run planner directory: never shared /tmp as cwd.
+        workdir = Path(tempfile.mkdtemp(prefix="gg-plan-"))
         try:
-            result: ExecutionResult = await adapter.execute(request, collected.append)
-        except Exception as exc:
-            self.registry.record_failure(provider_name, FailureClass.CRASH, 0.0, str(exc)[:500])
-            raise
-        self.registry.record_success(provider_name, result.duration_s)
-        return result.assistant_text or result.raw_tail or "\n".join(collected)
+            state_root = Path(self.db.path).parent
+        except Exception:
+            state_root = workdir
+        log_dir = state_root / "logs"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log_dir = workdir
+        outcome = await self._invocations().execute(
+            InvocationSpec(
+                owner=InvocationOwner(product_project_id=project_id, operation_id=operation_id),
+                stage=STAGE_PRODUCT_PLANNING,
+                role=Role.PLANNING.value,
+                prompt=prompt,
+                workdir=workdir,
+                log_dir=log_dir,
+                provider=provider_name,
+                timeout_s=self.config.provider_timeout_s(provider_name),
+                model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
+                attempt_number=attempt_index + 1,
+            )
+        )
+        ops.note_attempt(self.db, operation_id, outcome.run_id)
+        # Best-effort cleanup of the isolated cwd (logs live under state root).
+        try:
+            import shutil as _shutil
+
+            _shutil.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            logger.debug("planner workdir cleanup failed for %s", workdir, exc_info=True)
+        text = outcome.assistant_text or outcome.raw_tail or ""
+        return text, outcome
 
     def _select_planning_provider(self) -> str | None:
         priorities: list[str] = self.config.priority_for("planning")
@@ -417,6 +495,30 @@ class ProjectCoordinator:
                 logger.debug("planning provider check failed", exc_info=True)
                 continue
         return None
+
+    def get_planning_operation(self, project_id: str) -> dict[str, Any] | None:
+        from . import operations as ops
+
+        op = ops.get_active_operation(self.db, project_id, ops.KIND_PLAN)
+        if op is None:
+            return None
+        row = self.db.get("orchestration_operations", op.id)
+        return dict(row) if row else None
+
+    async def cancel_planning(self, project_id: str) -> dict[str, Any]:
+        from . import operations as ops
+
+        op = ops.get_active_operation(self.db, project_id, ops.KIND_PLAN)
+        if op is None:
+            return {"ok": False, "error": "no active planning operation"}
+        ops.request_cancel(self.db, op.id)
+        # Interrupt the owned provider process before releasing capacity.
+        if op.current_run_id:
+            try:
+                await self._invocations().cancel(op.current_run_id)
+            except Exception:
+                logger.warning("planning cancel interrupt failed", exc_info=True)
+        return {"ok": True, "operation_id": op.id}
 
     def revise_plan(self, project_id: str, plan_data: dict[str, Any], reason: str) -> dict[str, Any]:
         """Persist an edited plan as a new immutable revision (auditable)."""

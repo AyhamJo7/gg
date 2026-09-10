@@ -112,11 +112,33 @@ class MissionEngine:
         self._tests_run: list[str] = []
         self.workspace: WorkspaceInfo | None = None
         self.project_path: Path | None = None
+        self._invocation_service: Any = None
+
+    def _invocations(self) -> Any:
+        if self._invocation_service is None:
+            from .invocations import InvocationService
+
+            self._invocation_service = InvocationService(self.db, self.registry, self.config)
+        return self._invocation_service
+
+    def _product_attribution(self) -> tuple[str | None, str | None]:
+        try:
+            rows = self.db.query(
+                "SELECT project_id, id FROM project_phases WHERE mission_id=? LIMIT 1", (self.mission_id,)
+            )
+            if rows:
+                return rows[0].get("project_id"), rows[0].get("id")
+        except Exception:
+            logger.debug("product attribution lookup failed for %s", self.mission_id, exc_info=True)
+        return None, None
 
     def request_pause(self) -> None:
         self._pause.set()
         self._wake.set()
-        if self._current_adapter and self._current_run_id:
+        if self._current_run_id:
+            svc = self._invocations()
+            asyncio.create_task(svc.cancel(self._current_run_id))
+        elif self._current_adapter and self._current_run_id:
             asyncio.create_task(self._current_adapter.interrupt(self._current_run_id))
 
     def pause(self) -> None:
@@ -126,7 +148,10 @@ class MissionEngine:
         self._cancel.set()
         self._pause.clear()
         self._wake.set()
-        if self._current_adapter and self._current_run_id:
+        if self._current_run_id:
+            svc = self._invocations()
+            asyncio.create_task(svc.cancel(self._current_run_id))
+        elif self._current_adapter and self._current_run_id:
             asyncio.create_task(self._current_adapter.interrupt(self._current_run_id))
 
     def cancel(self) -> None:
@@ -379,90 +404,108 @@ class MissionEngine:
                 EventType.TASK_STARTED, self.mission_id, task_id=task.id, role=role.value, provider=provider_name
             )
 
-            run_id = f"run-{utcnow().timestamp()}".replace(".", "")
             if self.project_path is None:
                 raise RuntimeError("engine project path not initialized")
             log_dir = self.project_path / ".orchestrator" / "logs"
-
-            def on_spawn(pid: int, pgid: int, start_ts: float, r_id: str = run_id) -> None:
-                self.db.update(
-                    "provider_runs",
-                    r_id,
-                    {"pid": pid, "pgid": pgid, "started_at_ts": start_ts},
-                )
-
-            request = ExecutionRequest(
-                prompt=prompt,
-                workdir=self.project_path,
-                role=role.value,
-                timeout_s=self.config.provider_timeout_s(provider_name),
-                run_id=run_id,
-                log_dir=log_dir,
-                on_spawn=on_spawn,
-            )
             commit_before = await git_ops.head_sha(self.project_path) if self.project_path else None
 
-            # Persist initial run record before execution so startup recovery
-            # has process identity (pgid) to reap on an abnormal backend exit.
-            self.db.insert(
-                "provider_runs",
-                {
-                    "id": run_id,
-                    "mission_id": self.mission_id,
-                    "task_id": task.id,
-                    "provider": provider_name,
-                    "role": role.value,
-                    "command": [redact(provider_name)],
-                    "cwd": str(request.workdir),
-                    "started_at": utcnow().isoformat(),
-                    "finished_at": None,
-                    "exit_code": None,
-                    "failure_class": "RUNNING",
-                    "provider_state": "RUNNING",
-                    "stdout_path": str(request.log_dir / f"{run_id}.stdout.log"),
-                    "stderr_path": str(request.log_dir / f"{run_id}.stderr.log"),
-                    "git_commit_before": commit_before,
-                    "git_commit_after": None,
-                    "summary": "",
-                    "pgid": None,
-                    "pid": None,
-                    "started_at_ts": None,
-                },
-            )
-
-            self.registry.mark_busy(provider_name)
             self.db.update("missions", self.mission_id, {"current_provider": provider_name, "updated_at": utcnow()})
             self.events.publish(EventType.PROVIDER_STARTED, self.mission_id, provider=provider_name, role=role.value)
-            # Register cancellation BEFORE exposing the run as interruptible,
-            # closing the lost-interrupt race between run start and cancel.
-            cancel_ev = adapter.cancel_event_for(run_id)
-            if self._cancel.is_set():
-                cancel_ev.set()
-            self._current_adapter, self._current_run_id = adapter, run_id
 
             def on_output(line: str, provider: str = provider_name) -> None:
                 self.events.publish(EventType.PROVIDER_OUTPUT, self.mission_id, provider=provider, line=line)
 
-            try:
-                result = await adapter.execute(request, on_output)
-            except Exception as exc:  # adapter itself blew up — treat as crash
-                logger.exception("provider %s crashed", provider_name)
-                result = ExecutionResult(
-                    state=ProviderState.CRASHED,
-                    failure_class=FailureClass.CRASH,
-                    exit_code=None,
-                    duration_s=0.0,
-                    summary="",
-                    raw_tail=str(exc),
-                )
-            finally:
-                self._current_adapter, self._current_run_id = None, None
+            # Shared invocation boundary: durable run, lease, usage, health.
+            from .invocations import (
+                STAGE_IMPLEMENTATION,
+                STAGE_MISSION_PLANNING,
+                STAGE_REPAIR,
+                STAGE_REVIEW,
+                STAGE_TESTING,
+                InvocationOwner,
+                InvocationSpec,
+            )
 
-            commit_after = await git_ops.head_sha(self.project_path) if self.project_path else None
-            self._record_run(run_id, task.id, provider_name, role, request, result, commit_before, commit_after)
+            _stage_by_role = {
+                Role.PLANNING: STAGE_MISSION_PLANNING,
+                Role.IMPLEMENTATION: STAGE_IMPLEMENTATION,
+                Role.TESTING: STAGE_TESTING,
+                Role.REVIEW: STAGE_REVIEW,
+                Role.REPAIR: STAGE_REPAIR,
+            }
+            _product_id, _phase_id = self._product_attribution()
+            import uuid as _uuid
+
+            _pre_run_id = f"run-{_uuid.uuid4().hex[:12]}"
+            _spec = InvocationSpec(
+                owner=InvocationOwner(
+                    mission_id=self.mission_id,
+                    task_id=task.id,
+                    product_project_id=_product_id,
+                    phase_id=_phase_id,
+                ),
+                stage=_stage_by_role.get(role, role.value),
+                role=role.value,
+                prompt=prompt,
+                workdir=self.project_path,
+                log_dir=log_dir,
+                provider=provider_name,
+                timeout_s=self.config.provider_timeout_s(provider_name),
+                model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
+                run_id=_pre_run_id,
+                attempt_number=attempt + 1,
+                cancel_event=self._cancel,
+                on_output=on_output,
+            )
+            self._current_adapter, self._current_run_id = adapter, _pre_run_id
+            try:
+                outcome = await self._invocations().execute(_spec)
+            except RuntimeError as exc:
+                # Capacity refusal from the shared boundary: wait, do not
+                # consume an attempt.
+                logger.warning("invocation capacity refused: %s", exc)
+                self.db.update(
+                    "tasks", task.id, {"status": "failed", "summary": str(exc)[:300], "finished_at": utcnow()}
+                )
+                await self._wait_for_wake()
+                continue
+            run_id = outcome.run_id
+            self._current_adapter, self._current_run_id = None, None
+            # Attach Git linkage without touching terminal outcome.
+            try:
+                commit_after = await git_ops.head_sha(self.project_path) if self.project_path else None
+            except Exception:
+                commit_after = None
+            try:
+                self.db.execute(
+                    "UPDATE provider_runs SET git_commit_before=?, git_commit_after=? WHERE id=?",
+                    (commit_before, commit_after, run_id),
+                )
+            except Exception:
+                logger.debug("git linkage update failed for run %s", run_id, exc_info=True)
+            # Adapt the shared outcome to the engine's existing result shape.
+            result = ExecutionResult(
+                state=ProviderState(outcome.provider_state)
+                if outcome.provider_state in ProviderState.__members__.values()
+                else (ProviderState.COMPLETED if outcome.ok else ProviderState.CRASHED),
+                failure_class=FailureClass(outcome.failure_class)
+                if outcome.failure_class in FailureClass.__members__.values()
+                else FailureClass.CRASH,
+                exit_code=outcome.exit_code,
+                duration_s=outcome.duration_s,
+                summary=outcome.summary,
+                argv=[],
+                stdout_path=Path(outcome.stdout_path) if outcome.stdout_path else None,
+                stderr_path=Path(outcome.stderr_path) if outcome.stderr_path else None,
+                raw_tail=outcome.raw_tail,
+                assistant_text=outcome.assistant_text,
+                pid=outcome.pid,
+                pgid=outcome.pgid,
+                gate_refused=outcome.gate_refused,
+            )
 
             if result.ok:
-                self.registry.record_success(provider_name, result.duration_s)
+                # Health already accounted exactly once by InvocationService.
                 used = set(self._mission().providers_used)
                 if provider_name not in used:
                     self.db.update(
@@ -485,20 +528,13 @@ class MissionEngine:
                 self._completed_work.append(f"[{role.value}] {provider_name}: {result.summary[:200]}")
                 return result
 
-            # failure path
+            # failure path (health already accounted by InvocationService)
             if result.gate_refused:
-                # Spawn-handshake refusal is orchestrator-internal (identity
-                # persistence failed before exec) — not evidence about the
-                # provider itself, so it must not cost it a reliability
-                # cooldown the way a genuine crash/timeout does. Still must
-                # clear the BUSY state mark_busy() set, or is_eligible()
-                # leaves this provider permanently unselectable.
-                self.registry.clear_busy_without_penalty(provider_name)
                 state = ProviderState.AVAILABLE
             else:
-                state = self.registry.record_failure(
-                    provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
-                )
+                from .providers.classify import FAILURE_TO_STATE as _FTS
+
+                state = _FTS.get(result.failure_class, ProviderState.CRASHED)
             self.db.update(
                 "tasks", task.id, {"status": "failed", "summary": result.raw_tail[-300:], "finished_at": utcnow()}
             )

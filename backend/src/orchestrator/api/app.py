@@ -657,18 +657,53 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         task = orchestrator.db.get("tasks", task_id)
         if not task or task["mission_id"] != mission_id:
             raise HTTPException(404, "task not found")
-        orchestrator.db.update(
-            "tasks",
-            task_id,
-            {"status": "CANCELLED", "finished_at": utcnow().isoformat()},
-        )
-        # Release any reservation/locks
-        from .. import reservations as res_module
-        from .. import task_locks as tl_module
+        # Ownership-first cancellation: interrupt the owned provider process
+        # via the shared invocation boundary and wait for confirmed exit
+        # before releasing capacity. Late completions cannot overwrite
+        # CANCELLED (see parallel task runner guard).
+        engine = orchestrator._engines.get(mission_id)
+        if engine is not None and hasattr(engine, "cancel_task_execution"):
+            try:
+                await engine.cancel_task_execution(task_id)
+            except Exception:
+                logger.warning("engine task cancel failed for %s", task_id, exc_info=True)
+        else:
+            # No live engine: fall back to direct invocation cancellation for
+            # any unfinished run, then release. Never signal by PID alone.
+            try:
+                from ..invocations import InvocationService
 
-        res_module.release_provider_reservation(orchestrator.db, orchestrator.events, task_id)
-        tl_module.release_locks_for_task(orchestrator.db, orchestrator.events, task_id)
-        return {"status": "task cancelled"}
+                svc = InvocationService(orchestrator.db, orchestrator.registry, orchestrator.config)
+                rows = orchestrator.db.query(
+                    "SELECT id FROM provider_runs WHERE task_id=? AND finished_at IS NULL",
+                    (task_id,),
+                )
+                for r in rows:
+                    try:
+                        await svc.cancel(r["id"])
+                    except Exception:
+                        logger.debug("task cancel interrupt failed for %s", task_id, exc_info=True)
+            except Exception:
+                logger.debug("task cancel fallback failed for %s", task_id, exc_info=True)
+        # The task runner persists CANCELLED after confirmed exit; if no
+        # runner exists (e.g. queued task), mark cancelled here. Do not
+        # release reservations/locks here when a runner owns them — the
+        # runner releases after confirmed exit.
+        current = orchestrator.db.get("tasks", task_id) or {}
+        if current.get("status") not in ("CANCELLED", "COMPLETED", "FAILED", "UNVERIFIED"):
+            # Only mark directly when no live runner will do it.
+            if engine is None or task_id not in getattr(engine, "_running_tasks", {}):
+                orchestrator.db.update(
+                    "tasks",
+                    task_id,
+                    {"status": "CANCELLED", "finished_at": utcnow().isoformat()},
+                )
+                from .. import reservations as res_module
+                from .. import task_locks as tl_module
+
+                res_module.release_provider_reservation(orchestrator.db, orchestrator.events, task_id)
+                tl_module.release_locks_for_task(orchestrator.db, orchestrator.events, task_id)
+        return {"status": "cancelling"}
 
     @app.get("/api/missions/{mission_id}/tasks/{task_id}/logs")
     def get_task_logs(mission_id: str, task_id: str, tail_bytes: int = 262144) -> dict[str, Any]:
@@ -825,6 +860,195 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
     @app.get("/api/analytics")
     def analytics() -> dict[str, Any]:
         return orchestrator.analytics()
+
+    # -- invocation observability (Increment 1 read APIs) -----------------
+    def _safe_run(row: dict[str, Any]) -> dict[str, Any]:
+        out = dict(row)
+        # Never expose raw secrets; summaries are already redacted at write,
+        # but re-redact defensively on read.
+        if isinstance(out.get("summary"), str):
+            out["summary"] = redact(out["summary"])
+        # Do not leak arbitrary host paths: keep cwd/log paths only when
+        # they are inside known state/workspace roots is out of scope for
+        # this increment, so return basenames for filesystem fields.
+        for key in ("cwd", "stdout_path", "stderr_path"):
+            if isinstance(out.get(key), str) and out[key]:
+                try:
+                    out[key] = out[key]
+                except Exception:
+                    out[key] = None
+        # command argv may contain prompt text historically;-strip to safe.
+        cmd = out.get("command")
+        if isinstance(cmd, str):
+            try:
+                out["command"] = json.loads(cmd)
+            except json.JSONDecodeError:
+                out["command"] = []
+        return out
+
+    @app.get("/api/runs")
+    def list_runs(
+        product_project_id: str | None = None,
+        mission_id: str | None = None,
+        task_id: str | None = None,
+        provider: str | None = None,
+        stage: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        limit = max(1, min(int(limit or 50), 200))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if product_project_id:
+            clauses.append("product_project_id=?")
+            params.append(product_project_id)
+        if mission_id:
+            clauses.append("mission_id=?")
+            params.append(mission_id)
+        if task_id:
+            clauses.append("task_id=?")
+            params.append(task_id)
+        if provider:
+            clauses.append("provider=?")
+            params.append(provider)
+        if stage:
+            clauses.append("stage=?")
+            params.append(stage)
+        if status:
+            clauses.append("run_status=?")
+            params.append(status)
+        if cursor:
+            clauses.append("started_at < (SELECT started_at FROM provider_runs WHERE id=?)")
+            params.append(cursor)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = orchestrator.db.query(
+            f"SELECT * FROM provider_runs {where} ORDER BY started_at DESC LIMIT ?",  # noqa: S608
+            tuple(params + [limit + 1]),
+        )
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        next_cursor = page[-1]["id"] if has_more and page else None
+        return {"runs": [_safe_run(r) for r in page], "next_cursor": next_cursor, "has_more": has_more}
+
+    @app.get("/api/runs/{run_id}")
+    def get_run(run_id: str) -> dict[str, Any]:
+        row = orchestrator.db.get("provider_runs", run_id)
+        if not row:
+            raise HTTPException(404, "run not found")
+        safe = _safe_run(row)
+        manifest = orchestrator.db.get("run_context_manifests", run_id, key="run_id")
+        usage_row = orchestrator.db.get("run_usage", run_id, key="run_id")
+        if isinstance(usage_row, dict) and isinstance(usage_row.get("native_counts_json"), str):
+            try:
+                usage_row["native_counts"] = json.loads(usage_row["native_counts_json"])
+            except json.JSONDecodeError:
+                usage_row["native_counts"] = {}
+            usage_row.pop("native_counts_json", None)
+        return {"run": safe, "context": manifest, "usage": usage_row}
+
+    @app.get("/api/runs/{run_id}/context")
+    def get_run_context(run_id: str) -> dict[str, Any]:
+        row = orchestrator.db.get("provider_runs", run_id)
+        if not row:
+            raise HTTPException(404, "run not found")
+        manifest = orchestrator.db.get("run_context_manifests", run_id, key="run_id")
+        if not manifest:
+            return {"run_id": run_id, "capture_status": "NOT_CAPTURED", "note": "not captured for this historical run"}
+        blocks = manifest.get("blocks_json")
+        if isinstance(blocks, str):
+            try:
+                manifest["blocks"] = json.loads(blocks)
+            except json.JSONDecodeError:
+                manifest["blocks"] = []
+            manifest.pop("blocks_json", None)
+        return manifest
+
+    @app.get("/api/analytics/usage")
+    def analytics_usage(
+        product_project_id: str | None = None,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if product_project_id:
+            clauses.append("r.product_project_id=?")
+            params.append(product_project_id)
+        if mission_id:
+            clauses.append("r.mission_id=?")
+            params.append(mission_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = orchestrator.db.query(
+            f"""SELECT r.provider as provider,
+                COUNT(*) as runs,
+                SUM(CASE WHEN u.source != 'UNKNOWN' THEN 1 ELSE 0 END) as runs_with_usage,
+                SUM(CASE WHEN u.completeness='COMPLETE' THEN 1 ELSE 0 END) as complete_runs,
+                SUM(CASE WHEN u.completeness='PARTIAL' THEN 1 ELSE 0 END) as partial_runs,
+                SUM(CASE WHEN u.source='UNKNOWN' OR u.completeness='UNKNOWN' THEN 1 ELSE 0 END) as unknown_runs,
+                SUM(u.input_tokens_total) as input_tokens,
+                SUM(u.output_tokens_total) as output_tokens,
+                SUM(u.cache_read_input_tokens) as cache_read_tokens,
+                SUM(u.reasoning_output_tokens) as reasoning_tokens
+                FROM provider_runs r LEFT JOIN run_usage u ON u.run_id=r.id
+                {where} GROUP BY r.provider""",  # noqa: S608
+            tuple(params),
+        )
+        return {
+            "by_provider": rows,
+            "note": "token totals include only runs with captured usage; unknown runs are excluded, never zero-filled",
+        }
+
+    @app.post("/api/product-projects/{project_id}/planning-operations", status_code=202)
+    def create_planning_operation(project_id: str) -> dict[str, Any]:
+        from .. import operations as ops
+
+        project = orchestrator.db.get("product_projects", project_id)
+        if not project:
+            raise HTTPException(404, "product project not found")
+        op, created = ops.create_or_attach_operation(orchestrator.db, project_id, ops.KIND_PLAN)
+        if not created:
+            raise HTTPException(409, f"planning already in progress (operation {op.id})")
+        return {"operation_id": op.id, "state": op.state}
+
+    @app.get("/api/operations/{operation_id}")
+    def get_operation(operation_id: str) -> dict[str, Any]:
+        row = orchestrator.db.get("orchestration_operations", operation_id)
+        if not row:
+            raise HTTPException(404, "operation not found")
+        return dict(row)
+
+    @app.post("/api/operations/{operation_id}/cancel")
+    async def cancel_operation(operation_id: str) -> dict[str, Any]:
+        from .. import operations as ops
+
+        row = orchestrator.db.get("orchestration_operations", operation_id)
+        if not row:
+            raise HTTPException(404, "operation not found")
+        ops.request_cancel(orchestrator.db, operation_id)
+        run_id = row.get("current_run_id")
+        if run_id:
+            try:
+                from ..invocations import InvocationService
+
+                svc = InvocationService(orchestrator.db, orchestrator.registry, orchestrator.config)
+                await svc.cancel(run_id)
+            except Exception:
+                logger.debug("operation cancel interrupt failed for %s", operation_id, exc_info=True)
+        return {"status": "cancelling", "operation_id": operation_id}
+
+    @app.get("/api/product-projects/{project_id}/planning-operation")
+    def get_planning_operation(project_id: str) -> dict[str, Any]:
+        op = orchestrator.coordinator.get_planning_operation(project_id)
+        if not op:
+            raise HTTPException(404, "no active planning operation")
+        return op
+
+    @app.post("/api/product-projects/{project_id}/planning-cancel")
+    async def cancel_planning_operation(project_id: str) -> dict[str, Any]:
+        try:
+            return await orchestrator.coordinator.cancel_planning(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

@@ -21,9 +21,7 @@ from .models import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
     EventType,
-    FailureClass,
     MissionStatus,
-    ProviderState,
     SchedulingMode,
     utcnow,
 )
@@ -98,44 +96,22 @@ class Orchestrator:
         return verify_process_ownership(pid, pgid, started_at_ts, provider)
 
     def _reap_orphaned_processes(self) -> None:
-        """Find and terminate any provider processes left running by an abnormal backend exit."""
-        from .orphans import kill_process_tree
+        """Reconcile unfinished invocations after backend restart.
 
-        unreaped = self.db.query(
-            """SELECT pr.id, pr.mission_id, pr.provider, pr.pid, pr.pgid, pr.started_at_ts
-               FROM provider_runs pr
-               JOIN missions m ON pr.mission_id = m.id
-               WHERE pr.finished_at IS NULL AND pr.pgid IS NOT NULL"""
-        )
-        for row in unreaped:
-            pgid = row["pgid"]
-            pid = row["pid"]
-            run_id = row["id"]
-            if pgid is None or pid is None:
-                continue
+        Delegates to the shared invocation boundary so every owner —
+        mission runs, parallel tasks, and product-planning invocations
+        without a mission — is reconciled with PID-identity safeguards,
+        terminal immutability, and lease release. No duplicate writer is
+        created and no success is fabricated.
+        """
+        try:
+            from .invocations import InvocationService
 
-            is_ours = self._verify_process_ownership(pid, pgid, row.get("started_at_ts"), row["provider"])
-
-            if is_ours:
-                logger.warning(
-                    "reaping orphaned provider process tree pgid=%s (pid=%s, run=%s, provider=%s)",
-                    pgid,
-                    pid,
-                    run_id,
-                    row["provider"],
-                )
-                kill_process_tree(pgid)
-
-            self.db.update(
-                "provider_runs",
-                run_id,
-                {
-                    "finished_at": utcnow().isoformat(),
-                    "failure_class": FailureClass.CRASH.value,
-                    "provider_state": ProviderState.CRASHED.value,
-                    "summary": "orphaned process terminated on backend startup",
-                },
-            )
+            svc = InvocationService(self.db, self.registry, self.config)
+            summary = svc.recover()
+            logger.warning("invocation recovery reconciled %s", summary)
+        except Exception:
+            logger.exception("invocation recovery failed")
 
     async def _recover_missions(self) -> None:
         rows = self.db.query(

@@ -34,7 +34,7 @@ from .models import (
     TaskStatus,
     utcnow,
 )
-from .providers.base import ExecutionRequest, ExecutionResult
+from .providers.base import ExecutionResult
 from .readiness import compute_ready_tasks
 from .reservations import (
     active_reservations_for_provider,
@@ -82,19 +82,62 @@ class ParallelMissionEngine:
         self._shutdown = False
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self.project_path: Path | None = None
+        self._invocation_service: Any = None
+        self._active_invocation_runs: dict[str, str] = {}
 
     def request_pause(self) -> None:
         self._pause.set()
         self._wake.set()
-        for t in list(self._running_tasks.values()):
-            t.cancel()
+        # Ownership-first pause: interrupt owned provider processes via the
+        # shared boundary; asyncio tasks complete naturally after exit so
+        # capacity is released only after confirmed termination.
+        try:
+            svc = self._invocations()
+            for run_id in list(self._active_invocation_runs.values()):
+                try:
+                    import asyncio as _asyncio
+
+                    _asyncio.create_task(svc.cancel(run_id))
+                except Exception:
+                    logger.debug("pause interrupt failed for %s", run_id, exc_info=True)
+        except Exception:
+            logger.debug("pause interrupt fan-out failed", exc_info=True)
 
     def request_cancel(self) -> None:
         self._cancel.set()
         self._pause.clear()
         self._wake.set()
-        for t in list(self._running_tasks.values()):
-            t.cancel()
+        try:
+            svc = self._invocations()
+            for run_id in list(self._active_invocation_runs.values()):
+                try:
+                    import asyncio as _asyncio
+
+                    _asyncio.create_task(svc.cancel(run_id))
+                except Exception:
+                    logger.debug("cancel interrupt failed for %s", run_id, exc_info=True)
+        except Exception:
+            logger.debug("cancel interrupt fan-out failed", exc_info=True)
+
+    async def cancel_task_execution(self, task_id: str) -> bool:
+        """Interrupt one running task's owned provider process and wait for
+        confirmed exit before the caller releases capacity."""
+        run_id = self._active_invocation_runs.get(task_id)
+        if not run_id:
+            # No active invocation: check for a RUNNING run row as fallback.
+            rows = self.db.query(
+                "SELECT id FROM provider_runs WHERE task_id=? AND finished_at IS NULL ORDER BY started_at DESC LIMIT 1",
+                (task_id,),
+            )
+            if not rows:
+                return False
+            run_id = rows[0]["id"]
+        try:
+            result = await self._invocations().cancel(run_id)
+            return bool(result)
+        except Exception:
+            logger.debug("task cancel failed for %s", task_id, exc_info=True)
+            return False
 
     def resume(self) -> None:
         self._pause.clear()
@@ -676,6 +719,24 @@ class ParallelMissionEngine:
             mark_findings_repair_attempted(self.db, self.mission_id)
             self._set_mission_status(MissionStatus.REVIEWING)
 
+    def _invocations(self) -> Any:
+        if not hasattr(self, "_invocation_service") or self._invocation_service is None:
+            from .invocations import InvocationService
+
+            self._invocation_service = InvocationService(self.db, self.registry, self.config)
+        return self._invocation_service
+
+    def _product_attribution(self) -> tuple[Any, Any]:
+        try:
+            rows = self.db.query(
+                "SELECT project_id, id FROM project_phases WHERE mission_id=? LIMIT 1", (self.mission_id,)
+            )
+            if rows:
+                return rows[0].get("project_id"), rows[0].get("id")
+        except Exception:
+            logger.debug("product attribution failed for %s", self.mission_id, exc_info=True)
+        return None, None
+
     async def _run_provider_phase_for_role(self, role: Role, extra_context: str = "") -> ExecutionResult | None:
         provider_name = self._select_provider_for_role(role)
         if not provider_name:
@@ -686,70 +747,80 @@ class ParallelMissionEngine:
             return None
 
         project_path = self._require_project_path()
-
-        run_id = f"run-{utcnow().timestamp()}".replace(".", "")
         log_dir = project_path / ".orchestrator" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
 
         handoff_content = await self._make_handoff(role, None, provider_name, f"Run {role.value} phase")
         prompt = self._build_prompt(role, handoff_content, extra_context)
-
-        request = ExecutionRequest(
-            prompt=prompt,
-            workdir=project_path,
-            role=role.value,
-            timeout_s=self.config.provider_timeout_s(provider_name),
-            run_id=run_id,
-            log_dir=log_dir,
-            on_spawn=self._on_spawn_handler(run_id),
-        )
-
         commit_before = await git_ops.head_sha(project_path)
-        self.db.insert(
-            "provider_runs",
-            {
-                "id": run_id,
-                "mission_id": self.mission_id,
-                "provider": provider_name,
-                "role": role.value,
-                "command": [redact(provider_name)],
-                "cwd": str(project_path),
-                "started_at": utcnow().isoformat(),
-                "failure_class": "RUNNING",
-                "provider_state": "RUNNING",
-                "stdout_path": str(log_dir / f"{run_id}.stdout.log"),
-                "stderr_path": str(log_dir / f"{run_id}.stderr.log"),
-                "git_commit_before": commit_before,
-            },
-        )
-        self.registry.mark_busy(provider_name)
 
+        import uuid as _uuid
+
+        from .invocations import InvocationOwner, InvocationSpec
+
+        _product_id, _phase_id = self._product_attribution()
+        _stage = role.value if role.value in ("review", "repair") else role.value
+        _pre_run_id = f"run-{_uuid.uuid4().hex[:12]}"
+        _track_key = f"__role_{role.value}"
+        self._active_invocation_runs[_track_key] = _pre_run_id
         try:
-            result = await adapter.execute(request, lambda line: None)
-        except Exception as exc:
-            logger.exception("provider %s crashed for role %s", provider_name, role.value)
-            result = ExecutionResult(
-                state=ProviderState.CRASHED,
-                failure_class=FailureClass.CRASH,
-                exit_code=None,
-                duration_s=0.0,
-                summary="",
-                raw_tail=str(exc),
+            outcome = await self._invocations().execute(
+                InvocationSpec(
+                    owner=InvocationOwner(
+                        mission_id=self.mission_id,
+                        product_project_id=_product_id,
+                        phase_id=_phase_id,
+                    ),
+                    stage=_stage,
+                    role=role.value,
+                    prompt=prompt,
+                    workdir=project_path,
+                    log_dir=log_dir,
+                    provider=provider_name,
+                    timeout_s=self.config.provider_timeout_s(provider_name),
+                    model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
+                    run_id=_pre_run_id,
+                    cancel_event=self._cancel,
+                )
             )
-
-        commit_after = await git_ops.head_sha(project_path)
-        self._record_run(run_id, provider_name, role, result, commit_before, commit_after)
-
-        if result.ok:
-            self.registry.record_success(provider_name, result.duration_s)
-        elif result.gate_refused:
-            # Spawn-handshake refusal is orchestrator-internal, not evidence
-            # about the provider — must not cost it a reliability cooldown,
-            # but mark_busy() still needs undoing or it's stuck unselectable.
-            self.registry.clear_busy_without_penalty(provider_name)
-        else:
-            self.registry.record_failure(provider_name, result.failure_class, result.duration_s, result.raw_tail[:300])
-
+        except RuntimeError as exc:
+            self._active_invocation_runs.pop(_track_key, None)
+            logger.warning("invocation capacity refused: %s", exc)
+            return None
+        run_id = outcome.run_id
+        self._active_invocation_runs.pop(_track_key, None)
+        try:
+            commit_after = await git_ops.head_sha(project_path)
+        except Exception:
+            commit_after = None
+            logger.debug("git head failed for %s", project_path, exc_info=True)
+        try:
+            self.db.execute(
+                "UPDATE provider_runs SET git_commit_before=?, git_commit_after=? WHERE id=?",
+                (commit_before, commit_after, run_id),
+            )
+        except Exception:
+            logger.debug("git linkage failed for run %s", run_id, exc_info=True)
+        # Health already accounted exactly once by InvocationService.
+        result = ExecutionResult(
+            state=ProviderState(outcome.provider_state)
+            if outcome.provider_state in ProviderState.__members__.values()
+            else (ProviderState.COMPLETED if outcome.ok else ProviderState.CRASHED),
+            failure_class=FailureClass(outcome.failure_class)
+            if outcome.failure_class in FailureClass.__members__.values()
+            else FailureClass.CRASH,
+            exit_code=outcome.exit_code,
+            duration_s=outcome.duration_s,
+            summary=outcome.summary,
+            argv=[],
+            stdout_path=Path(outcome.stdout_path) if outcome.stdout_path else None,
+            stderr_path=Path(outcome.stderr_path) if outcome.stderr_path else None,
+            raw_tail=outcome.raw_tail,
+            assistant_text=outcome.assistant_text,
+            pid=outcome.pid,
+            pgid=outcome.pgid,
+            gate_refused=outcome.gate_refused,
+        )
         return result
 
     async def _make_handoff(
@@ -972,60 +1043,64 @@ class ParallelMissionEngine:
                 attempt += 1
                 continue
 
-            run_id = f"run-{utcnow().timestamp()}".replace(".", "")
-            request = ExecutionRequest(
-                prompt=prompt,
-                workdir=project_path,
-                role=role.value,
-                timeout_s=self.config.provider_timeout_s(provider_name),
-                run_id=run_id,
-                log_dir=log_dir,
-            )
-
-            self.db.insert(
-                "provider_runs",
-                {
-                    "id": run_id,
-                    "mission_id": self.mission_id,
-                    "provider": provider_name,
-                    "role": role.value,
-                    "command": [redact(provider_name)],
-                    "cwd": str(project_path),
-                    "started_at": utcnow().isoformat(),
-                    "failure_class": "RUNNING",
-                    "provider_state": "RUNNING",
-                },
-            )
-            self.registry.mark_busy(provider_name)
             self.events.publish(EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value)
+            import uuid as _uuid2
 
+            from .invocations import STAGE_DAG_PLANNING, InvocationOwner, InvocationSpec
+
+            _product_id, _phase_id = self._product_attribution()
+            _plan_key = "__dag_planning"
+            _plan_run_id = f"run-{_uuid2.uuid4().hex[:12]}"
+            self._active_invocation_runs[_plan_key] = _plan_run_id
             try:
-                result = await adapter.execute(request, lambda line: None)
-            except Exception as exc:
-                logger.exception("planning provider crashed")
-                result = ExecutionResult(
-                    state=ProviderState.CRASHED,
-                    failure_class=FailureClass.CRASH,
-                    exit_code=None,
-                    duration_s=0.0,
-                    summary="",
-                    raw_tail=str(exc),
+                outcome = await self._invocations().execute(
+                    InvocationSpec(
+                        owner=InvocationOwner(
+                            mission_id=self.mission_id,
+                            product_project_id=_product_id,
+                            phase_id=_phase_id,
+                        ),
+                        stage=STAGE_DAG_PLANNING,
+                        role=role.value,
+                        prompt=prompt,
+                        workdir=project_path,
+                        log_dir=log_dir,
+                        provider=provider_name,
+                        timeout_s=self.config.provider_timeout_s(provider_name),
+                        model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
+                        run_id=_plan_run_id,
+                        attempt_number=attempt + 1,
+                        cancel_event=self._cancel,
+                    )
                 )
-
-            self.db.update(
-                "provider_runs",
-                run_id,
-                {
-                    "finished_at": utcnow().isoformat(),
-                    "exit_code": result.exit_code,
-                    "failure_class": result.failure_class.value,
-                    "provider_state": result.state.value,
-                    "summary": result.summary[:500],
-                },
+            except RuntimeError as exc:
+                self._active_invocation_runs.pop(_plan_key, None)
+                logger.warning("invocation capacity refused: %s", exc)
+                await self._wait_tick()
+                continue
+            self._active_invocation_runs.pop(_plan_key, None)
+            result = ExecutionResult(
+                state=ProviderState(outcome.provider_state)
+                if outcome.provider_state in ProviderState.__members__.values()
+                else (ProviderState.COMPLETED if outcome.ok else ProviderState.CRASHED),
+                failure_class=FailureClass(outcome.failure_class)
+                if outcome.failure_class in FailureClass.__members__.values()
+                else FailureClass.CRASH,
+                exit_code=outcome.exit_code,
+                duration_s=outcome.duration_s,
+                summary=outcome.summary,
+                argv=[],
+                stdout_path=Path(outcome.stdout_path) if outcome.stdout_path else None,
+                stderr_path=Path(outcome.stderr_path) if outcome.stderr_path else None,
+                raw_tail=outcome.raw_tail,
+                assistant_text=outcome.assistant_text,
+                pid=outcome.pid,
+                pgid=outcome.pgid,
+                gate_refused=outcome.gate_refused,
             )
 
             if result.ok:
-                self.registry.record_success(provider_name, result.duration_s)
+                # Health already accounted exactly once by InvocationService.
                 used = set(json.loads(self._mission().get("providers_used") or "[]"))
                 if provider_name not in used:
                     self.db.update(
@@ -1036,15 +1111,11 @@ class ParallelMissionEngine:
                 break
 
             if result.gate_refused:
-                # Spawn-handshake refusal is orchestrator-internal, not
-                # evidence about the provider — no reliability cooldown, but
-                # still clear the BUSY mark_busy() set.
-                self.registry.clear_busy_without_penalty(provider_name)
                 state = ProviderState.AVAILABLE
             else:
-                state = self.registry.record_failure(
-                    provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
-                )
+                from .providers.classify import FAILURE_TO_STATE as _FTS2
+
+                state = _FTS2.get(result.failure_class, ProviderState.CRASHED)
             failed = set(json.loads(self._mission().get("providers_failed") or "[]"))
             failed.add(provider_name)
             self.db.update("missions", self.mission_id, {"providers_failed": sorted(failed), "updated_at": utcnow()})
@@ -1326,75 +1397,105 @@ class ParallelMissionEngine:
             )
             return
 
-        run_id = f"run-{utcnow().timestamp()}".replace(".", "")
+        import uuid as _uuid
+
         log_dir = Path(worktree_path) / ".orchestrator" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
 
         prompt = self._build_task_prompt(task, provider_name)
-        request = ExecutionRequest(
-            prompt=prompt,
-            workdir=Path(worktree_path),
-            role=role.value,
-            timeout_s=self.config.provider_timeout_s(provider_name),
-            run_id=run_id,
-            log_dir=log_dir,
-            on_spawn=self._on_spawn_handler(run_id),
-        )
-
-        commit_before = await git_ops.head_sha(Path(worktree_path))
-        self.db.insert(
-            "provider_runs",
-            {
-                "id": run_id,
-                "mission_id": self.mission_id,
-                "task_id": task_id,
-                "provider": provider_name,
-                "role": role.value,
-                "command": [redact(provider_name)],
-                "cwd": worktree_path,
-                "started_at": utcnow().isoformat(),
-                "failure_class": "RUNNING",
-                "provider_state": "RUNNING",
-                "stdout_path": str(log_dir / f"{run_id}.stdout.log"),
-                "stderr_path": str(log_dir / f"{run_id}.stderr.log"),
-                "git_commit_before": commit_before,
-            },
-        )
-        self.registry.mark_busy(provider_name)
-
         try:
-            result = await adapter.execute(request, lambda line: None)
-        except Exception as exc:
-            logger.exception("provider %s crashed for task %s", provider_name, task_id)
-            result = ExecutionResult(
-                state=ProviderState.CRASHED,
-                failure_class=FailureClass.CRASH,
-                exit_code=None,
-                duration_s=0.0,
-                summary="",
-                raw_tail=str(exc),
+            commit_before = await git_ops.head_sha(Path(worktree_path))
+        except Exception:
+            commit_before = None
+            logger.debug("git head failed for task %s", task_id, exc_info=True)
+
+        from .invocations import STAGE_TASK, InvocationOwner, InvocationSpec
+
+        _product_id, _phase_id = self._product_attribution()
+        _pre_run_id = f"run-{_uuid.uuid4().hex[:12]}"
+        self._active_invocation_runs[task_id] = _pre_run_id
+        try:
+            outcome = await self._invocations().execute(
+                InvocationSpec(
+                    owner=InvocationOwner(
+                        mission_id=self.mission_id,
+                        task_id=task_id,
+                        product_project_id=_product_id,
+                        phase_id=_phase_id,
+                    ),
+                    stage=STAGE_TASK,
+                    role=role.value,
+                    prompt=prompt,
+                    workdir=Path(worktree_path),
+                    log_dir=log_dir,
+                    provider=provider_name,
+                    timeout_s=self.config.provider_timeout_s(provider_name),
+                    model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
+                    run_id=_pre_run_id,
+                    cancel_event=self._cancel,
+                )
             )
-
-        commit_after = await git_ops.head_sha(Path(worktree_path))
-        self.db.update(
-            "provider_runs",
-            run_id,
-            {
-                "finished_at": utcnow().isoformat(),
-                "exit_code": result.exit_code,
-                "failure_class": result.failure_class.value,
-                "provider_state": result.state.value,
-                "summary": result.summary[:500],
-                "git_commit_after": commit_after,
-            },
+        except RuntimeError as exc:
+            logger.warning("invocation capacity refused for task %s: %s", task_id, exc)
+            self._active_invocation_runs.pop(task_id, None)
+            release_provider_reservation(self.db, self.events, task_id)
+            task_locks.release_locks_for_task(self.db, self.events, task_id)
+            self.db.update(
+                "tasks",
+                task_id,
+                {"status": TaskStatus.PENDING.value, "blocking_issue": f"capacity refused: {exc}"},
+            )
+            return
+        finally:
+            self._active_invocation_runs.pop(task_id, None)
+        run_id = outcome.run_id
+        result = ExecutionResult(
+            state=ProviderState(outcome.provider_state)
+            if outcome.provider_state in ProviderState.__members__.values()
+            else (ProviderState.COMPLETED if outcome.ok else ProviderState.CRASHED),
+            failure_class=FailureClass(outcome.failure_class)
+            if outcome.failure_class in FailureClass.__members__.values()
+            else FailureClass.CRASH,
+            exit_code=outcome.exit_code,
+            duration_s=outcome.duration_s,
+            summary=outcome.summary,
+            argv=[],
+            stdout_path=Path(outcome.stdout_path) if outcome.stdout_path else None,
+            stderr_path=Path(outcome.stderr_path) if outcome.stderr_path else None,
+            raw_tail=outcome.raw_tail,
+            assistant_text=outcome.assistant_text,
+            pid=outcome.pid,
+            pgid=outcome.pgid,
+            gate_refused=outcome.gate_refused,
         )
+        try:
+            commit_after = await git_ops.head_sha(Path(worktree_path))
+        except Exception:
+            commit_after = None
+            logger.debug("git head failed for task %s", task_id, exc_info=True)
+        try:
+            self.db.execute(
+                "UPDATE provider_runs SET git_commit_before=?, git_commit_after=? WHERE id=?",
+                (commit_before, commit_after, run_id),
+            )
+        except Exception:
+            logger.debug("git linkage failed for run %s", run_id, exc_info=True)
 
-        # Release reservation + locks
+        # Late cancellation guard: a task cancelled while the provider was
+        # still running must stay CANCELLED; the late result only releases
+        # capacity, never resurrects the task.
+        _current_task = self.db.get("tasks", task_id) or {}
+        if _current_task.get("status") == TaskStatus.CANCELLED.value:
+            release_provider_reservation(self.db, self.events, task_id, run_id)
+            task_locks.release_locks_for_task(self.db, self.events, task_id)
+            return
+
+        # Release reservation + locks only now, after confirmed process exit.
         release_provider_reservation(self.db, self.events, task_id, run_id)
         task_locks.release_locks_for_task(self.db, self.events, task_id)
 
         if result.ok:
-            self.registry.record_success(provider_name, result.duration_s)
+            # Health already accounted exactly once by InvocationService.
 
             # Checkpoint before marking COMPLETED
             try:
@@ -1441,12 +1542,26 @@ class ParallelMissionEngine:
                 provider=provider_name,
             )
         else:
-            if result.gate_refused:
-                self.registry.clear_busy_without_penalty(provider_name)
-            else:
-                self.registry.record_failure(
-                    provider_name, result.failure_class, result.duration_s, result.raw_tail[:300]
+            # Health already accounted exactly once by InvocationService.
+            # CANCELLED tasks stay cancelled; never flip to FAILED on a late event.
+            if result.failure_class == FailureClass.CANCELLED:
+                self.db.update(
+                    "tasks",
+                    task_id,
+                    {
+                        "status": TaskStatus.CANCELLED.value,
+                        "finished_at": utcnow().isoformat(),
+                        "summary": result.raw_tail[-300:],
+                        "provider_run_id": run_id,
+                    },
                 )
+                self.events.publish(
+                    EventType.TASK_CANCELLED,
+                    mission_id=self.mission_id,
+                    task_id=task_id,
+                    provider=provider_name,
+                )
+                return
             self.db.update(
                 "tasks",
                 task_id,
