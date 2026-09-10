@@ -67,6 +67,15 @@ files; streamed output is redacted heuristically. Git checkpoints exclude intern
 runtime files and recognized secrets. See [SECURITY.md](SECURITY.md) for the actual
 boundaries, including network-enabled dependency installation.
 
+## Invocation observability
+
+Every provider execution is one durable invocation with owner/stage, terminal
+outcome, prompt manifest (`~N estimated` via `char4-v1`), usage provenance
+(`PROVIDER_REPORTED`/`CLI_REPORTED`/`UNKNOWN` with `COMPLETE`/`PARTIAL`/`UNKNOWN`),
+and lease-owned cancellation/recovery. Inspect runs at `/api/runs`,
+`/api/runs/{id}`, `/api/runs/{id}/context`, and `/api/analytics/usage`; the UI
+Run Inspector shows the same without ever rendering unknown as zero.
+
 ## Development and documentation
 
 `make test`, `make lint`, and `make typecheck` are deterministic development checks.

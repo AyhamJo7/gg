@@ -72,29 +72,32 @@ RATE_LIMIT · QUOTA_EXHAUSTED · AUTH · OVERLOADED · TIMEOUT · CRASH ·
 MALFORMED_OUTPUT · HUMAN_INPUT · CANCELLED · NONE
 ```
 
-The classifier checks adapter success markers before generic exit-code patterns.
-This is currently too permissive: a Codex `item.completed` followed by a failing
-turn can override nonzero exit. Do not infer successful task acceptance from
-`failure_class=NONE`. See the current audit for the proposed event-aware fix.
+Terminal precedence is deterministic: confirmed cancellation, timeout, spawn
+refusal, and explicit terminal failure evidence take precedence over any
+intermediate success-like marker. A non-zero process exit is failure even when
+an earlier `item.completed`/`step_finish`/`result` event exists. Do not infer
+successful task acceptance from `failure_class=NONE` alone; see invocation
+outcome and acceptance evidence.
 
-## Usage visibility (not yet parsed by GG)
+## Usage visibility
 
-`ExecutionResult` has no token-usage fields. Analytics currently shows invocation
-counts and duration, not tokens. Historical GG logs inspected on 2026-09-10 contain:
+Every provider execution is one durable invocation (`InvocationService`) with a
+prompt manifest (`char4-v1` local estimate, explicitly approximate) and a
+normalized usage row carrying source/completeness/basis. `null` means unknown,
+never zero.
 
-- Claude: final `result.usage` and `modelUsage` on review runs; intermediate
-  assistant usage can repeat and must not be added to final totals.
-- OpenCode: `step_finish.part.tokens` with input/output/reasoning/cache counters.
-  Interrupted logs may have only partial steps or no counters.
-- Codex: the sampled stdout lacks final usage; its exact thread-matched local
-  session contains cumulative `token_count.info.total_token_usage`. GG does not
-  currently read session files. Any future fallback must restrict itself to the
-  recorded GG session and invocation time interval, never unrelated conversations.
-- AGY: no real GG run in the inspected default DB; token availability is unknown.
+- Claude: final `result.usage` is authoritative (`PROVIDER_REPORTED`); `modelUsage`
+  is corroborating breakdown only. Missing terminal usage stays `UNKNOWN`/`PARTIAL`.
+- OpenCode: unique `step_finish` deltas are summed; duplicates ignored; unfinished
+  runs are `PARTIAL` lower bounds.
+- Codex: terminal stdout usage when present; cumulative session snapshots use the
+  final snapshot only, never summed. Unattributable sessions stay `UNKNOWN`.
+- AGY: `UNKNOWN` until a verified fixture proves a schema.
 
-CLI-reported usage is not independently measured provider billing. Prompt-size
+CLI-reported usage is not independently measured provider billing. GG prompt
 estimates exclude CLI-added instructions and internal tool turns. Subscription
 quota remaining is unknown unless separately exposed with trustworthy provenance.
+Requested vs observed model are stored separately; unknown stays null.
 
 ## Simulation providers (tests/development)
 

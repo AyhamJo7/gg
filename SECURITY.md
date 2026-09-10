@@ -225,18 +225,22 @@ operations, and workspace escape.
   opencode: permission-bypass in the workspace). Review generated changes in the
   Git ledger — that is what it is for.
 - Full raw provider logs on disk are unredacted by design (debugging); mission
-  logs live under the project's `.orchestrator/logs/`. Treat that directory as
-  sensitive. `git_ops.checkpoint()` explicitly unstages the entire `.orchestrator/`
-  directory; internal runtime files are also sensitive paths. Product planning
-  currently writes separate run logs in the system temporary directory.
+  logs live under the project's `.orchestrator/logs/`; product-planning logs
+  live under the state directory's `logs/` with an isolated per-run planner
+  working directory. Treat those directories as sensitive.
+  `git_ops.checkpoint()` explicitly unstages the entire `.orchestrator/`
+  directory; internal runtime files are also sensitive paths.
 - The normal checkpoint safeguards do not cover every Git call: product workspace
   bootstrap in `ProjectCoordinator.ensure_target_repo()` directly runs `git add -A`
   when initializing an adopted non-Git directory. Existing secret files in such a
   directory can be staged by this path. Use an existing Git repository with its
   sensitive files excluded, or an empty new target, until bootstrap is corrected.
-- Spawn ownership is not uniform: product planning and parallel DAG planning do
-  not currently supply the mission runner's persisted process-identity callback.
-  See the current architecture audit before extending unattended execution.
+- Spawn ownership is uniform through the shared invocation boundary: every
+  provider execution (sequential phases, parallel planning/tasks/review/repair,
+  product planning) persists PID/PGID/start identity before the spawn gate
+  releases, verifies ownership before signalling, and releases capacity only
+  after confirmed exit. Invocation manifests persist sizes/hashes/estimates
+  only — never raw secrets or `.env` content.
 - `workspace_scope` is a scheduling lock, not a filesystem sandbox: a task
   declares which paths it will touch so conflicting tasks serialize, but the
   provider process itself is not confined to those paths.
