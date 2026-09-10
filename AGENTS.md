@@ -1,0 +1,41 @@
+# GG contributor guidance
+
+GG is a local, single-operator orchestrator of authenticated provider CLIs.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) for current behavior and
+[DEVELOPMENT.md](DEVELOPMENT.md) for commands. The redesign in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is proposed, not implemented.
+Current source overrides historical reports.
+
+## Boundaries
+
+- Keep orchestration policy out of adapters. Distinguish repository projects,
+  product lifecycles, missions, tasks, and runs.
+- Check all execution paths when changing shared behavior: product planning,
+  sequential phases, parallel planning, tasks, and integration review/repair.
+- Preserve process ownership, cancellation, capacity, workspace exclusion,
+  checkpoint safety, and restart behavior. CLI success is not acceptance.
+- Preserve reviewer provenance. Repair claims and omitted findings are not
+  verified fixes. Objective verification belongs in deterministic sandboxed tools.
+- Consult [SECURITY.md](SECURITY.md) before changing execution, paths, logs, auth,
+  or Git. Never weaken fail-closed containment or commit secrets/runtime evidence.
+
+## Workflow
+
+Inspect `git status` and local instructions first; preserve user changes.
+Use `uv` for Python and the existing npm lockfile/workflow for this frontend.
+Checks: `make test-backend`, `make test-frontend`, `make lint`, `make typecheck`.
+Run affected tests with fresh temporary fixtures; add meaningful regression
+coverage for behavior changes. Never use real providers in routine tests.
+`make smoke` and real dogfood scripts consume quota and require explicit scope.
+
+Use Conventional Commits. Never force-push main, reset user work, or kill shared
+instances. Migrations are append-only. Review generated build-file changes before
+staging; commit only task-related files.
+
+## Context discipline
+
+Read relevant modules after orienting. Keep these instructions concise and link
+specifications. Avoid entire plans, logs, or previous reports in task prompts.
+Preserve scoped requirements, architecture decisions, failure evidence, and reviewer
+independence. Label token estimates and unknown usage honestly; CLI token counts
+are not quota remaining or a subscription bill. Never inspect unrelated sessions.

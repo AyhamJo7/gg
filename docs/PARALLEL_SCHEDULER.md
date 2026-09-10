@@ -1,5 +1,9 @@
 # Parallel Scheduler
 
+Current-source clarification (2026-09-10): Parallel Safe is an alternative mission
+mode, not the executor automatically selected for product roadmap phases. See
+[current architecture](../ARCHITECTURE.md) for boundaries shared with the lifecycle.
+
 ## Overview
 
 The Phase 2A parallel scheduler replaces the primarily sequential phase executor
@@ -50,19 +54,15 @@ For every `READY` task, the scheduler calculates candidate providers using an
 score =
   + role preference (from config priority matrix)
   + historical success rate
-  + specialization fit
-  + independence bonus
+  + independence bonus (function parameter; task caller currently leaves it zero)
   - cooldown penalty
   - recent failure penalty
 ```
 
-The UI can explain any assignment:
-
-> Assigned OpenCode because:
-> + implementation priority #1
-> + provider available
-> + no workspace conflict
-> + recent implementation success
+The scoring helper returns explanation strings, but the task caller currently
+discards them; they are not displayed in the UI. `provider_profiles` is not read
+by the scoring path. Historical success is provider-wide CLI success, not verified
+implementation quality or role-specific effectiveness.
 
 ## Atomic Provider Reservation
 
@@ -122,11 +122,12 @@ A single task failure does **not** necessarily kill the mission:
 
 | Failure Type | Action |
 |-------------|--------|
-| Provider failure | Retry with different provider |
+| Provider failure | Bounded task retry; selection may use another eligible provider |
 | Task implementation failure | Block dependents, retry if attempts remain |
-| Verification failure | Repair task or Human Gate |
+| Final verification failure | `UNVERIFIED`; no sequential-style final-validation repair loop |
 | Dependency failure | Block dependents |
-| Integration failure | Human Gate |
+| Integration conflict | `WAITING_FOR_HUMAN`, conflict information and manual resume workflow |
+| Other integration failure | `FAILED` |
 
 ## Mission Pause / Cancel
 
@@ -145,4 +146,10 @@ On backend restart:
 5. Reconstruct provider reservations from `provider_reservations` table
 6. Resume scheduling loop
 
-Never duplicate task execution.  Never merge a task twice.
+Recovery and already-merged checks aim to avoid duplicate writers/merges, but
+provider calls can be re-executed after interruption. Task-level cancel currently
+updates rows/releases locks without interrupting the provider; process-lifetime
+ownership needs strengthening before claiming uniform cancellation guarantees.
+Reservations cover DAG tasks, not every provider invocation. Scope keys also lack
+a repository namespace, and configured per-provider concurrency above one is not
+consistently honored. These are current limitations, not implemented guarantees.

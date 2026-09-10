@@ -1,5 +1,10 @@
 # ADR 0002: State Machine Persistence
 
+2026-09-10 clarification: the decision below is historical. Fresh handoffs do not
+make arbitrary provider side effects idempotent. Current product planning and
+some parallel call paths do not share all mission recovery guarantees. See
+[current architecture](../../ARCHITECTURE.md) and its linked audit.
+
 ## Status
 Accepted (implemented, restart-tested)
 

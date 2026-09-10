@@ -22,7 +22,13 @@ class ProviderAdapter:
 Adapters translate CLI reality into normalized states. They **never** decide
 orchestration policy — priority, failover, and phases belong to the engine.
 
-## Verified CLI integrations (runtime-tested 2026-09-05)
+## CLI integrations
+
+Commands below reflect the current adapters. Historical runtime checks were made
+on 2026-09-05; the default DB inspected on 2026-09-10 recorded Claude 2.1.267,
+Codex 0.153.4, AGY 1.1.28, and OpenCode 1.17.13. Installation/version checks
+are not authentication or remaining-quota checks. All four are enabled in YAML;
+DB state and cooldowns affect eligibility. GG pins model/effort only for OpenCode.
 
 ### claude — 2.1.261 (Claude Code)
 ```
@@ -53,8 +59,9 @@ opencode run --format json --auto --dir <dir> -m <model> <prompt>
 ```
 - **Quirk (verified):** the interactive default model (`gpt-5.6-sol-pro` on this
   machine) hangs indefinitely in headless `run` mode with zero output. The adapter
-  pins `providers.opencode.model` (default `opencode-go/kimi-k2.7-code`, verified
-  responsive). Change it in `config/orchestrator.yaml` if your account differs.
+  pins `providers.opencode.model` (currently
+  `opencode-go/muse-spark-1.3-contributor`) and passes `--variant xhigh` from
+  configuration. Change these in `config/orchestrator.yaml` for your account.
 
 ## Failure classification
 
@@ -65,10 +72,29 @@ RATE_LIMIT · QUOTA_EXHAUSTED · AUTH · OVERLOADED · TIMEOUT · CRASH ·
 MALFORMED_OUTPUT · HUMAN_INPUT · CANCELLED · NONE
 ```
 
-Rule: exit 0 **with an explicit success marker** (`"subtype":"success"` or
-`"status":"SUCCESS"`) overrides pattern matches, because structured telemetry
-contains failure-shaped strings without blocking. Exit≠0 + limit text → failure
-even without a success marker.
+The classifier checks adapter success markers before generic exit-code patterns.
+This is currently too permissive: a Codex `item.completed` followed by a failing
+turn can override nonzero exit. Do not infer successful task acceptance from
+`failure_class=NONE`. See the current audit for the proposed event-aware fix.
+
+## Usage visibility (not yet parsed by GG)
+
+`ExecutionResult` has no token-usage fields. Analytics currently shows invocation
+counts and duration, not tokens. Historical GG logs inspected on 2026-09-10 contain:
+
+- Claude: final `result.usage` and `modelUsage` on review runs; intermediate
+  assistant usage can repeat and must not be added to final totals.
+- OpenCode: `step_finish.part.tokens` with input/output/reasoning/cache counters.
+  Interrupted logs may have only partial steps or no counters.
+- Codex: the sampled stdout lacks final usage; its exact thread-matched local
+  session contains cumulative `token_count.info.total_token_usage`. GG does not
+  currently read session files. Any future fallback must restrict itself to the
+  recorded GG session and invocation time interval, never unrelated conversations.
+- AGY: no real GG run in the inspected default DB; token availability is unknown.
+
+CLI-reported usage is not independently measured provider billing. Prompt-size
+estimates exclude CLI-added instructions and internal tool turns. Subscription
+quota remaining is unknown unless separately exposed with trustworthy provenance.
 
 ## Simulation providers (tests/development)
 

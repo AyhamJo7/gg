@@ -6,9 +6,9 @@
 backend/            FastAPI orchestration engine (Python 3.12, uv)
   migrations/       numbered SQL migrations
   src/orchestrator/ engine, providers, api, git, verify, …
-  tests/            46 tests (pytest + pytest-asyncio)
+  tests/            pytest + pytest-asyncio, including lifecycle/security/recovery
 frontend/           Mission Control UI (React 18 + TS + Vite)
-  src/pages/        MissionControl, NewMission, Projects, Providers, Priority, Analytics
+  src/pages/        MissionControl, NewMission, Lifecycle, Projects, Providers, Priority, Analytics
   src/components/   Terminal, GitPanel, ProviderStrip, WorkflowTimeline, GateCard, …
   src-tauri/        Tauri 2 shell (spawns backend, health-gated)
 config/             orchestrator.yaml — providers, priorities, cooldowns
@@ -26,9 +26,15 @@ make backend          # backend only
 make frontend         # frontend only
 ```
 
-Backend hot-reload: run `uv run uvicorn orchestrator.server:main --reload` in
-`backend/` (or just restart `make backend`). The backend recovers in-flight
-missions from SQLite on boot — killing it mid-mission is safe.
+`orchestrator.server:main` is a CLI entrypoint, not an ASGI application factory;
+do not pass it to uvicorn as an app. Use `make backend` and a controlled restart.
+Active missions have restart recovery; this does not imply exactly-once provider
+execution or complete recovery for the separate product-planning path.
+
+With these commands, SQLite and the auth token live in `backend/.orchestrator/`.
+Other launch directories change the relative state path. Run one backend per
+state directory. `make frontend` initializes the token first; plain `npm run dev`
+requires that token to exist already. Vite embeds it, including in builds.
 
 ## Testing
 
@@ -70,4 +76,7 @@ startup; tracked in `schema_migrations`. Never edit applied migrations.
 Requires Rust (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 and `npm i -D @tauri-apps/cli`, then `npx tauri build` in `frontend/`. The shell
 expects `gg-backend` on PATH (`uv tool install ./backend` or the repo venv).
-Tauri build is currently UNVERIFIED on this machine (no Rust toolchain).
+The 2026-09-10 audit did not verify desktop packaging. The shell inherits its cwd
+for backend state, probes port 8787, and still loads after a failed health wait;
+it is not a guarantee of backend readiness. Browser development is the canonical
+startup documented above.

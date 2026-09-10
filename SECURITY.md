@@ -224,10 +224,19 @@ operations, and workspace escape.
 - CLI sandboxing differs per provider (codex: `workspace-write` sandbox; claude/agy/
   opencode: permission-bypass in the workspace). Review generated changes in the
   Git ledger — that is what it is for.
-- Full raw provider logs on disk are unredacted by design (debugging); they live
-  under the project's `.orchestrator/logs/` and are excluded from checkpoints
-  by the sensitive-file rules only if they match secret filenames — treat that
-  directory as sensitive.
+- Full raw provider logs on disk are unredacted by design (debugging); mission
+  logs live under the project's `.orchestrator/logs/`. Treat that directory as
+  sensitive. `git_ops.checkpoint()` explicitly unstages the entire `.orchestrator/`
+  directory; internal runtime files are also sensitive paths. Product planning
+  currently writes separate run logs in the system temporary directory.
+- The normal checkpoint safeguards do not cover every Git call: product workspace
+  bootstrap in `ProjectCoordinator.ensure_target_repo()` directly runs `git add -A`
+  when initializing an adopted non-Git directory. Existing secret files in such a
+  directory can be staged by this path. Use an existing Git repository with its
+  sensitive files excluded, or an empty new target, until bootstrap is corrected.
+- Spawn ownership is not uniform: product planning and parallel DAG planning do
+  not currently supply the mission runner's persisted process-identity callback.
+  See the current architecture audit before extending unattended execution.
 - `workspace_scope` is a scheduling lock, not a filesystem sandbox: a task
   declares which paths it will touch so conflicting tasks serialize, but the
   provider process itself is not confined to those paths.

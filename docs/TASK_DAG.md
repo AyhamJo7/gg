@@ -1,5 +1,9 @@
 # Task DAG
 
+Current-source clarification (2026-09-10): this describes the DAG data model.
+See [current architecture](../ARCHITECTURE.md) and the
+[audit](ARCHITECTURE.md) for execution limitations.
+
 ## Overview
 
 Phase 2A introduces a first-class **persistent task graph** to the GG Orchestrator.
@@ -77,17 +81,21 @@ The planning provider must produce a JSON payload:
 }
 ```
 
-If the planner output is malformed:
-1. Retry with explicit JSON instructions
-2. Fallback planner
-3. `UNVERIFIED` / Human Gate
+Provider execution failures have bounded failover. After a successful CLI call,
+missing structured DAG output currently becomes `UNVERIFIED`; a structurally
+invalid DAG becomes `FAILED`. There is no implemented format-repair/fallback
+planning loop at this parsing stage.
 
 ## Dynamic Re-Planning
 
-Bounded re-planning is supported.  If a task permanently fails, the planner may
-replace that task, but completed tasks are immutable unless explicitly
-invalidated.  Every graph mutation creates a new `dag_revisions` record
-recording who changed the graph, why, and which tasks were added/removed.
+Automatic dynamic replanning is not implemented. The schema contains
+`dag_revisions`; initial planner output is recorded there. The manual DAG API is
+restricted to mission setup states. Task retries are separate from graph revision.
+
+Dependency edges currently gate task start, but do not transfer upstream branch
+content into the consumer worktree. Tasks start from the main repository's HEAD;
+completed task branches are integrated after all tasks finish. Do not assume that
+a dependent task can already read its producer's code.
 
 ## Compatibility
 

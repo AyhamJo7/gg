@@ -58,7 +58,10 @@ appended.  **Never overwrite existing user branches.**
 2. **Checkpoint**: provider checkpoints inside the worktree
 3. **Complete**: worktree stays until integration
 4. **Integration**: branches are merged into the main branch
-5. **Cleanup**: worktrees and branches are removed after integration
+5. **Retention**: cleanup helpers exist, but integration does not automatically
+   remove every task worktree/branch. Inspect ownership and evidence needs before
+   cleanup. Task worktrees currently start from repository HEAD; dependency branch
+   content is not automatically included before a consumer task runs.
 
 ### Safety Rules
 

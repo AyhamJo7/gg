@@ -1,5 +1,10 @@
 # ADR 0004: Provider Failure Classification
 
+2026-09-10 clarification: current adapter success hooks precede exit-code checks
+and can incorrectly accept intermediate completion. Quota failures also have a
+separate four-hour minimum cooldown. The historical rules below are design intent;
+see [PROVIDERS.md](../../PROVIDERS.md) and current source for actual behavior.
+
 ## Status
 Accepted (implemented, corrected by live evidence)
 

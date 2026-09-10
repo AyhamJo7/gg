@@ -1,79 +1,84 @@
-# GG Orchestrator — AI Engineering Mission Control
+# GG Orchestrator
 
-A local-first autonomous software factory that orchestrates multiple consumer AI
-subscriptions through their locally installed CLI tools. Give it **one high-level
-engineering mission**, walk away, and the system plans, implements, tests, reviews,
-repairs, and verifies the work — rotating providers automatically when any of them
-hits a rate limit, crashes, or needs authentication.
+GG is a local software-building orchestrator for authenticated CLI subscriptions.
+Its React browser UI drives a Python/FastAPI backend, SQLite state, Git checkpoints,
+and installed `claude`, `codex`, `agy`, and `opencode` adapters. It does not require
+a paid API-key gateway. Authentication and account access belong to the CLIs;
+installation alone does not prove available quota.
 
-```
-You: "Build a complete weather CLI."
-        ↓
-Claude plans  →  OpenCode implements  →  Codex rate-limited  →
-orchestrator checkpoints + hands off  →  Claude continues testing  →
-Claude reviews  →  verification engine runs real tests  →  VERIFIED COMPLETE
-```
+## Start locally
 
-## What it actually does (verified)
-
-- Detects your installed CLIs (`claude`, `codex`, `agy`, `opencode`) and their versions
-- Drives them non-interactively with argv arrays (no shell interpolation)
-- Classifies failures (rate limit / auth / crash / timeout) from real output
-- Checkpoints work into Git at every phase and every provider switch
-- Generates structured markdown handoffs so provider B continues provider A's work
-- Enforces separation of duties (implementer ≠ reviewer when possible)
-- Runs the project's real toolchain as the Definition of Done — never trusts "done"
-- Recovers mid-flight missions after backend restart (SIGKILL-tested)
-- Streams live output over WebSocket into a Mission Control UI
-
-## Quick start
+Requires Python 3.12+, `uv`, Node/npm, Git, and authenticated provider CLIs on PATH.
+Objective verification additionally requires Linux `bubblewrap` (`bwrap`) with
+working unprivileged user namespaces. It fails closed when unavailable.
 
 ```bash
-make install     # backend deps (uv) + frontend deps (npm)
-make dev         # backend on :8787 + frontend on :5173
+make install
+make dev
 ```
 
-Open http://localhost:5173 → **Projects** → add a folder → **New Mission** → launch.
+Open **http://localhost:5173**. The backend listens on **127.0.0.1:8787**.
+`make dev` creates the local auth token before starting Vite. Under the Makefile,
+state and token live in `backend/.orchestrator/`; the configured database path is
+relative to the backend's working directory. Do not publish the built frontend:
+Vite embeds this checkout's bearer token.
 
-Other commands: `make test` (backend 46 + frontend 6), `make lint`, `make typecheck`,
-`make build`, `make smoke` (real provider smoke test — consumes a little quota).
+## Two workflows
 
-## Provider setup
+- **Idea → Product:** create a product idea, generate a structured plan, inspect
+  requirements/architecture/roadmap, then select **Start Project**. Each roadmap
+  phase becomes a sequential mission. External prerequisites appear as Human
+  Gates. Final acceptance checks requirements and replays the detected toolchain
+  in a fresh checkout before recording a delivery SHA and report.
+- **Projects → New Mission:** register an existing repository and request work.
+  Choose sequential execution or **Parallel Safe**, optionally supplying a task
+  DAG. Parallel tasks use separate Git worktrees and a later integration step.
 
-All four subscriptions authenticate via their own CLIs — the orchestrator never
-touches credentials:
+These are distinct entities: “Projects” registers repositories; “Idea → Product”
+manages product lifecycles. Product creation and plan generation are separate
+steps. Use the explicit Start action: the current auto-execute/approval fields do
+not provide a reliable unattended approval workflow.
 
-| Provider | CLI | Non-interactive mode used |
-|---|---|---|
-| Claude Pro | `claude` | `claude -p <prompt> --output-format stream-json --permission-mode bypassPermissions` |
-| ChatGPT Plus | `codex` | `codex exec --json --sandbox workspace-write -C <dir> <prompt>` |
-| Gemini AI Pro | `agy` | `agy --print <prompt> --output-format stream-json --dangerously-skip-permissions` |
-| OpenCode Go | `opencode` | `opencode run --format json --auto --dir <dir> -m <model> <prompt>` |
+## What completion means
 
-Verified against: claude 2.1.261, codex-cli 0.153.1, agy 1.1.26/1.1.27, opencode 1.17.13.
-See [PROVIDERS.md](PROVIDERS.md) for the full adapter contract and known quirks
-(e.g. opencode's interactive default model hangs headless — pin
-`providers.opencode.model`).
+Missions include planning, implementation, testing, review/repair, and deterministic
+toolchain verification. `COMPLETED` is a mission verdict; `DELIVERED` is a separate
+product verdict. Review independence currently compares provider names and can
+degrade to disclosed self-review. Unavailable or failed verification can produce
+`UNVERIFIED`; product acceptance can become `BLOCKED`.
 
-## Documentation
+Requirement checks run allowlisted commands in a sandbox. Human Gates support
+external setup and variable-name checks; configure secret values in your own
+editor, never in plan text or resolution notes. Waivers are explicit exceptions,
+not proof that a requirement passed. Fresh-checkout verification currently repeats
+the detected toolchain, **not every requirement-specific criterion**.
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — components, data flow, state machine
-- [DEVELOPMENT.md](DEVELOPMENT.md) — repo layout, workflows, testing
-- [PROVIDERS.md](PROVIDERS.md) — adapter contract, flags, quirks, adding providers
-- [SECURITY.md](SECURITY.md) — threat model and safeguards
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — common problems
-- [docs/adr/](docs/adr/) — architecture decision records
+## Providers and safety
 
-## Security model (summary)
+Configure providers in [config/orchestrator.yaml](config/orchestrator.yaml).
+All four adapters are enabled there; the current OpenCode default is
+`opencode-go/muse-spark-1.3-contributor` with `variant: xhigh`. Other adapters inherit
+their CLI model defaults. Role priorities and saved profiles are editable in the
+browser; profile behavior differs between execution paths.
 
-Local-first: SQLite + filesystem, no telemetry. argv-only subprocesses, workspace
-path validation, secret redaction in all logs/events, `.env` files auto-gitignored
-and force-excluded from every checkpoint commit. No browser-cookie or session
-scraping anywhere — auth lives in the providers' own CLIs.
+Provider processes have substantial local authority. GG's verification sandbox
+does not uniformly sandbox provider CLIs. Raw provider logs are sensitive local
+files; streamed output is redacted heuristically. Git checkpoints exclude internal
+runtime files and recognized secrets. See [SECURITY.md](SECURITY.md) for the actual
+boundaries, including network-enabled dependency installation.
 
-## Current status
+## Development and documentation
 
-Dogfooded end-to-end: a real Node.js mission ran through Claude (planning) →
-OpenCode (implementation) → Codex (rate-limited mid-testing → automatic failover
-to Claude) → Claude (review) → verification (real `npm test` + `npm run build`) →
-COMPLETED, with git checkpoints and handoffs at every step.
+`make test`, `make lint`, and `make typecheck` are deterministic development checks.
+`make smoke` invokes real providers and consumes subscription capacity.
+
+- [ARCHITECTURE.md](ARCHITECTURE.md): current components, state, and limitations.
+- [DEVELOPMENT.md](DEVELOPMENT.md): commands, tests, migrations, desktop shell.
+- [PROVIDERS.md](PROVIDERS.md): commands, output formats, usage visibility.
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md): operator recovery and diagnostics.
+- [AGENTS.md](AGENTS.md): concise contributor instructions.
+- [Architecture audit and proposed blueprint](docs/ARCHITECTURE.md): assessment
+  dated 2026-09-10; proposals are not implemented features.
+
+Historical release reports and ADRs live under `docs/`. Their verification claims
+apply to their recorded versions; current source takes precedence.

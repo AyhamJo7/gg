@@ -1,5 +1,9 @@
 # ADR 0003: Git Checkpoint Strategy
 
+2026-09-10 clarification: exclusion guarantees below describe the checkpoint
+helper, not arbitrary provider Git commands or product bootstrap. Secret scanning
+is heuristic; see [SECURITY.md](../../SECURITY.md) for current residual risks.
+
 ## Status
 Accepted (implemented, dogfood-verified)
 
