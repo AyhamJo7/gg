@@ -391,6 +391,62 @@ def finish_phase_attempt(
     )
 
 
+async def adopt_head_as_human(
+    db: Any,
+    repo: Path,
+    *,
+    mission_id: str | None = None,
+    product_project_id: str | None = None,
+    phase_id: str | None = None,
+    message: str = "human: adopt workspace changes",
+) -> dict[str, Any]:
+    """Explicitly checkpoint unattributed workspace changes as HUMAN_OPERATOR.
+
+    The operator's adopt action — never automatic. Returns {adopted: bool,
+    base_sha, result_sha, row_id}. A clean tree is a no-op returning the HEAD.
+    """
+    from . import git_ops
+
+    try:
+        base = await git_ops.head_sha(repo)
+        st = await git_ops.status(repo)
+    except Exception as exc:
+        return {"adopted": False, "error": f"repository unreadable: {exc}"}
+    if st.is_clean:
+        return {"adopted": False, "base_sha": base, "result_sha": base, "row_id": None}
+    common = ""
+    try:
+        common = await git_ops.common_dir(repo)
+    except Exception:
+        logger.debug("adopt repo key failed", exc_info=True)
+    try:
+        result = await git_ops.checkpoint(repo, message[:200] or "human: adopt workspace changes")
+    except Exception as exc:
+        return {"adopted": False, "error": f"checkpoint failed: {exc}"}
+    if not result:
+        return {"adopted": False, "error": "nothing committable (sensitive-only changes stay out)"}
+    try:
+        tree = await git_ops.tree_sha(repo, result)
+    except Exception:
+        tree = None
+    row_id = record_write(
+        db,
+        run_id=None,
+        mission_id=mission_id,
+        product_project_id=product_project_id,
+        phase_id=phase_id,
+        actor_type=ACTOR_HUMAN,
+        actor_detail="operator-adopted workspace changes",
+        provider=None,
+        role="human",
+        base_sha=base,
+        result_sha=result,
+        tree_sha=tree,
+        repo_key_value=repo_key(product_project_id, common),
+    )
+    return {"adopted": True, "base_sha": base, "result_sha": result, "row_id": row_id}
+
+
 def latest_review_for_mission(db: Any, mission_id: str) -> dict[str, Any] | None:
     rows = db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,))
     return dict(rows[0]) if rows else None

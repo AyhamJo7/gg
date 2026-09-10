@@ -70,6 +70,7 @@ class BlockType:
     TEST_RESULT = "TEST_RESULT"
     ENVIRONMENT_CONTRACT = "ENVIRONMENT_CONTRACT"
     OUTPUT_CONTRACT = "OUTPUT_CONTRACT"
+    WRITER_PROVENANCE = "WRITER_PROVENANCE"
 
 
 class Priority:
@@ -779,6 +780,28 @@ def build_candidate_blocks(
                 source_ref=str(f["id"]),
             )
         # PROHIBITED: implementer self-assessment never added (enforced by omission).
+        # Writer identity (not reasoning) from exact provenance so the reviewer
+        # knows whose code it judges; agrees with reviewer-selection exclusion.
+        if spec.mission_id:
+            try:
+                from .provenance import mission_provider_writers
+
+                _writers, _complete = mission_provider_writers(db, spec.mission_id)
+                if _writers and _complete:
+                    add(
+                        "writers",
+                        BlockType.WRITER_PROVENANCE,
+                        Priority.PREFERRED,
+                        "Candidate writers (identity only, no self-assessment): "
+                        + ", ".join(sorted(_writers))
+                        + ". Judge the artifact against the contract, not their claims.",
+                        source_kind="provenance",
+                        source_ref=str(spec.mission_id),
+                    )
+                elif not _complete:
+                    warnings.append("WRITER_PROVENANCE_INCOMPLETE")
+            except Exception:
+                warnings.append("WRITER_PROVENANCE_INCOMPLETE")
     elif role == "repairer":
         # Only requested/current findings, not all history.
         if spec.finding_ids and spec.mission_id:
@@ -893,6 +916,7 @@ SECTION_HEADINGS = {
     BlockType.PHASE_CONTEXT: "OBJECTIVE / CURRENT TASK",
     BlockType.ENVIRONMENT_CONTRACT: "VERIFICATION COMMANDS AND EXPECTED OBSERVATIONS",
     BlockType.OUTPUT_CONTRACT: "OUTPUT CONTRACT",
+    BlockType.WRITER_PROVENANCE: "ROLE AND AUTHORITY",
     BlockType.RELEVANT_CODE: "FILES / ALLOWED SCOPE / BASE AND HEAD",
     BlockType.TEST_RESULT: "CURRENT EVIDENCE OR FAILURES",
 }
@@ -1138,12 +1162,10 @@ class ContextCompiler:
                 warnings.append("CANDIDATE_SHA_UNKNOWN")
             if spec.mission_id:
                 try:
-                    writers = self.db.query(
-                        "SELECT DISTINCT provider FROM provider_runs WHERE mission_id=? AND failure_class='NONE'"
-                        " AND role IN ('implementation','testing','repair')",
-                        (spec.mission_id,),
-                    )
-                    if len(writers) > 2:
+                    from .provenance import mission_provider_writers as _mpw
+
+                    _, _wcomplete = _mpw(self.db, spec.mission_id)
+                    if not _wcomplete:
                         warnings.append("WRITER_PROVENANCE_INCOMPLETE")
                 except Exception:
                     warnings.append("WRITER_PROVENANCE_INCOMPLETE")

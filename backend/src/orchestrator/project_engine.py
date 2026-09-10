@@ -1003,7 +1003,9 @@ RULES:
             from .provenance import begin_phase_attempt
 
             begin_phase_attempt(
-                self.db, phase["id"], mission["id"],
+                self.db,
+                phase["id"],
+                mission["id"],
                 trigger="INITIAL" if attempts <= 1 else "PHASE_RETRY",
             )
         except Exception:
@@ -1509,8 +1511,16 @@ RULES:
                         f"(revise the plan with an allowlisted command): {verify[:120]}"
                     )
                     self._record_criterion(
-                        project_id, req.id, cid, "UNVERIFIED", "", None, "no executable verify",
-                        sha, revision, capability="HUMAN_GATE",
+                        project_id,
+                        req.id,
+                        cid,
+                        "UNVERIFIED",
+                        "",
+                        None,
+                        "no executable verify",
+                        sha,
+                        revision,
+                        capability="HUMAN_GATE",
                     )
                     req_ok = False
                     continue
@@ -1525,9 +1535,7 @@ RULES:
                         and int(recorded[0].get("plan_revision") or 0) == revision
                     ):
                         if recorded[0]["status"] != "SATISFIED":
-                            problems.append(
-                                f"criterion {cid} failed: {command} (exit={recorded[0].get('exit_code')})"
-                            )
+                            problems.append(f"criterion {cid} failed: {command} (exit={recorded[0].get('exit_code')})")
                             req_ok = False
                         continue
                 recheck_of = None
@@ -1542,8 +1550,16 @@ RULES:
                 check = checks[0]
                 status = "SATISFIED" if check.passed else "FAILED"
                 self._record_criterion(
-                    project_id, req.id, cid, status, command, check.exit_code, check.output_tail,
-                    sha, revision, recheck_of=recheck_of,
+                    project_id,
+                    req.id,
+                    cid,
+                    status,
+                    command,
+                    check.exit_code,
+                    check.output_tail,
+                    sha,
+                    revision,
+                    recheck_of=recheck_of,
                 )
                 if not check.passed:
                     problems.append(f"criterion {cid} failed: {command} (exit={check.exit_code})")
@@ -1643,13 +1659,18 @@ RULES:
         self, project_id: str, requirement_id: str, criterion_id: str, sha: str, plan_revision: int = 0
     ) -> None:
         self._record_criterion(
-            project_id, requirement_id, criterion_id, "WAIVED", "", None, "authorized waiver",
-            sha, plan_revision,
+            project_id,
+            requirement_id,
+            criterion_id,
+            "WAIVED",
+            "",
+            None,
+            "authorized waiver",
+            sha,
+            plan_revision,
         )
 
-    async def _evidence_gate_findings(
-        self, project_id: str, plan: ProductPlan, repo: Path, sha: str
-    ) -> list[str]:
+    async def _evidence_gate_findings(self, project_id: str, plan: ProductPlan, repo: Path, sha: str) -> list[str]:
         """Canonical artifact-evidence evaluation for the delivery candidate."""
         import json as _json
 
@@ -1738,7 +1759,7 @@ RULES:
         return problems
 
     # -- acceptance + delivery ---------------------------------------------
-    async def _run_acceptance_locked(self, project_id: str) -> dict[str, Any]:
+    async def _run_acceptance_locked(self, project_id: str, *, recheck: bool = False) -> dict[str, Any]:
         row = self.db.get("product_projects", project_id)
         plan = self._current_plan(project_id)
         if not row or plan is None:
@@ -1776,9 +1797,13 @@ RULES:
                             from .provenance import ACTOR_SYSTEM, record_write
 
                             record_write(
-                                self.db, run_id=None, product_project_id=project_id,
-                                actor_type=ACTOR_SYSTEM, actor_detail="final acceptance checkpoint",
-                                base_sha=st.head, result_sha=sha,
+                                self.db,
+                                run_id=None,
+                                product_project_id=project_id,
+                                actor_type=ACTOR_SYSTEM,
+                                actor_detail="final acceptance checkpoint",
+                                base_sha=st.head,
+                                result_sha=sha,
                             )
                         except Exception:
                             logger.debug("acceptance checkpoint provenance failed", exc_info=True)
@@ -1788,7 +1813,12 @@ RULES:
                 sha = sha or st.head
                 info = await inspect_workspace(repo)
                 report = await run_verification(
-                    info, self.db, self.events, "", repo, sha=sha,
+                    info,
+                    self.db,
+                    self.events,
+                    "",
+                    repo,
+                    sha=sha,
                     product_project_id=project_id,
                 )
                 verify_ok = report.all_passed
@@ -1798,7 +1828,9 @@ RULES:
                     findings.append(f"toolchain verification failed:\n{report.summary()}")
                 # 3b. Criterion-level acceptance against the accepted SHA.
                 if sha and not findings:
-                    findings.extend(await self._evaluate_requirement_criteria_locked(project_id, plan, repo, sha))
+                    findings.extend(
+                        await self._evaluate_requirement_criteria_locked(project_id, plan, repo, sha, force=recheck)
+                    )
                 # 3c. Unresolved requirement/correctness findings block delivery.
                 if not findings:
                     findings.extend(self._blocking_findings_locked(project_id))
@@ -1942,7 +1974,13 @@ RULES:
                 if not ok:
                     return _record_fresh("failed", install_note, [])
             report = await run_verification(
-                info, self.db, self.events, "", clone, sha=sha, kind="fresh-toolchain",
+                info,
+                self.db,
+                self.events,
+                "",
+                clone,
+                sha=sha,
+                kind="fresh-toolchain",
                 product_project_id=project_id,
             )
             detail = f"{install_note}; {report.summary()}"
@@ -1971,10 +2009,18 @@ RULES:
                             "",
                         )
                         self._record_criterion(
-                            project_id, req_id, check.criterion_id,
+                            project_id,
+                            req_id,
+                            check.criterion_id,
                             "SATISFIED" if check.passed else "FAILED",
-                            check.command, check.exit_code, check.output_tail or "", sha, revision,
-                            context="fresh", capability="REPLAYABLE", update_cache=False,
+                            check.command,
+                            check.exit_code,
+                            check.output_tail or "",
+                            sha,
+                            revision,
+                            context="fresh",
+                            capability="REPLAYABLE",
+                            update_cache=False,
                         )
                     failed_replay = [c for c in fresh_checks if not c.passed]
                     if failed_replay:
@@ -1999,6 +2045,7 @@ RULES:
         criteria = self.db.query("SELECT * FROM criterion_results WHERE project_id=?", (project_id,))
         waivers = self.db.query("SELECT * FROM acceptance_waivers WHERE project_id=?", (project_id,))
         review_notes: list[str] = []
+        review_attempts: list[dict[str, Any]] = []
         for phase in phases:
             mission_id = phase.get("mission_id")
             if not mission_id:
@@ -2006,6 +2053,22 @@ RULES:
             rows = self.db.query("SELECT severity, description FROM review_findings WHERE mission_id=?", (mission_id,))
             for f in rows:
                 review_notes.append(f"[{phase['phase_key']}/{f['severity']}] {f['description']}")
+            for rev in self.db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at ASC", (mission_id,)):
+                try:
+                    _writers = json.loads(rev.get("writer_set_json") or "[]")
+                    _writers = _writers if isinstance(_writers, list) else []
+                except Exception:
+                    _writers = []
+                review_attempts.append(
+                    {
+                        "phase_key": phase["phase_key"],
+                        "reviewer": rev.get("review_provider"),
+                        "independent": bool(rev.get("independent")),
+                        "reviewed_base_sha": rev.get("reviewed_base_sha"),
+                        "reviewed_head_sha": rev.get("reviewed_head_sha"),
+                        "writer_set": _writers,
+                    }
+                )
         test_summary: list[str] = []
         recent = self.db.query(
             "SELECT type, payload FROM events WHERE type IN ('TEST_PASSED','TEST_FAILED')"
@@ -2053,6 +2116,51 @@ RULES:
             "git_sha": sha,
             "repo_path": str(repo) if repo else "",
             "review_notes": review_notes[:100],
+            "review_attempts": review_attempts,
+            "writers": sorted(
+                {
+                    w["provider"]
+                    for w in self.db.query(
+                        "SELECT DISTINCT provider FROM write_provenance WHERE product_project_id=?"
+                        " AND actor_type='PROVIDER' AND provider IS NOT NULL",
+                        (project_id,),
+                    )
+                    if w.get("provider")
+                }
+                | {
+                    w["provider"]
+                    for phase in phases
+                    for w in self.db.query(
+                        "SELECT DISTINCT provider FROM write_provenance WHERE mission_id=?"
+                        " AND actor_type='PROVIDER' AND provider IS NOT NULL",
+                        (phase.get("mission_id") or "",),
+                    )
+                    if w.get("provider")
+                }
+            ),
+            "verification_sha": next(
+                (
+                    v["sha"]
+                    for v in self.db.query(
+                        "SELECT sha FROM verification_attempts WHERE product_project_id=? AND status='passed'"
+                        " ORDER BY finished_at DESC LIMIT 1",
+                        (project_id,),
+                    )
+                ),
+                None,
+            ),
+            "fresh_checkout_sha": next(
+                (
+                    f["sha"]
+                    for f in self.db.query(
+                        "SELECT sha FROM fresh_checkout_attempts WHERE project_id=? AND status='passed'"
+                        " ORDER BY created_at DESC LIMIT 1",
+                        (project_id,),
+                    )
+                ),
+                None,
+            ),
+            "plan_revision": int((self.db.get("product_projects", project_id) or {}).get("plan_revision") or 0),
             "recent_toolchain": test_summary[:50],
             "human_gates": [
                 {"title": g["title"], "status": g["status"], "resolution": g.get("resolution")} for g in gates
@@ -2080,7 +2188,7 @@ RULES:
         )
         return "\n".join(parts)
 
-    async def run_acceptance(self, project_id: str) -> dict[str, Any]:
+    async def run_acceptance(self, project_id: str, *, recheck: bool = False) -> dict[str, Any]:
         async with self._advance_lock:
             row = self.db.get("product_projects", project_id)
             if not row:
@@ -2097,7 +2205,7 @@ RULES:
                     project_id,
                     {"state": ProductStatus.FINAL_ACCEPTANCE.value, "updated_at": utcnow()},
                 )
-            return await self._run_acceptance_locked(project_id)
+            return await self._run_acceptance_locked(project_id, recheck=recheck)
 
     # -- recovery ----------------------------------------------------------
     async def recover(self) -> None:

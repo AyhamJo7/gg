@@ -87,6 +87,10 @@ class WaiverRequest(BaseModel):
     actor: str = "operator"
 
 
+class AdoptChangesRequest(BaseModel):
+    message: str = "human: adopt workspace changes"
+
+
 def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
     for key in ("providers_used", "providers_failed", "choices", "payload", "command"):
         if isinstance(row.get(key), str):
@@ -337,6 +341,29 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             raise HTTPException(409, str(exc)) from exc
         return {"status": "resolved"}
 
+    @app.post("/api/missions/{mission_id}/adopt-changes")
+    async def adopt_mission_changes(mission_id: str, req: AdoptChangesRequest) -> dict[str, Any]:
+        """Explicitly checkpoint unattributed workspace changes as HUMAN_OPERATOR.
+
+        Never automatic: the operator adopts, GG records provenance. After
+        adoption the new SHA still needs independent review/verification —
+        adoption never certifies correctness.
+        """
+        from ..provenance import adopt_head_as_human
+
+        mission = orchestrator.db.get("missions", mission_id)
+        if not mission:
+            raise HTTPException(404, "mission not found")
+        project = orchestrator.db.get("projects", mission.get("project_id", ""))
+        if not project:
+            raise HTTPException(404, "project not found")
+        result = await adopt_head_as_human(
+            orchestrator.db, Path(project["path"]), mission_id=mission_id, message=req.message
+        )
+        if result.get("error"):
+            raise HTTPException(409, str(result["error"]))
+        return result
+
     # ---------------- product lifecycle (idea-to-product) ----------------
     @app.get("/api/product-projects")
     def list_product_projects() -> list[dict[str, Any]]:
@@ -475,9 +502,11 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return result
 
     @app.post("/api/product-projects/{project_id}/acceptance")
-    async def run_product_acceptance(project_id: str) -> dict[str, Any]:
+    async def run_product_acceptance(project_id: str, recheck: bool = False) -> dict[str, Any]:
+        """Run acceptance. recheck=true forces new criterion attempts (P-14)
+        instead of reusing valid cached evidence; history is preserved."""
         try:
-            return await orchestrator.coordinator.run_acceptance(project_id)
+            return await orchestrator.coordinator.run_acceptance(project_id, recheck=recheck)
         except KeyError:
             raise HTTPException(404, "product project not found") from None
 
@@ -1104,6 +1133,73 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         if not row:
             raise HTTPException(404, "operation not found")
         return dict(row)
+
+    @app.get("/api/product-projects/{project_id}/evidence")
+    async def get_product_evidence(project_id: str) -> dict[str, Any]:
+        """Read-only artifact evidence status for the delivery candidate.
+
+        Candidate = delivery_sha when DELIVERED, else the working-tree HEAD.
+        Never executes providers, checkouts, or tests.
+        """
+        from ..provenance import EvidenceInputs, PhaseCandidate, evaluate_artifact_evidence
+
+        product = orchestrator.db.get("product_projects", project_id)
+        if not product:
+            raise HTTPException(404, "product project not found")
+        target_id = product.get("target_project_id")
+        target = orchestrator.db.get("projects", target_id) if target_id else None
+        repo = Path(target["path"]) if target else None
+        candidate: str | None = product.get("delivery_sha")
+        if not candidate and repo is not None and repo.exists():
+            head = await git_ops.head_sha(repo)
+            candidate = head
+        if not candidate:
+            return {
+                "candidate_sha": None,
+                "delivery_ready": False,
+                "blocking_reasons": ["no candidate SHA (no delivery and no repository HEAD)"],
+            }
+        phases: list[PhaseCandidate] = []
+        for phase in orchestrator.db.query(
+            "SELECT * FROM project_phases WHERE project_id=? ORDER BY created_at ASC", (project_id,)
+        ):
+            evidence: dict[str, Any] = {}
+            try:
+                raw = phase.get("evidence_json") or "{}"
+                evidence = json.loads(raw) if isinstance(raw, str) else {}
+            except json.JSONDecodeError:
+                evidence = {}
+            phases.append(
+                PhaseCandidate(
+                    phase_id=str(phase["id"]),
+                    phase_key=str(phase.get("phase_key", "")),
+                    candidate_sha=evidence.get("git_head"),
+                    mission_id=phase.get("mission_id"),
+                )
+            )
+        oldest_base: str | None = None
+        first_writes = orchestrator.db.query(
+            "SELECT base_sha FROM write_provenance WHERE product_project_id=? AND base_sha IS NOT NULL"
+            " ORDER BY created_at ASC LIMIT 1",
+            (project_id,),
+        )
+        if first_writes:
+            oldest_base = first_writes[0].get("base_sha")
+        revision = int(product.get("plan_revision") or 0)
+        status = await evaluate_artifact_evidence(
+            orchestrator.db,
+            EvidenceInputs(
+                project_id=project_id,
+                candidate_sha=candidate,
+                plan_revision=revision,
+                repo=repo,
+                phases=phases,
+                oldest_base_sha=oldest_base,
+            ),
+        )
+        status["acceptance_state"] = product.get("acceptance_state")
+        status["delivery_sha"] = product.get("delivery_sha")
+        return status
 
     @app.post("/api/operations/{operation_id}/cancel")
     async def cancel_operation(operation_id: str) -> dict[str, Any]:
