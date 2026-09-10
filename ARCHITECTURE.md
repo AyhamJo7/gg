@@ -111,10 +111,17 @@ include/compact/omit decisions persisted as manifest metadata (no raw prompt
 or secret text). Reviewer prompts exclude implementer self-assessment;
 repairer prompts carry only the current defect contract. Mandatory blocks
 (requirements, acceptance, safety) can never be silently dropped — overflow
-fails instead. Mode is configurable (`context.mode`: `compiled` default,
-`legacy` for the `legacy-v1` baseline, `shadow` to measure compiled while
-executing legacy). `backend/scripts/compare_context.py` replays representative
-roles without providers to compare legacy vs compiled sizes.
+fails instead. Mode contract (`context.mode`): `compiled` (default) is
+strict — compilation failure blocks provider execution and the owning
+mission/task/operation records `CONTEXT_COMPILATION_FAILED` (no fake run, no
+lease, no health change); `legacy` executes `legacy-v1` without compiling;
+`shadow` measures the compiled candidate but always executes legacy exactly
+once, with `SHADOW_COMPILATION_FAILED` recorded observably on failure.
+`backend/scripts/compare_context.py` replays representative roles without
+providers. Honest sizing: compiled-v2 bounds growing/repetitive context and
+restores missing task contracts — small under-specified legacy prompts may
+become larger (required correctness context added), while long-history repair
+prompts shrink; there is no universal savings percentage.
 GG prompt estimates and provider-observed usage are separate metrics; quota and
 cost are not inferred.
 

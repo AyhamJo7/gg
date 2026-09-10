@@ -41,5 +41,7 @@ independence. Label token estimates and unknown usage honestly; CLI token counts
 are not quota remaining or a subscription bill. Never inspect unrelated sessions.
 Treat mapped acceptance criteria as authoritative for the assigned task; do not
 duplicate long architecture text in reports. Provider prompts are compiled by
-`context_compiler.py` (`compiled` default, `legacy`/`shadow` via `context.mode`
-for comparison) — change role policies there, not in ad hoc string builders.
+`context_compiler.py` (`compiled` default and strict — compilation failure
+blocks provider execution with no silent legacy fallback; `legacy`/`shadow`
+via `context.mode` for comparison) — change role policies there, not in ad hoc
+string builders.
