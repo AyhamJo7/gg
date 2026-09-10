@@ -206,7 +206,7 @@ def test_backend_sigkill_mid_run_recovers_without_duplicates(tmp_path: Path):
             )
             assert all(r["n"] <= 1 for r in unfinished), f"duplicate active runs: {unfinished}"
 
-            m = httpx.get(f"{base2}/api/missions/{mid}", timeout=10).json()
+            m = httpx.get(f"{base2}/api/missions/{mid}", headers=auth, timeout=10).json()
             assert m["status"] not in ("COMPLETED", "FAILED"), m["status"]
             httpx.post(f"{base2}/api/missions/{mid}/cancel", headers=auth, timeout=10)
         finally:

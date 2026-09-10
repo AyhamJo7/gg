@@ -17,9 +17,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
+import socket
+import subprocess
+import sys
+import time
 from pathlib import Path
 
+import httpx
 import pytest
 
 from orchestrator.sandbox import build_sandboxed_argv, run_sandboxed, sandbox_available
@@ -309,3 +315,107 @@ async def test_cargo_workspace_member_escape_is_contained(tmp_path: Path):
     assert result.exit_code != 0, "build should fail cleanly (dependency not found), never escape"
     assert not (repo / "MARKER_ESCAPED").exists()
     assert not (outside / "MARKER_ESCAPED").exists()
+
+
+# -- round-10 regression: network-enabled sandbox cannot read the ------------
+# -- orchestrator's own API even though it can reach 127.0.0.1 -------------
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_health(port: int, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if httpx.get(f"http://127.0.0.1:{port}/api/health", timeout=2.0).status_code == 200:
+                return
+        except Exception:
+            time.sleep(0.3)
+    raise TimeoutError("backend never became healthy")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="spawns a real subprocess server")
+def test_network_enabled_sandbox_cannot_read_orchestrator_api(tmp_path: Path):
+    """Round-10 regression for the proven finding: allow_network=True puts the
+    sandboxed process in the *host's* network namespace (bwrap has no
+    per-destination firewall), so it can reach 127.0.0.1:<port> — including
+    the orchestrator's own API, live for the whole install step. Proven
+    exploitable pre-fix: an unauthenticated GET returned real cross-project
+    data because GET routes were exempt from the bearer-token check. The fix
+    was requiring the token on GET too (see api/auth.py's module docstring),
+    not trying to firewall the sandbox's network access (bwrap can't).
+
+    Reconstructs that exact proof through the real production pieces: a real
+    spawned backend (real AuthMiddleware, real seeded project data) and the
+    real `run_sandboxed(..., allow_network=True)` primitive `_install` uses —
+    confirms the sandboxed process can still reach the port (network isn't
+    blocked) but gets 401, not the seeded project's data.
+    """
+    backend_root = Path(__file__).resolve().parents[1]
+    db = tmp_path / "server" / "srv.db"
+    db.parent.mkdir(parents=True)
+    port = _free_port()
+    log = tmp_path / "server.log"
+    venv_python = backend_root / ".venv" / "bin" / "python"
+    binary = str(venv_python) if venv_python.exists() else sys.executable
+    env = dict(os.environ, PYTHONPATH=str(backend_root / "src"))
+    proc = subprocess.Popen(
+        [
+            binary,
+            str(backend_root / "tests" / "helpers" / "isolated_server.py"),
+            str(db),
+            str(port),
+            str(tmp_path / "home"),
+        ],
+        env=env,
+        stdout=open(log, "ab"),
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        _wait_health(port)
+        token = (db.parent / "auth_token").read_text().strip()
+        auth = {"Authorization": f"Bearer {token}"}
+        seeded = tmp_path / "seeded-secret-project"
+        seeded.mkdir()
+        created = httpx.post(
+            f"http://127.0.0.1:{port}/api/projects", json={"path": str(seeded)}, headers=auth, timeout=10
+        )
+        assert created.status_code in (200, 201), created.text
+
+        repo = tmp_path / "install-sandbox-repo"
+        repo.mkdir()
+        probe = (
+            "import json, urllib.request, pathlib\n"
+            f"req = urllib.request.Request('http://127.0.0.1:{port}/api/projects')\n"
+            "try:\n"
+            "    with urllib.request.urlopen(req, timeout=5) as r:\n"
+            "        status, body = r.status, r.read().decode()\n"
+            "except urllib.error.HTTPError as e:\n"
+            "    status, body = e.code, e.read().decode()\n"
+            "pathlib.Path('result.json').write_text(json.dumps({'status': status, 'body': body}))\n"
+        )
+        (repo / "probe.py").write_text(probe)
+
+        result = asyncio.run(run_sandboxed(["python3", "probe.py"], repo, timeout_s=15, allow_network=True))
+        assert result.exit_code == 0, result.combined_tail
+
+        captured = json.loads((repo / "result.json").read_text())
+        # Reachable at all (proves this isn't accidentally passing because
+        # the network really is blocked — allow_network genuinely allows
+        # loopback, matching the reviewer's proof).
+        assert captured["status"] != 0
+        # ...but unauthorized, not real data.
+        assert captured["status"] == 401, captured
+        assert str(seeded) not in captured["body"]
+        assert "detail" in json.loads(captured["body"])
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
