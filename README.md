@@ -75,6 +75,9 @@ outcome, prompt manifest (`~N estimated` via `char4-v1`), usage provenance
 and lease-owned cancellation/recovery. Inspect runs at `/api/runs`,
 `/api/runs/{id}`, `/api/runs/{id}/context`, and `/api/analytics/usage`; the UI
 Run Inspector shows the same without ever rendering unknown as zero.
+Artifact evidence (writers, exact-SHA review/verification/criteria/fresh
+status, delivery readiness) is read-only at
+`/api/product-projects/{id}/evidence` and in the Lifecycle delivery tab.
 
 ## Development and documentation
 

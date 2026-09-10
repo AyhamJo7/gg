@@ -134,6 +134,29 @@ repeated-context ratio, compilation warnings; legacy vs compiled), plus
 `/api/runs` inspection with a read-only Context view (blocks, budget, omissions,
 warnings — never raw prompts); unknown telemetry is shown as unknown, never zero.
 
+## Artifact evidence and writer provenance
+
+Every code-affecting checkpoint is linked to its producer in
+`write_provenance` (provider run + base/result SHA, or HUMAN_OPERATOR / SYSTEM /
+UNKNOWN_EXTERNAL). Provider runs carry `retry_of_run_id` chains; roadmap phases
+keep immutable `project_phase_attempts` while `project_phases` holds the current
+pointer. Each review attempt is bound to its exact reviewed range
+(`reviews.reviewed_base/head_sha` + writer set); findings keep origin and
+verified-resolution lineage as their status evolves. Reviewer independence means
+reviewer outside the full code-writer set (planning/testing bookkeeping is
+tracked but does not taint independence); otherwise review is recorded degraded,
+never certified. Verification, criterion, and fresh-checkout executions persist
+as immutable SHA-bound attempts (`verification_attempts`, `criterion_attempts`,
+`fresh_checkout_attempts`); criteria are additionally bound to plan revision,
+with explicit RECHECK creating new attempts instead of reusing cache.
+`GET /api/product-projects/{id}/evidence` evaluates one candidate SHA
+(review/verification/criteria/fresh/writers) and product delivery requires all
+of them to cover exactly the delivery SHA — any post-evidence change makes
+prior evidence stale and blocks delivery. Dirty workspaces block code-writing
+runs before execution; pre-existing dirt is checkpointed as HUMAN_OPERATOR at
+mission start; the operator can explicitly adopt later dirt via
+`POST /api/missions/{id}/adopt-changes` (adoption never certifies correctness).
+
 Under `make dev`, database/token files live in `backend/.orchestrator/`. Paths are
 cwd-relative; desktop launch can use a different state directory. Verification
 uses Linux bubblewrap and fails closed; dependency installation enables network

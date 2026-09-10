@@ -15,6 +15,10 @@ operations, and workspace escape.
 - Process groups with SIGTERM→SIGKILL escalation and tree cleanup — no zombies.
 - Full raw stdout/stderr captured to `<project>/.orchestrator/logs/`;
   streamed lines and events pass through redaction.
+- Provenance/evidence records carry IDs, SHAs, statuses, and bounded
+  summaries only — never credentials, raw prompts, secret env values, or
+  provider session contents. Evidence APIs are project-scoped; unknown
+  provenance is reported UNKNOWN, never guessed or backfilled.
 
 ### Workspace safety
 - `validate_workspace_path`: must exist, be a directory, and not be `$HOME` or `/`.

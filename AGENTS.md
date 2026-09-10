@@ -44,4 +44,8 @@ duplicate long architecture text in reports. Provider prompts are compiled by
 `context_compiler.py` (`compiled` default and strict — compilation failure
 blocks provider execution with no silent legacy fallback; `legacy`/`shadow`
 via `context.mode` for comparison) — change role policies there, not in ad hoc
-string builders.
+string builders. Do not claim verification for a SHA different from the
+candidate being delivered. After any code-writing repair, independent review
+of the new candidate is required. Never attribute pre-existing workspace
+changes to the current provider run. Preserve failed/retried attempts as
+history; delivery evidence is evaluated per exact SHA via `provenance.py`.
