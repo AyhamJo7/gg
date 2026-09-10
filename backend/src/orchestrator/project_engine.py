@@ -997,6 +997,17 @@ RULES:
                 "updated_at": utcnow(),
             },
         )
+        # Immutable attempt lineage (P-18): the phase row keeps the current
+        # pointer, but every attempt stays queryable with its own mission.
+        try:
+            from .provenance import begin_phase_attempt
+
+            begin_phase_attempt(
+                self.db, phase["id"], mission["id"],
+                trigger="INITIAL" if attempts <= 1 else "PHASE_RETRY",
+            )
+        except Exception:
+            logger.debug("phase attempt insert failed for %s", phase["id"], exc_info=True)
         self.events.publish(
             EventType.PRODUCT_PHASE_STARTED,
             mission["id"],
@@ -1026,6 +1037,18 @@ RULES:
                     "updated_at": utcnow(),
                 },
             )
+            try:
+                from .provenance import finish_phase_attempt
+
+                _open = self.db.query(
+                    "SELECT id FROM project_phase_attempts WHERE phase_id=? AND mission_id=?"
+                    " ORDER BY attempt_number DESC LIMIT 1",
+                    (phase["id"], mission["id"]),
+                )
+                if _open:
+                    finish_phase_attempt(self.db, _open[0]["id"], "COMPLETED", result_sha=mission.get("git_head"))
+            except Exception:
+                logger.debug("phase attempt finish failed for %s", phase["id"], exc_info=True)
             self._mark_requirements_work_completed_locked(project_id, phase, evidence)
             self.events.publish(
                 EventType.PRODUCT_PHASE_COMPLETED,
@@ -1055,6 +1078,18 @@ RULES:
                         "updated_at": utcnow(),
                     },
                 )
+                try:
+                    from .provenance import finish_phase_attempt as _finish_cancelled_attempt
+
+                    _open = self.db.query(
+                        "SELECT id FROM project_phase_attempts WHERE phase_id=? AND mission_id=?"
+                        " ORDER BY attempt_number DESC LIMIT 1",
+                        (phase["id"], mission["id"]),
+                    )
+                    if _open:
+                        _finish_cancelled_attempt(self.db, _open[0]["id"], "CANCELLED")
+                except Exception:
+                    logger.debug("phase attempt finish failed for %s", phase["id"], exc_info=True)
                 return True
             if attempts < max_attempts:
                 # Bounded repair: clear the terminal mission link so the next
@@ -1069,6 +1104,18 @@ RULES:
                         "updated_at": utcnow(),
                     },
                 )
+                try:
+                    from .provenance import finish_phase_attempt as _finish_retry_attempt
+
+                    _open = self.db.query(
+                        "SELECT id FROM project_phase_attempts WHERE phase_id=? AND mission_id=?"
+                        " ORDER BY attempt_number DESC LIMIT 1",
+                        (phase["id"], mission["id"]),
+                    )
+                    if _open:
+                        _finish_retry_attempt(self.db, _open[0]["id"], status)
+                except Exception:
+                    logger.debug("phase attempt finish failed for %s", phase["id"], exc_info=True)
                 return True
             self.db.update(
                 "project_phases",
@@ -1082,6 +1129,18 @@ RULES:
                     "updated_at": utcnow(),
                 },
             )
+            try:
+                from .provenance import finish_phase_attempt as _finish_failed_attempt
+
+                _open = self.db.query(
+                    "SELECT id FROM project_phase_attempts WHERE phase_id=? AND mission_id=?"
+                    " ORDER BY attempt_number DESC LIMIT 1",
+                    (phase["id"], mission["id"]),
+                )
+                if _open:
+                    _finish_failed_attempt(self.db, _open[0]["id"], status)
+            except Exception:
+                logger.debug("phase attempt finish failed for %s", phase["id"], exc_info=True)
             return True
         return False
 

@@ -323,9 +323,9 @@ class MissionEngine:
         # candidate provider-writer set (not merely != last implementer) —
         # repairers join the writer set once they write.
         if role == Role.REVIEW and len(eligible) > 1:
-            from .provenance import mission_provider_writers
+            from .provenance import INDEPENDENCE_ROLES, mission_provider_writers
 
-            writers, _complete = mission_provider_writers(self.db, self.mission_id)
+            writers, _complete = mission_provider_writers(self.db, self.mission_id, INDEPENDENCE_ROLES)
             if not writers:
                 writers = {self._last_provider_for(Role.IMPLEMENTATION)} - {None}
             alternatives = [p for p in eligible if p not in writers]
@@ -1128,12 +1128,43 @@ class MissionEngine:
                 )
                 if repair is None:
                     return False
-                return await self._phase_final_validation()
+                if not await self._phase_final_validation():
+                    return False
+                # Repair changed the artifact: pre-repair review evidence no
+                # longer applies (P-10/P-11). Re-review the repaired SHA
+                # before the mission may complete.
+                return await self._rereview_after_final_repair()
             self._set_status(
                 MissionStatus.UNVERIFIED, blocking_issue=f"verification failed:\n{detail[:800]}", current_provider=None
             )
             return False
         return True
+
+    async def _rereview_after_final_repair(self) -> bool:
+        """Require a fresh independent review of the repaired SHA (P-11).
+
+        No-op when the repair left the reviewed SHA unchanged. Bounded by the
+        existing review loop (repair cycles already incremented); new blockers
+        route through the normal repair path, which revalidates on return.
+        """
+        try:
+            head = await git_ops.head_sha(self.project_path) if self.project_path else None
+        except Exception:
+            head = None
+        try:
+            from .provenance import latest_review_for_mission
+
+            last = latest_review_for_mission(self.db, self.mission_id)
+        except Exception:
+            last = None
+        if not head or not last or last.get("reviewed_head_sha") == head:
+            return True
+        self._set_status(MissionStatus.REVIEWING)
+        ok = await self._phase_review_loop()
+        if not ok:
+            return False
+        # Any further repair revalidates before completion.
+        return await self._phase_final_validation()
 
 
 def request_prompt_safe_command(request: ExecutionRequest) -> list[str]:
