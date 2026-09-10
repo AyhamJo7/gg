@@ -28,6 +28,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 import type {
   Analytics,
+  ContextAnalytics,
   DagDependencyInput,
   DagTaskInput,
   GitState,
@@ -124,6 +125,8 @@ export const api = {
   analytics: () => req<Analytics>("/api/analytics"),
   usageAnalytics: (productProjectId?: string) =>
     req<UsageAnalytics>(`/api/analytics/usage${productProjectId ? `?product_project_id=${productProjectId}` : ""}`),
+  contextAnalytics: (productProjectId?: string) =>
+    req<ContextAnalytics>(`/api/analytics/context${productProjectId ? `?product_project_id=${productProjectId}` : ""}`),
   runs: () => ({
     list: (params?: Record<string, string | number>) => {
       const q = params ? `?${new URLSearchParams(params as Record<string, string>).toString()}` : "";

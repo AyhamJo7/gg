@@ -5,6 +5,7 @@ import { Badge } from "../components/Badge";
 export function AnalyticsPage() {
   const { data } = usePolling(() => api.analytics(), 10000);
   const { data: usage } = usePolling(() => api.usageAnalytics(), 10000);
+  const { data: context } = usePolling(() => api.contextAnalytics(), 10000);
 
   return (
     <div>
@@ -82,6 +83,61 @@ export function AnalyticsPage() {
           </tbody>
         </table>
         {(!usage || usage.by_provider.length === 0) && <p className="muted">No token telemetry captured yet</p>}
+      </div>
+      <div className="card" style={{ marginTop: 12 }}>
+        <h3>Context efficiency (GG prompt estimates, char4-v1)</h3>
+        <p className="muted" style={{ fontSize: 12 }}>
+          {context?.note ?? "GG prompt estimates are distinct from provider-observed usage."}
+        </p>
+        <table>
+          <thead>
+            <tr><th>Policy</th><th>Runs</th><th>Avg est. tokens</th><th>Avg repeated ratio</th></tr>
+          </thead>
+          <tbody>
+            {(context?.by_policy ?? []).map((p) => (
+              <tr key={p.policy}>
+                <td className="mono">{p.policy || "—"}</td>
+                <td className="mono">{p.runs}</td>
+                <td className="mono">{p.avg_estimated_tokens != null ? Math.round(p.avg_estimated_tokens) : "—"}</td>
+                <td className="mono">{p.avg_repeated_ratio != null ? Number(p.avg_repeated_ratio).toFixed(3) : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <table style={{ marginTop: 8 }}>
+          <thead>
+            <tr><th>Role</th><th>Runs</th><th>Avg est. tokens</th><th>Avg repeated ratio</th></tr>
+          </thead>
+          <tbody>
+            {(context?.by_role ?? []).map((p) => (
+              <tr key={p.role}>
+                <td className="mono">{p.role}</td>
+                <td className="mono">{p.runs}</td>
+                <td className="mono">{p.avg_estimated_tokens != null ? Math.round(p.avg_estimated_tokens) : "—"}</td>
+                <td className="mono">{p.avg_repeated_ratio != null ? Number(p.avg_repeated_ratio).toFixed(3) : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {context && (
+          <p className="muted mono" style={{ fontSize: 12 }}>
+            Legacy avg: {context.legacy_avg_estimated_tokens != null ? Math.round(context.legacy_avg_estimated_tokens) : "—"} ·{" "}
+            Compiled avg: {context.compiled_avg_estimated_tokens != null ? Math.round(context.compiled_avg_estimated_tokens) : "—"}
+          </p>
+        )}
+        {context && Object.keys(context.warning_counts).length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            {Object.entries(context.warning_counts).map(([w, n]) => (
+              <div key={w} className="row spread" style={{ padding: "2px 0" }}>
+                <span className="mono" style={{ fontSize: 12 }}>{w}</span>
+                <span className="mono">{n}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {(!context || (context.by_policy.length === 0 && context.by_role.length === 0)) && (
+          <p className="muted">No context manifests yet</p>
+        )}
       </div>
     </div>
   );

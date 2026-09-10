@@ -182,6 +182,21 @@ export interface ProviderRun {
   product_project_id?: string | null;
 }
 
+export interface ContextBlockMeta {
+  block_type: string;
+  block_id: string;
+  source_kind: string;
+  source_ref: string;
+  priority: string;
+  original_chars: number;
+  included_chars: number;
+  estimated_tokens: number;
+  representation: string;
+  included: boolean;
+  reason: string;
+  hash: string;
+}
+
 export interface RunContextManifest {
   run_id: string;
   prompt_chars: number;
@@ -191,6 +206,23 @@ export interface RunContextManifest {
   estimator_id: string;
   prompt_hash: string;
   capture_status: string;
+  schema_version?: string;
+  budget_estimated_tokens?: number | null;
+  used_estimated_tokens?: number | null;
+  remaining_estimated_tokens?: number | null;
+  repeated_context_ratio?: number | null;
+  warnings?: string[];
+  plan_revision?: number | null;
+  blocks?: ContextBlockMeta[];
+}
+
+export interface ContextAnalytics {
+  by_policy: Array<{ policy: string; runs: number; avg_estimated_tokens: number | null; avg_repeated_ratio: number | null }>;
+  by_role: Array<{ role: string; runs: number; avg_estimated_tokens: number | null; avg_repeated_ratio: number | null }>;
+  warning_counts: Record<string, number>;
+  legacy_avg_estimated_tokens: number | null;
+  compiled_avg_estimated_tokens: number | null;
+  note: string;
 }
 
 export interface RunUsage {
