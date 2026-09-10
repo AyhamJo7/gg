@@ -72,3 +72,21 @@ server:
 
 database:
   path: .orchestrator/orchestrator.db
+
+# Deterministic role-specific context compiler (Increment 2).
+# mode: compiled (default) | legacy (v1 baseline) | shadow (measure compiled, execute legacy).
+# Budgets are internal GG prompt targets (estimated tokens via char4-v1),
+# not provider model limits. Unknown provider limits are never fabricated.
+context:
+  mode: compiled
+  default_input_budget_estimate: 16000
+  roles:
+    planner: 20000
+    planning: 20000
+    implementer: 16000
+    implementation: 16000
+    reviewer: 18000
+    review: 18000
+    repairer: 12000
+    repair: 12000
+    testing: 12000

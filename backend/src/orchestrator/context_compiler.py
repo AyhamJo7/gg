@@ -1,0 +1,1472 @@
+"""Deterministic role-specific context compiler (Increment 2).
+
+Compiles structured project state into a budgeted, role-specific prompt
+without any provider call. Default path is fully deterministic; no LLM
+rewrite is performed.
+
+Versions:
+  template compiled-v2, policy context-policy-v2, estimator char4-v1.
+Legacy baseline remains legacy-v1 for controlled comparison.
+
+Legacy prompt inventory (all families now route through this compiler;
+the legacy string is kept as the fallback baseline):
+
+  PRODUCT_PLANNER      product_plan.build_planner_prompt -> project_engine
+                         ._run_planning_provider (stage product_plan) -> planner
+  PRODUCT_PLAN_REPAIR  product_plan.build_plan_repair_prompt -> same -> planner
+  MISSION_PLANNER      engine.ROLE_PROMPTS[PLANNING] + handoff
+                         (stage mission_plan) -> planner
+  DAG_PLANNER          parallel_engine DAG planning prompt (stage dag_plan) -> planner
+  IMPLEMENTER          engine.ROLE_PROMPTS[IMPLEMENTATION] + handoff -> implementer
+  DAG_TASK_IMPLEMENTER parallel_engine._build_task_prompt + dependency_ids
+                         (stage task) -> implementer
+  TESTING_AGENT        engine ROLE_PROMPTS[TESTING] -> testing
+  REVIEWER             ROLE_PROMPTS[REVIEW] + prior-findings context
+                         (+ candidate SHA range when known) -> reviewer
+  REPAIRER             ROLE_PROMPTS[REPAIR] + blocker/verification-failure text
+                         (+ finding_ids) -> repairer
+  FINAL_VALIDATION     deterministic verify.run_verification, no LLM prompt.
+
+FINAL_VALIDATION has no provider prompt by design: objective verification
+stays in sandboxed tools; its failures feed the repairer as evidence.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+from dataclasses import dataclass, field
+from typing import Any
+
+from .security import redact
+
+logger = logging.getLogger(__name__)
+
+TEMPLATE_COMPILED_V2 = "compiled-v2"
+POLICY_COMPILED_V2 = "context-policy-v2"
+TEMPLATE_LEGACY_V1 = "legacy-v1"
+POLICY_LEGACY_V1 = "legacy-v1"
+ESTIMATOR_ID = "char4-v1"
+
+
+# -- taxonomy ---------------------------------------------------------------
+
+
+class BlockType:
+    SYSTEM_INSTRUCTIONS = "SYSTEM_INSTRUCTIONS"
+    TASK_OBJECTIVE = "TASK_OBJECTIVE"
+    PROJECT_SUMMARY = "PROJECT_SUMMARY"
+    PRODUCT_REQUIREMENT = "PRODUCT_REQUIREMENT"
+    ACCEPTANCE_CRITERION = "ACCEPTANCE_CRITERION"
+    ARCHITECTURE_DECISION = "ARCHITECTURE_DECISION"
+    PHASE_CONTEXT = "PHASE_CONTEXT"
+    DEPENDENCY_HANDOFF = "DEPENDENCY_HANDOFF"
+    RELEVANT_CODE = "RELEVANT_CODE"
+    GIT_DIFF = "GIT_DIFF"
+    OPEN_FINDING = "OPEN_FINDING"
+    FAILURE_EVIDENCE = "FAILURE_EVIDENCE"
+    TEST_RESULT = "TEST_RESULT"
+    ENVIRONMENT_CONTRACT = "ENVIRONMENT_CONTRACT"
+    OUTPUT_CONTRACT = "OUTPUT_CONTRACT"
+
+
+class Priority:
+    MANDATORY = "MANDATORY"
+    PREFERRED = "PREFERRED"
+    BUDGET_DEPENDENT = "BUDGET_DEPENDENT"
+    SUMMARY_ONLY = "SUMMARY_ONLY"
+    RETRIEVE_ON_DEMAND = "RETRIEVE_ON_DEMAND"
+    PROHIBITED = "PROHIBITED"
+
+
+class Representation:
+    FULL = "FULL"
+    COMPACT = "COMPACT"
+    REFERENCE = "REFERENCE"
+    OMITTED = "OMITTED"
+
+
+class OmissionReason:
+    NOT_RELEVANT = "NOT_RELEVANT"
+    BUDGET = "BUDGET"
+    PROHIBITED = "PROHIBITED"
+    SUPERSEDED = "SUPERSEDED"
+    REFERENCE_ONLY = "REFERENCE_ONLY"
+
+
+# -- data -------------------------------------------------------------------
+
+
+@dataclass
+class ContextBlock:
+    id: str
+    type: str
+    priority: str
+    content: str
+    source_kind: str = ""
+    source_ref: str = ""
+    required: bool = False
+    summarizable: bool = True
+    reason: str = ""
+    sensitivity: str = "safe"
+    compact_content: str | None = None
+    reference_content: str | None = None
+
+    @property
+    def chars(self) -> int:
+        return len(self.content)
+
+    @property
+    def estimated_tokens(self) -> int:
+        return math.ceil(len(self.content) / 4) if self.content else 0
+
+    def content_hash(self) -> str:
+        return hashlib.sha256(redact(self.content).encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass
+class BlockDecision:
+    block_id: str
+    type: str
+    source_kind: str
+    source_ref: str
+    priority: str
+    original_chars: int
+    included_chars: int
+    estimated_tokens: int
+    representation: str
+    included: bool
+    reason: str
+    hash: str
+
+
+@dataclass
+class ContextCompileSpec:
+    role: str  # planner | implementer | reviewer | repairer | testing | planning
+    stage: str = ""
+    project_id: str | None = None
+    product_project_id: str | None = None
+    project_phase_id: str | None = None
+    mission_id: str | None = None
+    task_id: str | None = None
+    provider: str | None = None
+    base_sha: str | None = None
+    candidate_sha: str | None = None
+    task_objective: str = ""
+    task_title: str = ""
+    task_description: str = ""
+    requirement_ids: list[str] = field(default_factory=list)
+    dependency_ids: list[str] = field(default_factory=list)
+    failure_text: str = ""
+    failure_command: str = ""
+    failure_exit_code: int | None = None
+    finding_ids: list[str] = field(default_factory=list)
+    extra_context: str = ""
+    plan_revision: int | None = None
+    git_diff_summary: str = ""
+    git_files_changed: list[str] = field(default_factory=list)
+    workspace_scope: list[str] = field(default_factory=list)
+    attempt: int = 1
+
+
+@dataclass
+class CompiledContext:
+    prompt: str
+    prompt_hash: str
+    prompt_chars: int
+    prompt_bytes: int
+    prompt_words: int
+    estimated_tokens: int
+    template_version: str = TEMPLATE_COMPILED_V2
+    policy_version: str = POLICY_COMPILED_V2
+    blocks: list[BlockDecision] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    budget_estimated_tokens: int = 16000
+    used_estimated_tokens: int = 0
+    remaining_estimated_tokens: int = 16000
+    repeated_context_ratio: float = 0.0
+    plan_revision: int | None = None
+
+
+class ContextCompileError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+# -- budgets -----------------------------------------------------------------
+
+DEFAULT_BUDGETS: dict[str, int] = {
+    "planner": 20000,
+    "planning": 20000,
+    "implementer": 16000,
+    "implementation": 16000,
+    "reviewer": 18000,
+    "review": 18000,
+    "repairer": 12000,
+    "repair": 12000,
+    "testing": 12000,
+    "default": 16000,
+}
+
+
+def budget_for_role(role: str, config: Any | None = None) -> int:
+    if config is not None:
+        try:
+            raw = config.raw if hasattr(config, "raw") else {}
+            ctx = raw.get("context") or {}
+            roles = ctx.get("roles") or {}
+            if isinstance(roles, dict) and role in roles:
+                return int(roles[role])
+            if isinstance(ctx.get("default_input_budget_estimate"), int):
+                return int(ctx["default_input_budget_estimate"])
+        except Exception:
+            logger.debug("context budget config read failed", exc_info=True)
+    return DEFAULT_BUDGETS.get(role, DEFAULT_BUDGETS["default"])
+
+
+def context_mode(config: Any | None = None) -> str:
+    try:
+        raw: Any = config.raw if config is not None and hasattr(config, "raw") else {}
+        if isinstance(raw, dict):
+            mode = (raw.get("context") or {}).get("mode", "compiled")
+            if mode in ("legacy", "compiled", "shadow"):
+                return str(mode)
+    except Exception:
+        logger.debug("context mode read failed, defaulting to compiled", exc_info=True)
+    return "compiled"
+
+
+# -- projections --------------------------------------------------------------
+
+_summary_cache: dict[tuple[str, int], str] = {}
+
+
+def get_project_summary(db: Any, product_project_id: str) -> tuple[str, int | None]:
+    """Deterministic compact summary derived from current plan revision."""
+    product = db.get("product_projects", product_project_id) if product_project_id else None
+    if not product:
+        return "", None
+    revision = int(product.get("plan_revision") or 0)
+    key = (product_project_id, revision)
+    if key in _summary_cache:
+        return _summary_cache[key], revision
+    plan_rows = db.query(
+        "SELECT plan_json FROM plan_revisions WHERE project_id=? AND revision=? LIMIT 1",
+        (product_project_id, revision),
+    )
+    if not plan_rows:
+        return "", revision
+    try:
+        plan = (
+            json.loads(plan_rows[0]["plan_json"])
+            if isinstance(plan_rows[0]["plan_json"], str)
+            else plan_rows[0]["plan_json"]
+        )
+    except Exception:
+        return "", revision
+    arch = plan.get("architecture") or {}
+    parts = [
+        f"Product: {plan.get('product_name', '')}",
+        f"Goal: {plan.get('goal', '')}",
+        f"Users: {plan.get('users', '')}",
+        f"Stack: backend={arch.get('backend', '')} frontend={arch.get('frontend', '')} db={arch.get('database', '')}",
+        f"Constraints: {'; '.join((plan.get('non_functional') or [])[:4])}",
+    ]
+    summary = "\n".join(p for p in parts if p.strip())
+    _summary_cache[key] = summary
+    return summary, revision
+
+
+def project_requirements(db: Any, product_project_id: str) -> list[dict[str, Any]]:
+    product = db.get("product_projects", product_project_id) if product_project_id else None
+    if not product:
+        return []
+    revision = int(product.get("plan_revision") or 0)
+    rows = db.query(
+        "SELECT plan_json FROM plan_revisions WHERE project_id=? AND revision=? LIMIT 1",
+        (product_project_id, revision),
+    )
+    if not rows:
+        return []
+    try:
+        plan = json.loads(rows[0]["plan_json"]) if isinstance(rows[0]["plan_json"], str) else rows[0]["plan_json"]
+    except Exception:
+        return []
+    reqs = plan.get("requirements") or []
+    return [r for r in reqs if isinstance(r, dict)]
+
+
+def phase_spec(db: Any, phase_id: str | None) -> dict[str, Any] | None:
+    if not phase_id:
+        return None
+    try:
+        row: dict[str, Any] | None = db.get("project_phases", phase_id)
+    except Exception:
+        return None
+    return dict(row) if isinstance(row, dict) else None
+
+
+def mapped_requirements(
+    db: Any, product_project_id: str | None, requirement_ids: list[str], phase_id: str | None = None
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return (mapped req dicts, warnings). Includes globals (non_functional as constraints separately)."""
+    warnings: list[str] = []
+    if not product_project_id:
+        return [], warnings
+    all_reqs = {r.get("id"): r for r in project_requirements(db, product_project_id) if r.get("id")}
+    ids: list[str] = list(requirement_ids)
+    if phase_id:
+        phase = phase_spec(db, phase_id)
+        if phase:
+            try:
+                plan = None
+                product = db.get("product_projects", product_project_id)
+                rev = int((product or {}).get("plan_revision") or 0)
+                rows = db.query(
+                    "SELECT plan_json FROM plan_revisions WHERE project_id=? AND revision=? LIMIT 1",
+                    (product_project_id, rev),
+                )
+                if rows:
+                    raw = rows[0]["plan_json"]
+                    plan = json.loads(raw) if isinstance(raw, str) else raw
+                if plan:
+                    for p in plan.get("phases") or []:
+                        if isinstance(p, dict) and p.get("key") == phase.get("phase_key"):
+                            for rid in p.get("requirement_ids") or []:
+                                if rid not in ids:
+                                    ids.append(rid)
+                            break
+            except Exception:
+                warnings.append("ARCHITECTURE_MAPPING_INFERRED")
+    mapped = [all_reqs[i] for i in ids if i in all_reqs]
+    missing = [i for i in ids if i not in all_reqs]
+    if missing:
+        warnings.append("MISSING_REQUIREMENT_MAPPING")
+    return mapped, warnings
+
+
+def relevant_architecture(
+    db: Any, product_project_id: str | None, requirement_ids: list[str], task_text: str = ""
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Deterministic relevance: global/critical always, scoped by keyword overlap otherwise."""
+    warnings: list[str] = []
+    if not product_project_id:
+        return [], warnings
+    product = db.get("product_projects", product_project_id)
+    if not product:
+        return [], warnings
+    rev = int(product.get("plan_revision") or 0)
+    rows = db.query(
+        "SELECT plan_json FROM plan_revisions WHERE project_id=? AND revision=? LIMIT 1",
+        (product_project_id, rev),
+    )
+    if not rows:
+        return [], warnings
+    try:
+        raw = rows[0]["plan_json"]
+        plan = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return [], warnings
+    arch = plan.get("architecture") or {}
+    decisions = arch.get("decisions") or []
+    haystack = f"{task_text} {' '.join(requirement_ids)}".lower()
+    selected: list[dict[str, str]] = []
+    for d in decisions:
+        if not isinstance(d, dict):
+            continue
+        area = str(d.get("area", ""))
+        choice = str(d.get("choice", ""))
+        rationale = str(d.get("rationale", ""))
+        blob = f"{area} {choice} {rationale}".lower()
+        # Global: auth/security/data/api always relevant; else keyword overlap.
+        is_global = any(k in blob for k in ("auth", "security", "data", "api", "database"))
+        overlaps = any(tok in blob for tok in haystack.split() if len(tok) > 3)
+        if is_global or overlaps or not haystack.strip():
+            selected.append({"area": area, "choice": choice, "rationale": rationale})
+    # Always include top-level stack lines as one decision if present.
+    stack = f"backend={arch.get('backend', '')} frontend={arch.get('frontend', '')} db={arch.get('database', '')}"
+    if stack.strip(" =") and not any(s["area"] == "stack" for s in selected):
+        selected.insert(0, {"area": "stack", "choice": stack, "rationale": ""})
+    if not selected:
+        warnings.append("ARCHITECTURE_MAPPING_INFERRED")
+    return selected[:8], warnings
+
+
+def dependency_handoffs(
+    db: Any, mission_id: str | None, dependency_ids: list[str]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    warnings: list[str] = []
+    handoffs: list[dict[str, Any]] = []
+    if not mission_id or not dependency_ids:
+        return handoffs, warnings
+    for dep_id in dependency_ids:
+        task = db.get("tasks", dep_id)
+        if not task or task.get("mission_id") != mission_id:
+            warnings.append("INVALID_DEPENDENCY_HANDOFF")
+            continue
+        runs = db.query(
+            "SELECT id, git_commit_after, summary FROM provider_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1",
+            (dep_id,),
+        )
+        run = runs[0] if runs else {}
+        branch = db.query("SELECT branch_name FROM task_branches WHERE task_id=? LIMIT 1", (dep_id,))
+        handoffs.append(
+            {
+                "task_id": dep_id,
+                "title": task.get("title", ""),
+                "status": task.get("status", ""),
+                "checkpoint_sha": task.get("checkpoint_after") or run.get("git_commit_after") or "",
+                "branch": branch[0]["branch_name"] if branch else "",
+                "summary": (task.get("summary") or run.get("summary") or "")[:500],
+            }
+        )
+        if not (task.get("checkpoint_after") or run.get("git_commit_after")):
+            warnings.append("DEPENDENCY_CODE_NOT_PRESENT")
+    return handoffs, warnings
+
+
+def open_findings_for_scope(
+    db: Any, mission_id: str | None, files_changed: list[str] | None = None, limit: int = 8
+) -> list[dict[str, Any]]:
+    if not mission_id:
+        return []
+    try:
+        rows: list[dict[str, Any]] = db.query(
+            "SELECT id, severity, category, file, description, recommended_fix FROM review_findings"
+            " WHERE mission_id=? AND status IN ('open','repair_attempted') ORDER BY created_at DESC LIMIT ?",
+            (mission_id, limit * 2),
+        )
+    except Exception:
+        return []
+    if not files_changed:
+        return list(rows[:limit])
+    changed = {f.lower() for f in files_changed}
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for r in rows:
+        f = str(r.get("file") or "").lower()
+        score = 1 if f and any(f in c or c in f for c in changed) else 0
+        sev_boost = {"BLOCKER": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}.get(str(r.get("severity", "")).upper(), 0)
+        scored.append((score * 10 + sev_boost, r))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored[:limit]]
+
+
+def environment_contract(repo_hint: str = "", workspace_scope: list[str] | None = None) -> str:
+    scope = " ".join(workspace_scope or []).lower()
+    lines = ["Environment: local repo; toolchain via repo manifests."]
+    if "frontend" in scope or "node" in repo_hint.lower() or not scope:
+        lines.append("Frontend: npm run <script> (npm only); node <path>.js single file.")
+    if "backend" in scope or "python" in repo_hint.lower() or not scope:
+        lines.append("Backend: pytest <path>, python3 -m {pytest,mypy,ruff}, uv run <inner>.")
+    lines.append("Work only in the assigned workspace; never touch secrets or .env values.")
+    return "\n".join(lines)
+
+
+# -- role policies ------------------------------------------------------------
+
+OUTPUT_CONTRACTS: dict[str, str] = {
+    "planner": "Output exactly one PRODUCT_PLAN_JSON block matching the schema. No prose after it.",
+    "implementer": (
+        "Implement the task contract in the workspace. Run relevant checks. "
+        "End with a one-paragraph summary of files changed and verification."
+    ),
+    "reviewer": (
+        "Output exactly one REVIEW_FINDINGS_JSON line plus optional VERIFIED_FIXED_JSON. No implementation prose."
+    ),
+    "repairer": (
+        "Fix the listed findings only within scope. Rerun failing checks. "
+        "End with a short summary of the fix and evidence."
+    ),
+    "testing": (
+        "Execute the listed scope with the repo toolchain. "
+        "Report failing tests with command, exit code, and short excerpt."
+    ),
+}
+
+SAFE_RULES = (
+    "Work only in the assigned repository/worktree. Do not fabricate results. "
+    "Respect scope. Do not expose secrets. Run verification before claiming success."
+)
+
+
+def build_candidate_blocks(
+    spec: ContextCompileSpec, db: Any, config: Any | None = None
+) -> tuple[list[ContextBlock], dict[str, Any], list[str]]:
+    """Collect candidate blocks per role. Returns (blocks, aux, warnings)."""
+    warnings: list[str] = []
+    blocks: list[ContextBlock] = []
+    aux: dict[str, Any] = {}
+    role = spec.role.lower()
+
+    def add(
+        bid: str,
+        btype: str,
+        priority: str,
+        content: str,
+        *,
+        source_kind: str = "",
+        source_ref: str = "",
+        required: bool = False,
+        summarizable: bool = True,
+        reason: str = "",
+        compact: str | None = None,
+        reference: str | None = None,
+    ) -> None:
+        if not content.strip():
+            return
+        blocks.append(
+            ContextBlock(
+                id=bid,
+                type=btype,
+                priority=priority,
+                content=content,
+                source_kind=source_kind,
+                source_ref=source_ref,
+                required=required,
+                summarizable=summarizable,
+                reason=reason or priority,
+                compact_content=compact,
+                reference_content=reference,
+            )
+        )
+
+    # System instructions: single canonical copy per role (dedup source).
+    role_instruction = {
+        "planner": "You are the product planner. Produce a complete, verifiable product plan.",
+        "implementer": "You are the implementer. Implement exactly the task contract.",
+        "reviewer": "You are an independent reviewer. Judge the candidate against the contract only.",
+        "repairer": "You are the repairer. Fix the listed defects within scope.",
+        "testing": "You are the testing engineer. Execute checks and report evidence.",
+    }.get(role, f"You are the {role} engineer.")
+    add(
+        "sys",
+        BlockType.SYSTEM_INSTRUCTIONS,
+        Priority.MANDATORY,
+        f"{role_instruction} {SAFE_RULES}",
+        source_kind="policy",
+        source_ref=f"role:{role}",
+        required=True,
+        summarizable=False,
+        reason="role authority + safety",
+    )
+
+    if role in ("planner", "planning", "product_planner", "mission_planner", "dag_planner"):
+        summary, rev = get_project_summary(db, spec.product_project_id or "") if spec.product_project_id else ("", None)
+        if spec.task_objective or spec.task_title:
+            add(
+                "objective",
+                BlockType.TASK_OBJECTIVE,
+                Priority.MANDATORY,
+                f"Objective:\n{spec.task_title}\n{spec.task_objective}".strip(),
+                source_kind="spec",
+                source_ref="task_objective",
+                required=True,
+                summarizable=False,
+            )
+        # Planner keeps schema/rules as mandatory (from legacy builder, preserved verbatim path via caller).
+        if spec.extra_context:
+            add(
+                "planner-rules",
+                BlockType.PHASE_CONTEXT,
+                Priority.MANDATORY,
+                spec.extra_context,
+                source_kind="policy",
+                source_ref="planner-schema",
+                required=True,
+                summarizable=False,
+            )
+        if summary:
+            add(
+                "proj-sum",
+                BlockType.PROJECT_SUMMARY,
+                Priority.PREFERRED,
+                summary,
+                source_kind="plan",
+                source_ref=f"plan_rev:{rev}",
+                reason="existing decisions",
+            )
+        aux["plan_revision"] = rev if rev is not None else spec.plan_revision
+        contract = OUTPUT_CONTRACTS.get("planner", OUTPUT_CONTRACTS["implementer"])
+        add(
+            "output",
+            BlockType.OUTPUT_CONTRACT,
+            Priority.MANDATORY,
+            f"OUTPUT CONTRACT\n{contract}",
+            source_kind="policy",
+            source_ref="output:planner",
+            required=True,
+            summarizable=False,
+        )
+        return blocks, aux, warnings
+
+    # Non-planner roles: objective first.
+    objective = f"{spec.task_title}\n{spec.task_description}\n{spec.task_objective}".strip()
+    if objective:
+        add(
+            "objective",
+            BlockType.TASK_OBJECTIVE,
+            Priority.MANDATORY,
+            f"OBJECTIVE / CURRENT TASK\n{objective}",
+            source_kind="task" if spec.task_id else "mission",
+            source_ref=spec.task_id or spec.mission_id or "",
+            required=True,
+            summarizable=False,
+        )
+
+    # Requirement + acceptance projection (mandatory when mapped).
+    mapped, w1 = mapped_requirements(db, spec.product_project_id, spec.requirement_ids, spec.project_phase_id)
+    warnings.extend(w1)
+    aux["mapped_requirement_ids"] = [r.get("id") for r in mapped if r.get("id")]
+    for r in mapped:
+        rid = str(r.get("id", ""))
+        add(
+            f"req-{rid}",
+            BlockType.PRODUCT_REQUIREMENT,
+            Priority.MANDATORY,
+            f"Requirement {rid} — {r.get('title', '')}\n{r.get('description', '')}".strip(),
+            source_kind="plan",
+            source_ref=f"req:{rid}",
+            required=True,
+            summarizable=False,
+        )
+        for a in r.get("acceptance") or []:
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("id", ""))
+            add(
+                f"acc-{aid}",
+                BlockType.ACCEPTANCE_CRITERION,
+                Priority.MANDATORY,
+                f"Acceptance {aid}: {a.get('description', '')}\nVerify: {a.get('verify', '')}".strip(),
+                source_kind="plan",
+                source_ref=f"criterion:{aid}",
+                required=True,
+                summarizable=False,
+            )
+    if spec.requirement_ids and not mapped:
+        warnings.append("MISSING_REQUIREMENT_MAPPING")
+
+    # Architecture projection.
+    arch, w2 = relevant_architecture(db, spec.product_project_id, spec.requirement_ids, objective)
+    warnings.extend(w2)
+    for i, d in enumerate(arch):
+        add(
+            f"arch-{i}",
+            BlockType.ARCHITECTURE_DECISION,
+            Priority.MANDATORY if i == 0 else Priority.PREFERRED,
+            f"Architecture [{d['area']}]: {d['choice']}\n{d['rationale']}".strip(),
+            source_kind="plan",
+            source_ref=f"arch:{d['area']}",
+            required=(i == 0 and role in ("implementer", "reviewer", "repairer")),
+            compact=f"[{d['area']}]: {d['choice']}" if d["choice"] else None,
+        )
+
+    # Phase context (bounded, no full plan JSON).
+    if spec.project_phase_id:
+        phase = phase_spec(db, spec.project_phase_id)
+        if phase:
+            phase_text = f"Phase {phase.get('phase_key', '')} — {phase.get('title', '')}\nGoal: {phase.get('goal', '')}"
+            add(
+                "phase",
+                BlockType.PHASE_CONTEXT,
+                Priority.PREFERRED,
+                phase_text,
+                source_kind="phase",
+                source_ref=str(spec.project_phase_id),
+            )
+
+    # Dependency handoffs (explicit, attributable; never full logs).
+    deps, w3 = dependency_handoffs(db, spec.mission_id, spec.dependency_ids)
+    warnings.extend(w3)
+    aux["dependency_handoffs"] = deps
+    for h in deps:
+        full = (
+            f"Dependency {h['task_id']} ({h['title']}) — {h['status']}\n"
+            f"Checkpoint: {h['checkpoint_sha'] or '(no checkpoint)'}\n"
+            f"Summary: {h['summary'] or '(no summary)'}"
+        )
+        compact = f"{h['task_id']} @ {h['checkpoint_sha'][:8] if h['checkpoint_sha'] else 'no-sha'}: {h['title']}"
+        reference = f"Dependency checkpoint: {h['checkpoint_sha'] or 'unknown'}. Inspect worktree when necessary."
+        add(
+            f"dep-{h['task_id']}",
+            BlockType.DEPENDENCY_HANDOFF,
+            Priority.MANDATORY,
+            full,
+            source_kind="task",
+            source_ref=str(h["task_id"]),
+            required=True,
+            compact=compact,
+            reference=reference,
+        )
+        if not h["checkpoint_sha"]:
+            warnings.append("DEPENDENCY_CODE_NOT_PRESENT")
+
+    # Git context per role (bounded metadata, never full history).
+    if spec.candidate_sha or spec.base_sha:
+        if role == "reviewer":
+            if spec.base_sha and spec.candidate_sha:
+                add(
+                    "git",
+                    BlockType.GIT_DIFF,
+                    Priority.MANDATORY,
+                    f"Candidate range: base={spec.base_sha} candidate={spec.candidate_sha}\n"
+                    f"Files: {', '.join(spec.git_files_changed[:30]) or '(see diff)'}\n"
+                    f"{spec.git_diff_summary[:2000]}".strip(),
+                    source_kind="git",
+                    source_ref=f"{spec.base_sha}..{spec.candidate_sha}",
+                    required=True,
+                    summarizable=False,
+                    reference=f"Diff {spec.base_sha[:8]}..{spec.candidate_sha[:8]}; inspect locally for full hunks.",
+                )
+            else:
+                warnings.append("MODEL_CONTEXT_LIMIT_UNKNOWN")
+        elif role == "repairer":
+            _rel_files = ", ".join(spec.git_files_changed[:20]) or ", ".join(spec.workspace_scope[:20])
+            add(
+                "git",
+                BlockType.GIT_DIFF,
+                Priority.PREFERRED,
+                f"Candidate: {spec.candidate_sha or spec.base_sha or 'unknown'}\n"
+                f"Relevant files: {_rel_files or '(see scope)'}",
+                source_kind="git",
+                source_ref=str(spec.candidate_sha or spec.base_sha or ""),
+            )
+        else:
+            add(
+                "git",
+                BlockType.GIT_DIFF,
+                Priority.BUDGET_DEPENDENT,
+                f"Base: {spec.base_sha or 'unknown'}",
+                source_kind="git",
+                source_ref=str(spec.base_sha or ""),
+                reference=f"Base {(spec.base_sha or '')[:8]}; inspect worktree as needed.",
+            )
+
+    # Findings / failure evidence.
+    if role == "reviewer":
+        findings = open_findings_for_scope(db, spec.mission_id, spec.git_files_changed)
+        # Exclude resolved/unrelated by construction (only open queried, relevance-sorted).
+        for f in findings[:6]:
+            _fix = f.get("recommended_fix", "")
+            add(
+                f"find-{f['id']}",
+                BlockType.OPEN_FINDING,
+                Priority.PREFERRED,
+                f"Open finding [{f['severity']}] {f['id']}: {f['description']} → {_fix}".strip(),
+                source_kind="finding",
+                source_ref=str(f["id"]),
+            )
+        # PROHIBITED: implementer self-assessment never added (enforced by omission).
+    elif role == "repairer":
+        # Only requested/current findings, not all history.
+        if spec.finding_ids and spec.mission_id:
+            try:
+                _placeholders = ",".join("?" for _ in spec.finding_ids)
+                _base = "SELECT id, severity, file, description, recommended_fix FROM review_findings "
+                _sql = _base + "WHERE mission_id=? AND id IN (" + _placeholders + ")"  # noqa: S608
+                rows = db.query(_sql, (spec.mission_id, *spec.finding_ids))  # noqa: S608
+            except Exception:
+                rows = []
+            for f in rows:
+                _desc = f.get("description", "")
+                _rec = f.get("recommended_fix", "")
+                add(
+                    f"find-{f['id']}",
+                    BlockType.OPEN_FINDING,
+                    Priority.MANDATORY,
+                    f"Defect [{f.get('severity', '')}] {f['id']} {f.get('file') or ''}: {_desc} → {_rec}".strip(),
+                    source_kind="finding",
+                    source_ref=str(f["id"]),
+                    required=True,
+                    summarizable=False,
+                )
+        if spec.failure_text:
+            tail = spec.failure_text[-2000:]
+            cmd = f"Command: {spec.failure_command} (exit {spec.failure_exit_code})" if spec.failure_command else ""
+            add(
+                "failure",
+                BlockType.FAILURE_EVIDENCE,
+                Priority.MANDATORY,
+                f"Observed vs expected:\n{tail}\n{cmd}".strip(),
+                source_kind="evidence",
+                source_ref="failure-tail",
+                required=True,
+                summarizable=False,
+            )
+    else:
+        if spec.failure_text:
+            add(
+                "failure",
+                BlockType.FAILURE_EVIDENCE,
+                Priority.PREFERRED,
+                f"Prior failure (bounded tail):\n{spec.failure_text[-1500:]}".strip(),
+                source_kind="evidence",
+                source_ref="failure-tail",
+            )
+
+    # Environment contract (compact, scoped).
+    add(
+        "env",
+        BlockType.ENVIRONMENT_CONTRACT,
+        Priority.PREFERRED,
+        environment_contract("", spec.workspace_scope),
+        source_kind="config",
+        source_ref="toolchain",
+    )
+
+    # Output contract (single, role-specific).
+    contract = OUTPUT_CONTRACTS.get(role, OUTPUT_CONTRACTS["implementer"])
+    add(
+        "output",
+        BlockType.OUTPUT_CONTRACT,
+        Priority.MANDATORY,
+        f"OUTPUT CONTRACT\n{contract}",
+        source_kind="policy",
+        source_ref=f"output:{role}",
+        required=True,
+        summarizable=False,
+    )
+
+    # Code references on demand (never embed large source).
+    if spec.workspace_scope:
+        _scope_full = ", ".join(spec.workspace_scope[:20])
+        add(
+            "code-ref",
+            BlockType.RELEVANT_CODE,
+            Priority.RETRIEVE_ON_DEMAND,
+            f"Relevant scope: {_scope_full}. Inspect files locally as needed; "
+            "do not paste large files into the response.",
+            source_kind="scope",
+            source_ref="workspace_scope",
+            reference=f"Scope: {', '.join(spec.workspace_scope[:10])}",
+        )
+
+    # Plan revision binds all plan-derived context for invalidation.
+    if spec.product_project_id:
+        try:
+            _prod = db.get("product_projects", spec.product_project_id)
+            if _prod is not None:
+                aux["plan_revision"] = int(_prod.get("plan_revision") or 0)
+        except Exception:
+            logger.debug("plan revision lookup failed", exc_info=True)
+    if spec.plan_revision is not None and aux.get("plan_revision") is None:
+        aux["plan_revision"] = spec.plan_revision
+
+    return blocks, aux, warnings
+
+
+# -- budget + render ----------------------------------------------------------
+
+SECTION_HEADINGS = {
+    BlockType.SYSTEM_INSTRUCTIONS: "ROLE AND AUTHORITY",
+    BlockType.TASK_OBJECTIVE: "OBJECTIVE / CURRENT TASK",
+    BlockType.PRODUCT_REQUIREMENT: "REQUIRED BEHAVIOR AND ACCEPTANCE IDS",
+    BlockType.ACCEPTANCE_CRITERION: "REQUIRED BEHAVIOR AND ACCEPTANCE IDS",
+    BlockType.ARCHITECTURE_DECISION: "RELEVANT PROJECT / ARCHITECTURE CONTRACTS",
+    BlockType.DEPENDENCY_HANDOFF: "DEPENDENCY ARTIFACTS",
+    BlockType.GIT_DIFF: "FILES / ALLOWED SCOPE / BASE AND HEAD",
+    BlockType.OPEN_FINDING: "CURRENT EVIDENCE OR FAILURES",
+    BlockType.FAILURE_EVIDENCE: "CURRENT EVIDENCE OR FAILURES",
+    BlockType.PROJECT_SUMMARY: "RELEVANT PROJECT / ARCHITECTURE CONTRACTS",
+    BlockType.PHASE_CONTEXT: "OBJECTIVE / CURRENT TASK",
+    BlockType.ENVIRONMENT_CONTRACT: "VERIFICATION COMMANDS AND EXPECTED OBSERVATIONS",
+    BlockType.OUTPUT_CONTRACT: "OUTPUT CONTRACT",
+    BlockType.RELEVANT_CODE: "FILES / ALLOWED SCOPE / BASE AND HEAD",
+    BlockType.TEST_RESULT: "CURRENT EVIDENCE OR FAILURES",
+}
+
+SECTION_ORDER = [
+    "ROLE AND AUTHORITY",
+    "OBJECTIVE / CURRENT TASK",
+    "REQUIRED BEHAVIOR AND ACCEPTANCE IDS",
+    "RELEVANT PROJECT / ARCHITECTURE CONTRACTS",
+    "DEPENDENCY ARTIFACTS",
+    "FILES / ALLOWED SCOPE / BASE AND HEAD",
+    "CURRENT EVIDENCE OR FAILURES",
+    "CONSTRAINTS / UNKNOWNS / STOP CONDITIONS",
+    "VERIFICATION COMMANDS AND EXPECTED OBSERVATIONS",
+    "OUTPUT CONTRACT",
+]
+
+
+def _select_with_budget(
+    blocks: list[ContextBlock], budget: int
+) -> tuple[list[tuple[ContextBlock, str, str]], list[BlockDecision], list[str], int]:
+    """Return ([(block, representation, text)], decisions, warnings, used_tokens)."""
+    decisions: list[BlockDecision] = []
+    warnings: list[str] = []
+    selected: list[tuple[ContextBlock, str, str]] = []
+    used = 0
+
+    def tokens(text: str) -> int:
+        return math.ceil(len(text) / 4) if text else 0
+
+    # Prohibited never included.
+    live = [b for b in blocks if b.priority != Priority.PROHIBITED]
+    for b in blocks:
+        if b.priority == Priority.PROHIBITED:
+            decisions.append(
+                BlockDecision(
+                    b.id,
+                    b.type,
+                    b.source_kind,
+                    b.source_ref,
+                    b.priority,
+                    b.chars,
+                    0,
+                    0,
+                    Representation.OMITTED,
+                    False,
+                    OmissionReason.PROHIBITED,
+                    b.content_hash(),
+                )
+            )
+
+    # Mandatory first.
+    for b in [x for x in live if x.priority == Priority.MANDATORY]:
+        t = tokens(b.content)
+        if used + t > budget:
+            raise ContextCompileError(
+                "MANDATORY_CONTEXT_OVERFLOW",
+                f"mandatory block {b.id} ({t} est) exceeds remaining budget ({budget - used})",
+            )
+        selected.append((b, Representation.FULL, b.content))
+        used += t
+        decisions.append(
+            BlockDecision(
+                b.id,
+                b.type,
+                b.source_kind,
+                b.source_ref,
+                b.priority,
+                b.chars,
+                b.chars,
+                t,
+                Representation.FULL,
+                True,
+                "included",
+                b.content_hash(),
+            )
+        )
+    # Preferred (+ budget-dependent full, else compact/reference).
+    for b in [x for x in live if x.priority in (Priority.PREFERRED, Priority.BUDGET_DEPENDENT)]:
+        full_t = tokens(b.content)
+        if used + full_t <= budget:
+            selected.append((b, Representation.FULL, b.content))
+            used += full_t
+            decisions.append(
+                BlockDecision(
+                    b.id,
+                    b.type,
+                    b.source_kind,
+                    b.source_ref,
+                    b.priority,
+                    b.chars,
+                    b.chars,
+                    full_t,
+                    Representation.FULL,
+                    True,
+                    "included",
+                    b.content_hash(),
+                )
+            )
+            continue
+        # Try compact then reference.
+        for rep, text in ((Representation.COMPACT, b.compact_content), (Representation.REFERENCE, b.reference_content)):
+            if not text:
+                continue
+            t = tokens(text)
+            if used + t <= budget:
+                selected.append((b, rep, text))
+                used += t
+                decisions.append(
+                    BlockDecision(
+                        b.id,
+                        b.type,
+                        b.source_kind,
+                        b.source_ref,
+                        b.priority,
+                        b.chars,
+                        len(text),
+                        t,
+                        rep,
+                        True,
+                        "compacted",
+                        b.content_hash(),
+                    )
+                )
+                warnings.append("PROMPT_BUDGET_PRESSURE")
+                break
+        else:
+            if b.priority == Priority.PREFERRED and not b.summarizable:
+                # Required-ish preferred without compact variant: keep if mandatory-like? else omit with warning.
+                pass
+            decisions.append(
+                BlockDecision(
+                    b.id,
+                    b.type,
+                    b.source_kind,
+                    b.source_ref,
+                    b.priority,
+                    b.chars,
+                    0,
+                    0,
+                    Representation.OMITTED,
+                    False,
+                    OmissionReason.BUDGET,
+                    b.content_hash(),
+                )
+            )
+            warnings.append("PROMPT_BUDGET_PRESSURE")
+    # Summary-only / retrieve-on-demand → reference form.
+    for b in [x for x in live if x.priority in (Priority.SUMMARY_ONLY, Priority.RETRIEVE_ON_DEMAND)]:
+        text = b.reference_content or b.compact_content
+        if text and used + tokens(text) <= budget:
+            selected.append((b, Representation.REFERENCE, text))
+            used += tokens(text)
+            decisions.append(
+                BlockDecision(
+                    b.id,
+                    b.type,
+                    b.source_kind,
+                    b.source_ref,
+                    b.priority,
+                    b.chars,
+                    len(text),
+                    tokens(text),
+                    Representation.REFERENCE,
+                    True,
+                    OmissionReason.REFERENCE_ONLY,
+                    b.content_hash(),
+                )
+            )
+        else:
+            decisions.append(
+                BlockDecision(
+                    b.id,
+                    b.type,
+                    b.source_kind,
+                    b.source_ref,
+                    b.priority,
+                    b.chars,
+                    0,
+                    0,
+                    Representation.OMITTED,
+                    False,
+                    OmissionReason.REFERENCE_ONLY,
+                    b.content_hash(),
+                )
+            )
+    return selected, decisions, warnings, used
+
+
+def render_prompt(selected: list[tuple[ContextBlock, str, str]]) -> str:
+    grouped: dict[str, list[str]] = {}
+    for block, _rep, text in selected:
+        heading = SECTION_HEADINGS.get(block.type, "OBJECTIVE / CURRENT TASK")
+        grouped.setdefault(heading, []).append(text)
+    parts: list[str] = []
+    for heading in SECTION_ORDER:
+        bodies = grouped.get(heading)
+        if not bodies:
+            continue
+        # Deduplicate identical bodies within a section (single copy).
+        seen: set[str] = set()
+        unique: list[str] = []
+        for body in bodies:
+            h = hashlib.sha256(body.encode()).hexdigest()
+            if h not in seen:
+                seen.add(h)
+                unique.append(body)
+        parts.append(f"## {heading}\n" + "\n\n".join(unique))
+    return "\n\n".join(parts).strip() + "\n"
+
+
+class ContextCompiler:
+    def __init__(self, db: Any = None, config: Any | None = None):
+        self.db = db
+        self.config = config
+
+    def compile(self, spec: ContextCompileSpec) -> CompiledContext:
+        if self.db is None:
+            raise ContextCompileError("MISSING_PLAN_REVISION", "compiler requires a database handle")
+        blocks, aux, warnings = build_candidate_blocks(spec, self.db, self.config)
+        # Prohibited safety net: drop anything secret-shaped (defense in depth; source should never include).
+        safe_blocks: list[ContextBlock] = []
+        for b in blocks:
+            if b.sensitivity == "secret":
+                warnings.append("PROHIBITED")
+                continue
+            safe_blocks.append(b)
+        budget = budget_for_role(spec.role, self.config)
+        try:
+            selected, decisions, w2, used = _select_with_budget(safe_blocks, budget)
+        except ContextCompileError:
+            raise
+        warnings.extend(w2)
+        # Unknown model limits are never fabricated; note when relevant.
+        if not spec.provider:
+            warnings.append("MODEL_CONTEXT_LIMIT_UNKNOWN")
+        prompt = render_prompt(selected)
+        if not prompt.strip():
+            raise ContextCompileError("MISSING_REQUIREMENT_MAPPING", "compiled prompt is empty")
+        # Writer provenance warning when knowable and ambiguous.
+        if spec.role == "reviewer":
+            if not spec.candidate_sha:
+                warnings.append("CANDIDATE_SHA_UNKNOWN")
+            if spec.mission_id:
+                try:
+                    writers = self.db.query(
+                        "SELECT DISTINCT provider FROM provider_runs WHERE mission_id=? AND failure_class='NONE'"
+                        " AND role IN ('implementation','testing','repair')",
+                        (spec.mission_id,),
+                    )
+                    if len(writers) > 2:
+                        warnings.append("WRITER_PROVENANCE_INCOMPLETE")
+                except Exception:
+                    warnings.append("WRITER_PROVENANCE_INCOMPLETE")
+        from .context_manifest import count_words, redacted_hash
+
+        digest, _basis = redacted_hash(prompt)
+        plan_rev = aux.get("plan_revision")
+        if spec.plan_revision is not None:
+            plan_rev = spec.plan_revision
+        # Repeated-context ratio vs previous compiled/legacy prompt for same owner (hash overlap proxy:
+        # fraction of included block hashes seen in the immediately preceding run's manifest).
+        repeated_ratio = 0.0
+        try:
+            prev_ratio = _previous_block_overlap(self.db, spec, decisions)
+            repeated_ratio = prev_ratio
+        except Exception:
+            logger.debug("repeated ratio computation failed", exc_info=True)
+        return CompiledContext(
+            prompt=prompt,
+            prompt_hash=digest,
+            prompt_chars=len(prompt),
+            prompt_bytes=len(prompt.encode("utf-8")),
+            prompt_words=count_words(prompt),
+            estimated_tokens=math.ceil(len(prompt) / 4) if prompt else 0,
+            blocks=decisions,
+            warnings=sorted(set(warnings)),
+            budget_estimated_tokens=budget,
+            used_estimated_tokens=used,
+            remaining_estimated_tokens=max(0, budget - used),
+            repeated_context_ratio=repeated_ratio,
+            plan_revision=plan_rev,
+        )
+
+
+def _previous_block_overlap(db: Any, spec: ContextCompileSpec, decisions: list[BlockDecision]) -> float:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if spec.mission_id:
+        clauses.append("mission_id=?")
+        params.append(spec.mission_id)
+    elif spec.product_project_id:
+        clauses.append("product_project_id=?")
+        params.append(spec.product_project_id)
+    else:
+        return 0.0
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = db.query(
+        f"SELECT id FROM provider_runs {where} ORDER BY started_at DESC LIMIT 1",  # noqa: S608
+        tuple(params),
+    )
+    if not rows:
+        return 0.0
+    manifest = db.get("run_context_manifests", rows[0]["id"], key="run_id")
+    if not manifest or not isinstance(manifest.get("blocks_json"), str):
+        return 0.0
+    try:
+        prev = json.loads(manifest["blocks_json"])
+    except Exception:
+        return 0.0
+    prev_hashes = set()
+    if isinstance(prev, dict):
+        for b in prev.get("blocks", []) or []:
+            if isinstance(b, dict) and b.get("hash"):
+                prev_hashes.add(b["hash"])
+    elif isinstance(prev, list):
+        for b in prev:
+            if isinstance(b, dict) and b.get("hash"):
+                prev_hashes.add(b["hash"])
+    if not prev_hashes:
+        return 0.0
+    included = [d for d in decisions if d.included]
+    if not included:
+        return 0.0
+    overlap_chars = sum(d.included_chars for d in included if d.hash in prev_hashes)
+    total_chars = sum(d.included_chars for d in included)
+    return round(overlap_chars / total_chars, 4) if total_chars else 0.0
+
+
+def should_use_compiled(config: Any | None, role: str | None = None) -> bool:
+    _ = role
+    return context_mode(config) in ("compiled", "shadow")
+
+
+# -- canonical stage/role mapping (one mapping, no divergence) -----------------
+# stage (invocation) -> context role (compiler policy). Both persisted.
+
+STAGE_ROLE_MAP: dict[str, str] = {
+    "product_plan": "planner",
+    "mission_plan": "planner",
+    "dag_plan": "planner",
+    "planning": "planner",
+    "implementation": "implementer",
+    "task": "implementer",
+    "testing": "testing",
+    "review": "reviewer",
+    "repair": "repairer",
+}
+
+
+def role_for_stage(stage: str, role: str) -> str:
+    """Canonical mapping between invocation stage and compiler role."""
+    mapped = STAGE_ROLE_MAP.get(stage, "")
+    if mapped:
+        return mapped
+    return (role or "implementer").lower()
+
+
+# -- optional refinement (disabled by default) ---------------------------------
+# Future LLM prompt refinement stays behind this interface. Default path is
+# deterministic and consumes zero provider quota.
+
+
+class PromptRefiner:
+    enabled = False
+
+    def refine(self, prompt: str, spec: ContextCompileSpec) -> str:
+        raise NotImplementedError("prompt refinement is disabled by default")
+
+
+# -- phase handoffs -------------------------------------------------------------
+# Compact durable handoff derived deterministically from phase/mission state.
+# No full transcript; primarily SHAs, requirement coverage, files, tests.
+
+
+def build_phase_handoff(
+    db: Any,
+    product_project_id: str,
+    phase_id: str,
+) -> dict[str, Any]:
+    phase = phase_spec(db, phase_id)
+    if not phase:
+        return {}
+    mission_id = phase.get("mission_id") or ""
+    mission = db.get("missions", mission_id) if mission_id else None
+    runs = (
+        db.query(
+            "SELECT id, git_commit_after, summary FROM provider_runs "
+            "WHERE mission_id=? ORDER BY started_at DESC LIMIT 3",
+            (mission_id,),
+        )
+        if mission_id
+        else []
+    )
+    candidate_sha = (mission or {}).get("git_head") or (runs[0].get("git_commit_after") if runs else "")
+    try:
+        findings = db.query(
+            "SELECT COUNT(*) as n FROM review_findings WHERE mission_id=? AND status='open'",
+            (mission_id,),
+        )
+        open_findings = int((findings[0].get("n") if findings else 0) or 0)
+    except Exception:
+        open_findings = 0
+    return {
+        "phase_id": phase_id,
+        "phase_key": phase.get("phase_key", ""),
+        "mission_id": mission_id,
+        "candidate_sha": candidate_sha or "",
+        "status": phase.get("status", ""),
+        "open_findings": open_findings,
+    }
+
+
+def resolve_phase_requirements(db: Any, product_project_id: str | None, phase_id: str | None) -> list[str]:
+    """Deterministic requirement projection for a phase (plan revision bound)."""
+    if not product_project_id or not phase_id:
+        return []
+    phase = phase_spec(db, phase_id)
+    if not phase:
+        return []
+    try:
+        product = db.get("product_projects", product_project_id)
+        rev = int((product or {}).get("plan_revision") or 0)
+        rows = db.query(
+            "SELECT plan_json FROM plan_revisions WHERE project_id=? AND revision=? LIMIT 1",
+            (product_project_id, rev),
+        )
+        if not rows:
+            return []
+        raw = rows[0]["plan_json"]
+        plan = json.loads(raw) if isinstance(raw, str) else raw
+        for p in plan.get("phases") or []:
+            if isinstance(p, dict) and p.get("key") == phase.get("phase_key"):
+                return [str(r) for r in (p.get("requirement_ids") or [])]
+    except Exception:
+        logger.debug("phase requirement resolution failed", exc_info=True)
+    return []
+
+
+def task_dependency_ids(db: Any, task_id: str | None) -> list[str]:
+    if not task_id:
+        return []
+    try:
+        rows = db.query("SELECT from_task_id FROM task_dependencies WHERE to_task_id=?", (task_id,))
+        return [str(r["from_task_id"]) for r in rows]
+    except Exception:
+        return []
+
+
+def latest_candidate_shas(db: Any, mission_id: str | None) -> tuple[str | None, str | None]:
+    """Most recent implementation-side commit range for reviewer/repairer specs.
+
+    Returns (base_sha, candidate_sha) or (None, None) when unknown. Fails
+    open: the compiler records MODEL_CONTEXT_LIMIT_UNKNOWN rather than
+    fabricating SHAs.
+    """
+    if not mission_id:
+        return None, None
+    try:
+        rows = db.query(
+            "SELECT git_commit_before, git_commit_after FROM provider_runs WHERE mission_id=?"
+            " AND failure_class='NONE' AND role IN ('implementation','task','testing','repair')"
+            " ORDER BY started_at DESC LIMIT 1",
+            (mission_id,),
+        )
+    except Exception:
+        return None, None
+    if not rows:
+        return None, None
+    return rows[0].get("git_commit_before"), rows[0].get("git_commit_after")
+
+
+def finding_ids_in_text(text: str | None) -> list[str]:
+    """Extract finding IDs (id=<id>) from repair extra_context."""
+    import re
+
+    if not text:
+        return []
+    return re.findall(r"\bid=([A-Za-z0-9_.\-]+)", text)
+
+
+def finding_files(db: Any, mission_id: str | None) -> list[str]:
+    """Files named by open/repair-attempted findings (diff relevance hint)."""
+    if not mission_id:
+        return []
+    try:
+        rows = db.query(
+            "SELECT DISTINCT file FROM review_findings"
+            " WHERE mission_id=? AND status IN ('open','repair_attempted') AND file IS NOT NULL AND file != ''",
+            (mission_id,),
+        )
+    except Exception:
+        return []
+    return [str(r["file"]) for r in rows if r.get("file")][:20]
+
+
+# -- integration helper ----------------------------------------------------------
+# Single choke point for legacy/compiled/shadow selection with safe fallback.
+# Compilation itself consumes zero provider quota; failure never silently
+# launches a degraded prompt.
+
+
+def prepare_invocation_context(
+    *,
+    legacy_prompt: str,
+    spec: ContextCompileSpec,
+    db: Any,
+    config: Any | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Return (prompt_to_execute, invocation_metadata)."""
+    from .context_manifest import CONTEXT_POLICY_LEGACY, TEMPLATE_VERSION_LEGACY
+
+    mode = context_mode(config)
+    if mode == "legacy":
+        return legacy_prompt, {
+            "prompt_template_version": TEMPLATE_VERSION_LEGACY,
+            "context_policy_version": CONTEXT_POLICY_LEGACY,
+            "context_blocks_json": None,
+            "context_warnings_json": "[]",
+            "context_budget": None,
+            "context_used": None,
+            "context_remaining": None,
+            "context_repeated_ratio": None,
+            "context_plan_revision": spec.plan_revision,
+        }
+    try:
+        compiler = ContextCompiler(db, config)
+        # Optional refinement stays disabled; interface preserved for future.
+        compiled = compiler.compile(spec)
+    except ContextCompileError as exc:
+        # Critical missing/overflow blocks the launch; caller must surface.
+        # Non-safety fallback to legacy is explicit and auditable.
+        if exc.code in ("MANDATORY_CONTEXT_OVERFLOW", "MISSING_REQUIREMENT_MAPPING") and legacy_prompt:
+            if exc.code == "MANDATORY_CONTEXT_OVERFLOW":
+                raise
+        logger.warning("context compilation failed (%s), falling back to legacy", exc.code)
+        return legacy_prompt, {
+            "prompt_template_version": TEMPLATE_VERSION_LEGACY,
+            "context_policy_version": CONTEXT_POLICY_LEGACY,
+            "context_blocks_json": None,
+            "context_warnings_json": json.dumps([f"COMPILER_FALLBACK_{exc.code}"]),
+            "context_budget": None,
+            "context_used": None,
+            "context_remaining": None,
+            "context_repeated_ratio": None,
+            "context_plan_revision": spec.plan_revision,
+        }
+    meta: dict[str, Any] = {
+        "prompt_template_version": compiled.template_version,
+        "context_policy_version": compiled.policy_version,
+        "context_blocks_json": blocks_to_json(compiled.blocks),
+        "context_warnings_json": json.dumps(compiled.warnings),
+        "context_budget": compiled.budget_estimated_tokens,
+        "context_used": compiled.used_estimated_tokens,
+        "context_remaining": compiled.remaining_estimated_tokens,
+        "context_repeated_ratio": compiled.repeated_context_ratio,
+        "context_plan_revision": compiled.plan_revision,
+    }
+    if mode == "shadow":
+        # Shadow: measure compiled, execute legacy, record comparison honestly.
+        shadow_warnings = list(compiled.warnings) + ["SHADOW_MODE_LEGACY_EXECUTED"]
+        meta = {
+            "prompt_template_version": TEMPLATE_VERSION_LEGACY,
+            "context_policy_version": CONTEXT_POLICY_LEGACY,
+            "context_blocks_json": None,
+            "context_warnings_json": json.dumps(shadow_warnings + [f"SHADOW_COMPILED_EST={compiled.estimated_tokens}"]),
+            "context_budget": compiled.budget_estimated_tokens,
+            "context_used": compiled.used_estimated_tokens,
+            "context_remaining": compiled.remaining_estimated_tokens,
+            "context_repeated_ratio": compiled.repeated_context_ratio,
+            "context_plan_revision": compiled.plan_revision,
+        }
+        return legacy_prompt, meta
+    return compiled.prompt, meta
+
+
+def blocks_to_json(decisions: list[BlockDecision]) -> str:
+    return json.dumps(
+        [
+            {
+                "block_type": d.type,
+                "block_id": d.block_id,
+                "source_kind": d.source_kind,
+                "source_ref": d.source_ref,
+                "priority": d.priority,
+                "original_chars": d.original_chars,
+                "included_chars": d.included_chars,
+                "estimated_tokens": d.estimated_tokens,
+                "representation": d.representation,
+                "included": d.included,
+                "reason": d.reason,
+                "hash": d.hash,
+            }
+            for d in decisions
+        ]
+    )
