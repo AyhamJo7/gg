@@ -603,3 +603,127 @@ def test_evidence_and_adopt_endpoints(tmp_path: Path, workspace: Path):
         await orch.shutdown()
 
     asyncio.run(main())
+
+
+def test_final_validation_repair_requires_rereview(tmp_path: Path):
+    """P-11/§56: review PASS at A, validation fails, repair creates B,
+    revalidation passes -> a fresh review of B is required before completion."""
+    import json as _json
+
+    from orchestrator.providers.fake import FindingsProvider, WorkspaceWriterProvider
+
+    async def main() -> None:
+        repo = tmp_path / "ws"
+        repo.mkdir()
+        (repo / "package.json").write_text(_json.dumps({"name": "v", "scripts": {"test": "node check.js"}}))
+        (repo / "check.js").write_text(
+            "const fs = require('fs');\n"
+            "const go = JSON.parse(fs.readFileSync('./ready.json', 'utf8')).go === true;\n"
+            "if (!go) { console.error('NOT READY'); process.exit(1); }\n"
+            "console.log('READY_OK');\n"
+        )
+        _git(repo, "init")
+        _git(repo, "config", "user.email", "t@t")
+        _git(repo, "config", "user.name", "t")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-m", "init")
+        adapters = {
+            "fake-impl": FakeAdapter("fake-impl", ["ok", "ok", "ok"]),
+            "fake-rev": FindingsProvider("fake-rev", findings_script=[[], []]),
+            "fake-rep": WorkspaceWriterProvider("fake-rep", filename="ready.json", content='{"go":true}'),
+        }
+        cfg = make_config(providers=["fake-impl", "fake-rev", "fake-rep"])
+        cfg.raw.setdefault("priority", {}).update(
+            {
+                "planning": ["fake-impl"],
+                "implementation": ["fake-impl"],
+                "testing": ["fake-impl"],
+                "review": ["fake-rev"],
+                "repair": ["fake-rep"],
+            }
+        )
+        orch = make_orchestrator(tmp_path, adapters, config=cfg)
+        await orch.registry.detect_all()
+        _seed_project(orch, repo)
+        mission = orch.create_mission("p1", "Gate the release", "make check.js pass", "AUTONOMOUS", "balanced")
+        await _run_mission(orch, mission["id"])
+        db = orch.db
+        assert db.get("missions", mission["id"])["status"] == MissionStatus.COMPLETED.value
+        reviews = db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at ASC", (mission["id"],))
+        assert len(reviews) == 2, f"final-validation repair must trigger re-review, got {len(reviews)}"
+        assert reviews[0]["reviewed_head_sha"] != reviews[1]["reviewed_head_sha"]
+        repairs = db.query("SELECT * FROM provider_runs WHERE mission_id=? AND role='repair'", (mission["id"],))
+        assert len(repairs) == 1
+        assert (
+            reviews[1]["reviewed_head_sha"] == repairs[0]["git_commit_after"]
+            or reviews[1]["reviewed_head_sha"] == db.get("missions", mission["id"])["git_head"]
+        )
+        await orch.shutdown()
+
+    asyncio.run(main())
+
+
+def test_delivered_project_has_complete_sha_evidence(tmp_path: Path):
+    """End-to-end: a DELIVERED product's delivery SHA carries review,
+    verification, criterion, and fresh evidence with complete writers."""
+    import json as _json
+
+    from test_lifecycle import drive_project, standard_adapters, start_planned_project
+    from test_lifecycle import make_orch as _make_lifecycle_orch
+
+    async def main() -> None:
+        orch = await _make_lifecycle_orch(tmp_path, standard_adapters())
+        pid = await start_planned_project(tmp_path, orch)
+        project = await drive_project(orch, pid)
+        assert project["state"] == "DELIVERED", project.get("blocking_reason")
+        sha = project["delivery_sha"]
+        assert sha and len(sha) == 40
+        db = orch.db
+        # Review attempts bound to phase candidates exist and are independent.
+        reviews = db.query(
+            "SELECT r.* FROM reviews r JOIN project_phases p ON p.mission_id=r.mission_id WHERE p.project_id=?",
+            (pid,),
+        )
+        assert reviews, "delivery requires recorded review attempts"
+        assert all(r["independent"] == 1 for r in reviews), "all delivery reviews must be independent"
+        assert all(r["reviewed_head_sha"] for r in reviews)
+        # Verification + fresh attempts at exactly the delivery SHA.
+        assert db.query(
+            "SELECT id FROM verification_attempts WHERE product_project_id=? AND sha=? AND status='passed' LIMIT 1",
+            (pid, sha),
+        ), "verification must cover the delivery SHA"
+        assert db.query(
+            "SELECT id FROM fresh_checkout_attempts WHERE project_id=? AND sha=? AND status='passed' LIMIT 1",
+            (pid, sha),
+        ), "fresh checkout must cover the delivery SHA"
+        # Criteria: workdir pass + fresh replay at the delivery SHA.
+        criteria = db.query("SELECT criterion_id FROM criterion_results WHERE project_id=?", (pid,))
+        assert criteria
+        for c in criteria:
+            row = db.query(
+                "SELECT * FROM criterion_results WHERE project_id=? AND criterion_id=?", (pid, c["criterion_id"])
+            )[0]
+            if row["status"] == "WAIVED":
+                continue
+            assert row["status"] == "SATISFIED"
+            assert row["sha"] == sha
+            fresh_att = db.query(
+                "SELECT id FROM criterion_attempts WHERE project_id=? AND criterion_id=?"
+                " AND checked_sha=? AND result='SATISFIED' AND context='fresh' LIMIT 1",
+                (pid, c["criterion_id"], sha),
+            )
+            assert fresh_att, f"criterion {c['criterion_id']} must be replayed fresh at {sha[:8]}"
+        # Writer provenance complete; delivery report carries it.
+        report = (
+            _json.loads(project["delivery_report"])
+            if isinstance(project["delivery_report"], str)
+            else project["delivery_report"]
+        )
+        assert report["git_sha"] == sha
+        assert report["writers"], "delivery report must name writers"
+        assert report["verification_sha"] == sha
+        assert report["fresh_checkout_sha"] == sha
+        assert report["review_attempts"], "delivery report must list review attempts"
+        await orch.shutdown()
+
+    asyncio.run(main())
