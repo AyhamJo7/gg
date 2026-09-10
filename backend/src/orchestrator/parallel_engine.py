@@ -525,9 +525,15 @@ class ParallelMissionEngine:
         if not report.all_passed:
             failures = [r for r in report.results if not r.passed]
             detail = "\n".join(f"{r.command}: exit={r.exit_code}" for r in failures)
+            environment_issue = bool(failures) and all(r.likely_environment_issue for r in failures)
+            prefix = (
+                "verification could not run due to an environment/tooling issue, not a code defect"
+                if environment_issue
+                else "verification failed"
+            )
             self._set_mission_status(
                 MissionStatus.UNVERIFIED,
-                blocking_issue=f"verification failed:\n{detail[:800]}",
+                blocking_issue=f"{prefix}:\n{detail[:800]}",
             )
             return
 

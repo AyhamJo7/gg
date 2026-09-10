@@ -926,6 +926,24 @@ class MissionEngine:
         if not report.all_passed:
             failures = [r for r in report.results if not r.passed]
             detail = "\n".join(f"{r.command}: exit={r.exit_code}\n{r.tail[-400:]}" for r in failures)
+            # An environment/tooling-provisioning failure (e.g. a package
+            # manager needing network to self-provision inside a sandbox that
+            # deliberately has none) can't be fixed by any code change — no
+            # amount of REPAIR-role attempts against the repo's own source
+            # will make a DNS lookup succeed. Route straight to a clearly
+            # labeled blocking state instead of spending repair cycles (real
+            # provider spawns, real time) on something structurally
+            # unfixable from inside the mission.
+            if failures and all(r.likely_environment_issue for r in failures):
+                self._set_status(
+                    MissionStatus.UNVERIFIED,
+                    blocking_issue=(
+                        "verification could not run due to an environment/tooling issue, "
+                        f"not a code defect — no repair attempt was made:\n{detail[:800]}"
+                    ),
+                    current_provider=None,
+                )
+                return False
             # one automated repair attempt via the repair role before giving up
             cycles = self._mission().repair_cycles
             if cycles < int(self.config.get("orchestration.max_repair_cycles", 3)):

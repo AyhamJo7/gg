@@ -67,6 +67,15 @@ _HOME_TOOLCHAIN_SUBPATHS = (
     ".npm",
     ".cache/uv",
     ".cache/pip",
+    # corepack (bundled with Node, provisions pnpm/yarn on first use) caches
+    # downloaded package managers here; without this bind and the COREPACK_HOME
+    # re-point below, corepack sees an empty cache on every sandboxed run and
+    # tries to fetch the pinned package manager over network — which verify-time
+    # sandboxing deliberately doesn't have. Same bug class as CARGO_HOME/
+    # RUSTUP_HOME/GOPATH below, just for a toolchain none of those rounds'
+    # "legitimate usage" proofs happened to exercise (they tested plain `npm
+    # test`, which doesn't need corepack's provisioning step at all).
+    ".cache/node/corepack",
 )
 
 # Defense in depth on top of the allow-list above, in case a future
@@ -119,14 +128,27 @@ def _resolve_toolchain_binds(home: Path) -> list[Path]:
     return resolved
 
 
-def _build_sandboxed_path(bound_dirs: list[Path]) -> str:
+def _build_sandboxed_path(toolchain_dirs: list[Path]) -> str:
     """Rebuild PATH from only directories actually reachable inside the
     sandbox, instead of forwarding the operator's full host PATH verbatim
     (which would name directories, e.g. version-manager or unrelated tool
     installs, that aren't bound and can only ever fail lookups there —
     unnecessary machine-specific coupling for zero functional benefit).
+
+    `toolchain_dirs` must be toolchain-specific binds ONLY (nvm, cargo/bin,
+    ...) — not the generic `_SYSTEM_RO_DIRS` (`/usr`, `/bin`, ...). Those
+    are placed *before* the fixed `_SYSTEM_BIN_DIRS` fallback, preserving
+    their relative order from the host PATH, so a project's pinned/
+    version-managed toolchain wins over a same-named stray system package
+    (e.g. an apt-installed `nodejs` sharing a machine with nvm). Passing a
+    generic system directory in `toolchain_dirs` defeats this: a host PATH
+    entry under `/usr` (present on essentially every machine, e.g.
+    `/usr/bin` itself) would then compete for priority placement purely on
+    host PATH order, silently reintroducing the shadowing bug this function
+    exists to prevent — caught by a test that put `/usr/bin` before an nvm
+    directory in a synthetic host PATH specifically to catch this.
     """
-    entries: list[str] = list(_SYSTEM_BIN_DIRS)
+    toolchain_entries: list[str] = []
     host_path = os.environ.get("PATH", "")
     for raw in host_path.split(os.pathsep):
         if not raw:
@@ -135,9 +157,9 @@ def _build_sandboxed_path(bound_dirs: list[Path]) -> str:
             candidate = Path(raw).resolve()
         except OSError:
             continue
-        if any(candidate == b or candidate.is_relative_to(b) for b in bound_dirs):
-            if raw not in entries:
-                entries.append(raw)
+        if any(candidate == b or candidate.is_relative_to(b) for b in toolchain_dirs) and raw not in toolchain_entries:
+            toolchain_entries.append(raw)
+    entries = [*toolchain_entries, *(d for d in _SYSTEM_BIN_DIRS if d not in toolchain_entries)]
     return os.pathsep.join(entries)
 
 
@@ -225,7 +247,7 @@ def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path, allow_
         value = os.environ.get(name)
         if value is not None:
             bwrap_args += ["--setenv", name, value]
-    bwrap_args += ["--setenv", "PATH", _build_sandboxed_path([*toolchain_binds, *(Path(d) for d in _SYSTEM_RO_DIRS)])]
+    bwrap_args += ["--setenv", "PATH", _build_sandboxed_path(toolchain_binds)]
 
     bwrap_args += ["--setenv", "HOME", str(scratch_home)]
     bwrap_args += ["--setenv", "TMPDIR", str(scratch_home)]
@@ -254,6 +276,14 @@ def build_sandboxed_argv(argv: list[str], repo: Path, scratch_home: Path, allow_
         bwrap_args += ["--setenv", "GOPATH", str(home / "go")]
     else:
         bwrap_args += ["--setenv", "GOPATH", str(scratch_home / "go")]
+    corepack_home = home / ".cache/node/corepack"
+    if corepack_home.is_dir():
+        # corepack.cjs reads process.env.COREPACK_HOME directly (verified
+        # against the installed corepack's own source), falling back to a
+        # HOME-derived default otherwise — same re-point pattern as
+        # CARGO_HOME/RUSTUP_HOME/GOPATH above, for the same reason: HOME is
+        # the empty scratch dir, so an unset COREPACK_HOME always looks empty.
+        bwrap_args += ["--setenv", "COREPACK_HOME", str(corepack_home)]
 
     real_argv = argv
     bash = shutil.which("bash")

@@ -147,6 +147,82 @@ def test_sandboxed_path_excludes_unbound_host_directories(tmp_path: Path):
     assert fake_unbound not in path_value.split(":")
 
 
+def _path_env(argv: list[str]) -> str:
+    for i, tok in enumerate(argv):
+        if tok == "--setenv" and i + 1 < len(argv) and argv[i + 1] == "PATH":
+            return argv[i + 2]
+    raise AssertionError("PATH was not set in the built argv")
+
+
+def test_toolchain_dirs_precede_system_dirs_in_path(tmp_path: Path, monkeypatch):
+    """A stray system-package binary (e.g. apt's /usr/bin/node) must never
+    shadow a project's version-managed toolchain (e.g. nvm's active node) —
+    proven on a real machine where /usr/bin/node (v20.20.0) and nvm's active
+    node (v22.20.0, the version a project's .nvmrc/packageManager actually
+    expects) coexist. Placing system dirs first in PATH, as an earlier
+    version of _build_sandboxed_path did, resolved `node`/`corepack` to the
+    wrong, unmanaged binary. This must hold regardless of which directory
+    happens to appear first in the *host's* PATH."""
+    fake_home = tmp_path / "fake-home"
+    nvm_bin = fake_home / ".nvm" / "versions" / "node" / "v22.0.0" / "bin"
+    nvm_bin.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setenv("PATH", f"/usr/bin:{nvm_bin}")  # system dir listed first in the *host* PATH
+
+    argv = build_sandboxed_argv(["true"], repo, tmp_path / "scratch")
+    entries = _path_env(argv).split(":")
+    assert entries.index(str(nvm_bin)) < entries.index("/usr/bin"), (
+        "toolchain-managed directory must precede the generic system directory "
+        "in the sandboxed PATH regardless of host PATH order"
+    )
+
+
+def test_corepack_home_repointed_to_real_cache_when_present(tmp_path: Path, monkeypatch):
+    """corepack (bundled with Node, provisions pnpm/yarn on first use) reads
+    COREPACK_HOME directly and otherwise derives a HOME-relative default;
+    since the sandbox always overrides HOME to an empty scratch dir, an
+    unset COREPACK_HOME makes corepack see an empty cache on every run and
+    try to fetch the pinned package manager over network — unavailable
+    during verify-time sandboxing. Same re-point pattern as CARGO_HOME/
+    RUSTUP_HOME/GOPATH."""
+    fake_home = tmp_path / "fake-home"
+    corepack_cache = fake_home / ".cache" / "node" / "corepack"
+    corepack_cache.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    argv = build_sandboxed_argv(["true"], repo, tmp_path / "scratch")
+    assert "COREPACK_HOME" in argv
+    assert argv[argv.index("COREPACK_HOME") + 1] == str(corepack_cache)
+
+
+def test_corepack_home_not_set_when_no_cache_exists(tmp_path: Path, monkeypatch):
+    """No false re-point to a nonexistent path — mirrors CARGO_HOME/RUSTUP_HOME's
+    existing is_dir() guard, not a new behavior for this variable."""
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+    argv = build_sandboxed_argv(["true"], repo, tmp_path / "scratch")
+    assert "COREPACK_HOME" not in argv
+
+
+async def test_corepack_home_readable_and_populated_inside_sandbox(tmp_path: Path):
+    """End-to-end against the real, potentially-populated corepack cache on
+    whatever machine runs this test — skips cleanly where there is none."""
+    real_cache = Path.home() / ".cache" / "node" / "corepack"
+    if not real_cache.is_dir() or not any(real_cache.iterdir()):
+        pytest.skip("no populated ~/.cache/node/corepack on this machine to verify against")
+    result = await run_sandboxed(["sh", "-c", 'echo "$COREPACK_HOME" && ls "$COREPACK_HOME"'], tmp_path, timeout_s=10)
+    assert result.exit_code == 0
+    assert str(real_cache) in result.combined_tail
+
+
 def test_generic_mounts_structurally_precede_every_specific_bind(tmp_path: Path):
     """Round-9 regression for the ordering bug class (not just the one /tmp
     case a test happened to catch): the three broad, low-specificity mounts

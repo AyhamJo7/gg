@@ -30,6 +30,22 @@ from .workspace import WorkspaceInfo
 
 VERIFY_TIMEOUT_S = 600.0
 
+# High-confidence signatures of an environment/tooling-provisioning failure
+# (DNS resolution unreachable — verify-time sandboxing has no network by
+# design, see sandbox.py) rather than a genuine code/test defect. Deliberately
+# narrow: only signatures that essentially never occur for any other reason,
+# so a real code failure is never misclassified and skipped past a repair
+# attempt that could have actually helped. A toolchain trying to
+# self-provision over network it doesn't have (e.g. corepack fetching a
+# pinned pnpm version) is the concrete case this was written for — no repair
+# attempt, however good, can fix a DNS lookup failing inside a sandbox that
+# has no network by design.
+_ENVIRONMENT_FAILURE_MARKERS = ("EAI_AGAIN", "getaddrinfo", "ENETUNREACH")
+
+
+def _is_environment_failure(tail: str) -> bool:
+    return any(marker in tail for marker in _ENVIRONMENT_FAILURE_MARKERS)
+
 
 @dataclass
 class CommandResult:
@@ -38,6 +54,7 @@ class CommandResult:
     passed: bool
     duration_s: float
     tail: str = ""
+    likely_environment_issue: bool = False
 
 
 @dataclass
@@ -90,19 +107,22 @@ async def run_verification(
                     passed=False,
                     duration_s=0.0,
                     tail="sandboxed execution unavailable on this platform — bubblewrap (bwrap) not found",
+                    likely_environment_issue=True,
                 )
             )
             events.publish(EventType.TEST_FAILED, mission_id, command=command, exit_code=None)
             continue
         result = await run_sandboxed(argv, workdir, timeout_s=VERIFY_TIMEOUT_S)
         passed = result.exit_code == 0 and not result.timed_out
+        tail = result.combined_tail[-1500:]
         report.results.append(
             CommandResult(
                 command=command,
                 exit_code=result.exit_code,
                 passed=passed,
                 duration_s=result.duration_s,
-                tail=result.combined_tail[-1500:],
+                tail=tail,
+                likely_environment_issue=(not passed) and _is_environment_failure(tail),
             )
         )
         _ = db  # events are persisted by EventBus.publish; db kept for API symmetry
