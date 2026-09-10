@@ -348,6 +348,7 @@ class MissionEngine:
         max_attempts = int(self.config.get("orchestration.max_phase_attempts", 4))
         max_wait_s = float(self.config.get("orchestration.max_provider_wait_seconds", 7200))
         last_provider: str | None = None
+        last_run_id: str | None = None
         attempt = 0
         wait_started: float | None = None
 
@@ -378,6 +379,23 @@ class MissionEngine:
             if adapter is None:
                 attempt += 1
                 continue
+
+            # Exact-SHA write provenance (Increment 3): capture the base SHA
+            # and pre-existing dirt BEFORE a code-writing run. Unattributed
+            # dirty changes are never silently blamed on the provider — the
+            # phase fails with an actionable reason instead.
+            from .provenance import CODE_WRITING_ROLES, capture_write_start
+
+            if role.value in CODE_WRITING_ROLES:
+                _, _write_dirty, _write_paths = await capture_write_start(self.project_path)
+                if _write_dirty:
+                    _paths = ", ".join(_write_paths[:5])
+                    self._fail(
+                        f"workspace has unattributed changes before {role.value} run "
+                        f"({_paths}); commit, discard, or adopt them as human operator, then retry. "
+                        "Provider was NOT invoked."
+                    )
+                    return None
 
             mission = self._mission()
             self.events.publish(EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value)
@@ -526,6 +544,7 @@ class MissionEngine:
                 model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
                 run_id=_pre_run_id,
                 attempt_number=attempt + 1,
+                retry_of_run_id=last_run_id,
                 cancel_event=self._cancel,
                 on_output=on_output,
                 prompt_template_version=_ctx_meta.get("prompt_template_version"),
@@ -551,6 +570,7 @@ class MissionEngine:
                 await self._wait_for_wake()
                 continue
             run_id = outcome.run_id
+            last_run_id = run_id
             self._current_adapter, self._current_run_id = None, None
             # Attach Git linkage without touching terminal outcome.
             try:
@@ -602,10 +622,33 @@ class MissionEngine:
                 )
                 self.events.publish(EventType.TASK_COMPLETED, self.mission_id, task_id=task.id, provider=provider_name)
                 try:
-                    await self._checkpoint(f"agent({provider_name}): {role.value} checkpoint")
+                    _ckpt_sha = await self._checkpoint(f"agent({provider_name}): {role.value} checkpoint")
                 except git_ops.GitCheckpointError as exc:
                     self._fail_checkpoint_exhaustion(str(exc))
                     return None
+                if role.value in CODE_WRITING_ROLES:
+                    # Bind this run to its checkpoint SHA (or the unchanged
+                    # HEAD when the run modified nothing — recorded honestly).
+                    from .provenance import record_provider_write, repo_key
+
+                    _repo_key = ""
+                    try:
+                        _repo_key = repo_key(_product_id, await git_ops.common_dir(self.project_path))
+                    except Exception:
+                        logger.debug("repo key capture failed", exc_info=True)
+                    await record_provider_write(
+                        self.db,
+                        workdir=self.project_path,
+                        run_id=run_id,
+                        mission_id=self.mission_id,
+                        task_id=task.id,
+                        product_project_id=_product_id,
+                        phase_id=_phase_id,
+                        provider=provider_name,
+                        role=role.value,
+                        base_sha=commit_before,
+                        repo_key_value=_repo_key,
+                    )
                 self._completed_work.append(f"[{role.value}] {provider_name}: {result.summary[:200]}")
                 return result
 
@@ -665,6 +708,23 @@ class MissionEngine:
                 except git_ops.GitCheckpointError as exc:
                     self._fail_checkpoint_exhaustion(str(exc))
                     return None
+                if role.value in CODE_WRITING_ROLES:
+                    # A failed run may still have left partial work behind;
+                    # attribute the checkpoint to this run rather than the next.
+                    from .provenance import record_provider_write as _record_write2
+
+                    await _record_write2(
+                        self.db,
+                        workdir=self.project_path,
+                        run_id=run_id,
+                        mission_id=self.mission_id,
+                        task_id=task.id,
+                        product_project_id=_product_id,
+                        phase_id=_phase_id,
+                        provider=provider_name,
+                        role=role.value,
+                        base_sha=commit_before,
+                    )
             last_provider = provider_name
             attempt += 1
 

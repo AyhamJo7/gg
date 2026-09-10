@@ -110,6 +110,63 @@ async def head_sha(root: Path) -> str | None:
     return res.text if res.returncode == 0 else None
 
 
+async def commit_exists(root: Path, sha: str) -> bool:
+    """True iff sha names a commit in this repository (plumbing, no trust in callers)."""
+    import re
+
+    if not re.fullmatch(r"[0-9a-f]{4,64}", (sha or "").strip().lower()):
+        return False
+    res = await _spawn_git(root, "cat-file", "-e", f"{sha.strip()}^{{commit}}")
+    return res.returncode == 0
+
+
+async def tree_sha(root: Path, commit: str) -> str | None:
+    """Tree SHA for observability (never a substitute for exact-commit policy)."""
+    res = await _spawn_git(root, "rev-parse", f"{commit}^{{tree}}")
+    return res.text if res.returncode == 0 else None
+
+
+async def is_ancestor(root: Path, older: str, newer: str) -> bool:
+    """True iff older is an ancestor-or-equal of newer (both must exist)."""
+    if not older or not newer:
+        return False
+    res = await _spawn_git(root, "merge-base", "--is-ancestor", older, newer)
+    return res.returncode == 0
+
+
+async def rev_list(root: Path, base: str, head: str, limit: int = 500) -> list[str]:
+    """Commit SHAs in (base..head], newest first. Empty when head==base or on error."""
+    if not base or not head or base == head:
+        return []
+    res = await _spawn_git(root, "rev-list", f"--max-count={limit}", f"{base}..{head}")
+    if res.returncode != 0:
+        return []
+    return [line.strip() for line in res.text.splitlines() if line.strip()]
+
+
+async def rev_list_parents(root: Path, sha: str) -> list[str]:
+    """Parent SHAs of one commit (empty on error). Used to derive merge provenance."""
+    res = await _spawn_git(root, "rev-list", "--parents", "-n", "1", sha)
+    if res.returncode != 0:
+        return []
+    parts = (res.text or "").split()
+    return parts[1:] if len(parts) > 1 else []
+
+
+async def common_dir(root: Path) -> str:
+    """Stable repository identity for scoping SHA evidence (git common dir)."""
+    res = await _spawn_git(root, "rev-parse", "--git-common-dir")
+    if res.returncode != 0:
+        return ""
+    p = (res.text or "").strip()
+    if not p:
+        return ""
+    # No resolve(): keep this helper non-blocking; callers scope keys, not access.
+    if Path(p).is_absolute():
+        return p
+    return str(Path(root / p))
+
+
 async def status(root: Path) -> GitStatus:
     if not await is_repo(root):
         return GitStatus(is_repo=False)
