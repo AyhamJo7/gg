@@ -39,7 +39,9 @@ import type {
   ProductProjectSummary,
   Project,
   ProviderHealth,
+  RunDetail,
   TaskLogsResponse,
+  UsageAnalytics,
 } from "./types";
 
 export const api = {
@@ -120,6 +122,16 @@ export const api = {
       }),
   },
   analytics: () => req<Analytics>("/api/analytics"),
+  usageAnalytics: (productProjectId?: string) =>
+    req<UsageAnalytics>(`/api/analytics/usage${productProjectId ? `?product_project_id=${productProjectId}` : ""}`),
+  runs: () => ({
+    list: (params?: Record<string, string | number>) => {
+      const q = params ? `?${new URLSearchParams(params as Record<string, string>).toString()}` : "";
+      return req<{ runs: RunDetail["run"][]; next_cursor: string | null; has_more: boolean }>(`/api/runs${q}`);
+    },
+    get: (id: string) => req<RunDetail>(`/api/runs/${id}`),
+    context: (id: string) => req<Record<string, unknown>>(`/api/runs/${id}/context`),
+  }),
   health: () => req<{ status: string }>("/api/health"),
   lifecycle: {
     list: () => req<ProductProjectSummary[]>("/api/product-projects"),

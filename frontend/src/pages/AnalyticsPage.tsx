@@ -4,6 +4,7 @@ import { Badge } from "../components/Badge";
 
 export function AnalyticsPage() {
   const { data } = usePolling(() => api.analytics(), 10000);
+  const { data: usage } = usePolling(() => api.usageAnalytics(), 10000);
 
   return (
     <div>
@@ -55,6 +56,32 @@ export function AnalyticsPage() {
             ))}
           </tbody>
         </table>
+      </div>
+      <div className="card" style={{ marginTop: 12 }}>
+        <h3>Token telemetry coverage (honest aggregates)</h3>
+        <p className="muted" style={{ fontSize: 12 }}>
+          {usage?.note ?? "Totals include only runs with captured usage; unknown runs are excluded, never zero-filled."}
+        </p>
+        <table>
+          <thead>
+            <tr><th>Provider</th><th>Runs</th><th>With usage</th><th>Complete</th><th>Partial</th><th>Unknown</th><th>Input</th><th>Output</th></tr>
+          </thead>
+          <tbody>
+            {(usage?.by_provider ?? []).map((p) => (
+              <tr key={p.provider}>
+                <td style={{ textTransform: "capitalize", fontWeight: 600 }}>{p.provider}</td>
+                <td className="mono">{p.runs}</td>
+                <td className="mono">{p.runs_with_usage}</td>
+                <td className="mono">{p.complete_runs}</td>
+                <td className="mono">{p.partial_runs}</td>
+                <td className="mono">{p.unknown_runs}</td>
+                <td className="mono">{p.input_tokens ?? "—"}</td>
+                <td className="mono">{p.output_tokens ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {(!usage || usage.by_provider.length === 0) && <p className="muted">No token telemetry captured yet</p>}
       </div>
     </div>
   );

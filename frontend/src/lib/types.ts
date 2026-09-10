@@ -172,6 +172,61 @@ export interface ProviderRun {
   started_at: string;
   finished_at: string | null;
   summary: string;
+  stage?: string;
+  run_status?: string;
+  model_requested?: string | null;
+  model_observed?: string | null;
+  duration_ms?: number | null;
+  mission_id?: string | null;
+  task_id?: string | null;
+  product_project_id?: string | null;
+}
+
+export interface RunContextManifest {
+  run_id: string;
+  prompt_chars: number;
+  prompt_bytes: number;
+  prompt_words: number;
+  estimated_prompt_tokens: number | null;
+  estimator_id: string;
+  prompt_hash: string;
+  capture_status: string;
+}
+
+export interface RunUsage {
+  run_id: string;
+  input_tokens_total: number | null;
+  output_tokens_total: number | null;
+  cache_read_input_tokens: number | null;
+  cache_write_input_tokens: number | null;
+  reasoning_output_tokens: number | null;
+  native_total_tokens: number | null;
+  source: string;
+  completeness: string;
+  observed_model: string | null;
+  requested_model: string | null;
+}
+
+export interface RunDetail {
+  run: ProviderRun;
+  context: RunContextManifest | null;
+  usage: RunUsage | null;
+}
+
+export interface UsageAnalytics {
+  by_provider: Array<{
+    provider: string;
+    runs: number;
+    runs_with_usage: number;
+    complete_runs: number;
+    partial_runs: number;
+    unknown_runs: number;
+    input_tokens: number | null;
+    output_tokens: number | null;
+    cache_read_tokens: number | null;
+    reasoning_tokens: number | null;
+  }>;
+  note: string;
 }
 
 export interface TaskLogsResponse {

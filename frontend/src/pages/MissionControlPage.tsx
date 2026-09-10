@@ -16,6 +16,7 @@ import { TaskPanel } from "../components/TaskPanel";
 import { Terminal } from "../components/Terminal";
 import { WorkflowTimeline } from "../components/WorkflowTimeline";
 import { TERMINAL_TASK_STATUSES, type Mission } from "../lib/types";
+import { RunInspector } from "../components/RunInspector";
 
 function MissionHeader({ mission }: { mission: Mission }) {
   const active = !["COMPLETED", "FAILED", "CANCELLED", "PAUSED", "UNVERIFIED"].includes(mission.status);
@@ -38,6 +39,7 @@ function MissionHeader({ mission }: { mission: Mission }) {
 export function MissionControlPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [inspectedRunId, setInspectedRunId] = useState<string | null>(null);
   const { data: missions, refresh: refreshMissions } = usePolling(() => api.missions.list(), 3000);
   const { data: providers } = usePolling(() => api.providers.list(), 5000);
   const mission = missions?.find((m) => m.id === selectedId) ?? missions?.[0] ?? null;
@@ -238,7 +240,15 @@ export function MissionControlPage() {
                 <tbody>
                   {detail.runs.map((r) => (
                     <tr key={r.id}>
-                      <td style={{ textTransform: "capitalize" }}>{r.provider}</td>
+                      <td style={{ textTransform: "capitalize" }}>
+                        <button
+                          className="link"
+                          onClick={() => setInspectedRunId(r.id)}
+                          title="Inspect invocation"
+                        >
+                          {r.provider}
+                        </button>
+                      </td>
                       <td>{r.role}</td>
                       <td><Badge value={r.failure_class === "NONE" ? "COMPLETED" : r.failure_class} /></td>
                       <td className="mono">{r.exit_code ?? "—"}</td>
@@ -247,6 +257,11 @@ export function MissionControlPage() {
                   ))}
                 </tbody>
               </table>
+              {inspectedRunId && (
+                <div style={{ marginTop: 12 }}>
+                  <RunInspector runId={inspectedRunId} onClose={() => setInspectedRunId(null)} />
+                </div>
+              )}
             </div>
           )}
         </>
