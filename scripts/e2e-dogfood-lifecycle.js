@@ -9,6 +9,11 @@ const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
 
+const AUTH_TOKEN = (() => {
+  try { return fs.readFileSync(path.join(__dirname, "..", "backend", ".orchestrator", "auth_token"), "utf8").trim(); }
+  catch { return null; }
+})();
+
 const API = process.env.API || "http://127.0.0.1:8793";
 const UI = process.env.UI || "http://127.0.0.1:5174";
 const SHOTS = process.env.SHOTS || "/tmp/gg-dogfood/shots";
@@ -28,6 +33,7 @@ no cloud, no paid services, no frontend framework build step unless trivial.`;
 async function api(p, opts = {}, ms = 30000) {
   const c = new AbortController(); const t = setTimeout(() => c.abort(), ms);
   try {
+    if (AUTH_TOKEN) opts = { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${AUTH_TOKEN}` } };
     const r = await fetch(`${API}${p}`, { ...opts, signal: c.signal });
     if (!r.ok) throw new Error(`${r.status} ${p}: ${(await r.text()).slice(0, 300)}`);
     return r.json();

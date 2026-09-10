@@ -133,7 +133,7 @@ fs.mkdirSync(shots, { recursive: true });
 
 # Get final mission state
 echo "Final mission state:"
-curl -s "http://127.0.0.1:8787/api/missions/$MISSION_ID" | python3 -m json.tool
+curl -s -H "Authorization: Bearer $AUTH_TOKEN" "http://127.0.0.1:8787/api/missions/$MISSION_ID" | python3 -m json.tool
 
 # Cleanup
 kill $BACKEND_PID $FRONTEND_PID 2>/dev/null || true

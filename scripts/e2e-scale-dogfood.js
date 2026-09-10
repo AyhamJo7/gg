@@ -4,6 +4,11 @@ const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
 
+const AUTH_TOKEN = (() => {
+  try { return fs.readFileSync(path.join(__dirname, "..", "backend", ".orchestrator", "auth_token"), "utf8").trim(); }
+  catch { return null; }
+})();
+
 const API = "http://127.0.0.1:8787";
 const UI = "http://127.0.0.1:5173";
 const REPO = process.env.REPO_PATH || process.argv[2];
@@ -38,6 +43,7 @@ const DEPS = [
 async function api(p, opts = {}, ms = 15000) {
   const c = new AbortController(); const t = setTimeout(() => c.abort(), ms);
   try {
+    if (AUTH_TOKEN) opts = { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${AUTH_TOKEN}` } };
     const r = await fetch(`${API}${p}`, { ...opts, signal: c.signal });
     if (!r.ok) throw new Error(`${r.status} ${p}: ${(await r.text()).slice(0, 200)}`);
     return r.json();

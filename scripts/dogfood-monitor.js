@@ -13,10 +13,16 @@ const PROJECT = process.env.PROJECT;
 const BUDGET_MS = parseInt(process.env.BUDGET_MS || "7200000", 10);
 if (!PROJECT) { console.error("need PROJECT"); process.exit(2); }
 
+const AUTH_TOKEN = (() => {
+  try { return fs.readFileSync(path.join(__dirname, "..", "backend", ".orchestrator", "auth_token"), "utf8").trim(); }
+  catch { return null; }
+})();
+
 async function api(p, ms = 30000) {
   const c = new AbortController(); const t = setTimeout(() => c.abort(), ms);
   try {
-    const r = await fetch(`${API}${p}`, { signal: c.signal });
+    const headers = AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {};
+    const r = await fetch(`${API}${p}`, { headers, signal: c.signal });
     if (!r.ok) throw new Error(`${r.status} ${p}`);
     return r.json();
   } finally { clearTimeout(t); }
