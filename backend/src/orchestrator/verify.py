@@ -18,15 +18,18 @@ host — there is no unsandboxed fallback.
 
 from __future__ import annotations
 
+import logging
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .db import Database
 from .events import EventBus
-from .models import EventType
+from .models import EventType, utcnow
 from .sandbox import run_sandboxed, sandbox_available
 from .workspace import WorkspaceInfo
+
+logger = logging.getLogger(__name__)
 
 VERIFY_TIMEOUT_S = 600.0
 
@@ -77,6 +80,52 @@ class VerificationReport:
         return "\n".join(lines)
 
 
+def _persist_verification_attempt(
+    db: Database,
+    *,
+    mission_id: str,
+    product_project_id: str | None,
+    task_id: str | None,
+    sha: str | None,
+    repo_key: str,
+    kind: str,
+    report: VerificationReport,
+    started_at: str,
+) -> str | None:
+    """Immutable SHA-bound verification attempt (P-12). No SHA → no row (never fabricate)."""
+    import json as _json
+    import uuid as _uuid
+
+    if not sha or len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha.lower()):
+        logger.debug("verification attempt not persisted: no exact SHA")
+        return None
+    attempt_id = f"ver-{_uuid.uuid4().hex[:12]}"
+    failed = [r for r in report.results if not r.passed]
+    try:
+        db.insert(
+            "verification_attempts",
+            {
+                "id": attempt_id,
+                "mission_id": mission_id or None,
+                "product_project_id": product_project_id,
+                "task_id": task_id,
+                "sha": sha.lower(),
+                "repo_key": repo_key,
+                "kind": kind,
+                "commands_json": _json.dumps([r.command for r in report.results]),
+                "status": "passed" if report.all_passed else "failed",
+                "exit_code": failed[0].exit_code if failed else 0,
+                "started_at": started_at,
+                "finished_at": utcnow().isoformat(),
+                "summary": report.summary()[:2000],
+            },
+        )
+    except Exception:
+        logger.debug("verification attempt insert failed", exc_info=True)
+        return None
+    return attempt_id
+
+
 async def run_verification(
     workspace: WorkspaceInfo,
     db: Database,
@@ -84,7 +133,21 @@ async def run_verification(
     mission_id: str,
     workdir: Path,
     include_build: bool = True,
+    *,
+    sha: str | None = None,
+    repo_key: str = "",
+    kind: str = "toolchain",
+    product_project_id: str | None = None,
+    task_id: str | None = None,
 ) -> VerificationReport:
+    from . import git_ops
+
+    started = utcnow().isoformat()
+    if sha is None:
+        try:
+            sha = await git_ops.head_sha(workdir)
+        except Exception:
+            sha = None
     report = VerificationReport()
     commands: list[str] = []
     commands.extend(workspace.test_commands)
@@ -132,4 +195,15 @@ async def run_verification(
             command=command,
             exit_code=result.exit_code,
         )
+    _persist_verification_attempt(
+        db,
+        mission_id=mission_id,
+        product_project_id=product_project_id,
+        task_id=task_id,
+        sha=sha,
+        repo_key=repo_key,
+        kind=kind,
+        report=report,
+        started_at=started,
+    )
     return report

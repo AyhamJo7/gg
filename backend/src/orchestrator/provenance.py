@@ -263,26 +263,54 @@ async def range_writers(
     return result
 
 
-def provider_writers(writers: list[dict[str, Any]]) -> set[str]:
-    """Provider names with PROVIDER-actor writes (independence boundary is provider-level)."""
-    return {str(w["provider"]) for w in writers if w.get("actor_type") == ACTOR_PROVIDER and w.get("provider")}
+def provider_writers(
+    writers: list[dict[str, Any]], roles: frozenset[str] | None = None
+) -> set[str]:
+    """Provider names with PROVIDER-actor writes (independence boundary is provider-level).
+
+    When roles is given, only writers in those roles count — planning/testing
+    bookkeeping swept into checkpoints is tracked for completeness but does
+    not taint reviewer independence (which guards code under review).
+    """
+    return {
+        str(w["provider"])
+        for w in writers
+        if w.get("actor_type") == ACTOR_PROVIDER and w.get("provider") and (roles is None or w.get("role") in roles)
+    }
+
+
+#: Roles whose writes disqualify a provider from independently reviewing the
+#: candidate containing them.
+INDEPENDENCE_ROLES = frozenset({"implementation", "repair"})
 
 
 #: Stages whose provider runs are expected to have write rows.
 WRITE_STAGES = frozenset({"product_plan", "mission_plan", "dag_plan", "implementation", "repair", "task", "testing"})
 
 
-def mission_provider_writers(db: Any, mission_id: str) -> tuple[set[str], bool]:
+def mission_provider_writers(
+    db: Any, mission_id: str, roles: frozenset[str] | None = None
+) -> tuple[set[str], bool]:
     """(provider writers, complete) for one mission, from write_provenance.
 
-    Complete is False when a successful code-writing run has no write row
+    Complete is False when a successful tracked run has no write row
     (legacy/unlinked) or when dirt/unknown actors were captured — in that
-    case independence cannot be certified.
+    case independence cannot be certified. Pass INDEPENDENCE_ROLES to get
+    the reviewer-exclusion set.
     """
-    rows = db.query(
-        "SELECT DISTINCT provider FROM write_provenance WHERE mission_id=? AND actor_type=? AND provider IS NOT NULL",
-        (mission_id, ACTOR_PROVIDER),
-    )
+    if roles is None:
+        rows = db.query(
+            "SELECT DISTINCT provider FROM write_provenance WHERE mission_id=? AND actor_type=?"
+            " AND provider IS NOT NULL",
+            (mission_id, ACTOR_PROVIDER),
+        )
+    else:
+        placeholders = ",".join("?" for _ in roles)
+        rows = db.query(
+            f"SELECT DISTINCT provider FROM write_provenance WHERE mission_id=? AND actor_type=?"  # noqa: S608
+            f" AND provider IS NOT NULL AND role IN ({placeholders})",
+            (mission_id, ACTOR_PROVIDER, *sorted(roles)),
+        )
     writers = {str(r["provider"]) for r in rows}
     runs = db.query(
         "SELECT id FROM provider_runs WHERE mission_id=? AND failure_class='NONE' AND stage IN"
@@ -405,6 +433,7 @@ async def record_review_attempt(
     implementer = str(impl_rows[0]["provider"]) if impl_rows else None
 
     writers, complete = mission_provider_writers(db, mission_id)
+    code_writers, _ = mission_provider_writers(db, mission_id, INDEPENDENCE_ROLES)
     earliest_base: str | None = None
     if writers or complete:
         bases = db.query(
@@ -419,6 +448,7 @@ async def record_review_attempt(
     # Exact range writers when the repo is available (stronger than the
     # mission-wide approximation above).
     range_provider_writers = set(writers)
+    range_code_writers = set(code_writers)
     range_complete = complete
     if repo is not None and reviewed_base and reviewed_head:
         from . import git_ops
@@ -429,6 +459,7 @@ async def record_review_attempt(
             exact = await range_writers(db, repo, reviewed_base, reviewed_head)
             if exact["checked"]:
                 range_provider_writers = provider_writers(exact["writers"])
+                range_code_writers = provider_writers(exact["writers"], INDEPENDENCE_ROLES)
                 range_complete = bool(exact["complete"])
 
     if not reviewer:
@@ -439,7 +470,7 @@ async def record_review_attempt(
         independent, reason = False, "writer provenance incomplete (cannot certify independence)"
     elif implementer is not None and reviewer == implementer:
         independent, reason = False, f"reviewer {reviewer} is the implementer (self-review)"
-    elif reviewer in range_provider_writers:
+    elif reviewer in range_code_writers:
         independent, reason = False, f"reviewer {reviewer} is in the candidate writer set (self-review)"
     else:
         independent, reason = True, None
@@ -585,7 +616,7 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
         blocking.append(
             f"writer provenance INCOMPLETE: unattributed commits {', '.join(s[:8] for s in full['unattributed'][:5])}"
         )
-    provider_set = provider_writers(full["writers"])
+    provider_set = provider_writers(full["writers"], INDEPENDENCE_ROLES)
 
     # Review: every phase candidate needs an independent exact review, and no
     # non-SYSTEM commit may sit uncovered after the last reviewed tip.

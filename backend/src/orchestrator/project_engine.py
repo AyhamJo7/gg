@@ -1420,27 +1420,28 @@ RULES:
         return result.exit_code == 0
 
     async def _evaluate_requirement_criteria_locked(
-        self, project_id: str, plan: ProductPlan, repo: Path, sha: str
+        self, project_id: str, plan: ProductPlan, repo: Path, sha: str, *, force: bool = False
     ) -> list[str]:
         """Execute every required criterion check; record per-criterion verdicts.
 
-        Restart-safe: a recorded result for the same (criterion, command, SHA)
-        is reused, never re-executed — checks may have side effects (e.g. HTTP
-        probes that create records), so acceptance must not duplicate runs.
+        Restart-safe: a recorded result for the same (criterion, command, SHA,
+        plan revision) is reused, never re-executed — checks may have side
+        effects (e.g. HTTP probes that create records), so acceptance must not
+        duplicate runs. Pass force=True for an explicit operator/engine
+        RECHECK, which creates a new immutable attempt without reusing the
+        prior result (history is preserved, never deleted).
         Returns blocking finding strings (empty when all criteria satisfied).
         """
         problems: list[str] = []
         waived = self._waived_targets(project_id)
+        revision = int((self.db.get("product_projects", project_id) or {}).get("plan_revision") or 0)
         for req in plan.requirements:
             req_ok = True
             for criterion in req.acceptance:
                 cid = criterion.id
                 if waived.get(f"criterion:{cid}") == self._criterion_content_hash(criterion):
-                    self._record_criterion_waived(project_id, req.id, cid, sha)
+                    self._record_criterion_waived(project_id, req.id, cid, sha, revision)
                     continue
-                recorded = self.db.query(
-                    "SELECT * FROM criterion_results WHERE project_id=? AND criterion_id=?", (project_id, cid)
-                )
                 verify = criterion.verify or ""
                 ok, command = is_executable_command(verify)
                 if not ok:
@@ -1448,19 +1449,42 @@ RULES:
                         f"criterion {cid} has no executable verification "
                         f"(revise the plan with an allowlisted command): {verify[:120]}"
                     )
-                    self._record_criterion(project_id, req.id, cid, "UNVERIFIED", "", None, "no executable verify", sha)
+                    self._record_criterion(
+                        project_id, req.id, cid, "UNVERIFIED", "", None, "no executable verify",
+                        sha, revision, capability="HUMAN_GATE",
+                    )
                     req_ok = False
                     continue
-                if recorded and recorded[0].get("command") == command and recorded[0].get("sha") == sha:
-                    if recorded[0]["status"] != "SATISFIED":
-                        problems.append(f"criterion {cid} failed: {command} (exit={recorded[0].get('exit_code')})")
-                        req_ok = False
-                    continue
+                if not force:
+                    recorded = self.db.query(
+                        "SELECT * FROM criterion_results WHERE project_id=? AND criterion_id=?", (project_id, cid)
+                    )
+                    if (
+                        recorded
+                        and recorded[0].get("command") == command
+                        and recorded[0].get("sha") == sha
+                        and int(recorded[0].get("plan_revision") or 0) == revision
+                    ):
+                        if recorded[0]["status"] != "SATISFIED":
+                            problems.append(
+                                f"criterion {cid} failed: {command} (exit={recorded[0].get('exit_code')})"
+                            )
+                            req_ok = False
+                        continue
+                recheck_of = None
+                if force:
+                    prior = self.db.query(
+                        "SELECT id FROM criterion_attempts WHERE project_id=? AND criterion_id=?"
+                        " ORDER BY created_at DESC LIMIT 1",
+                        (project_id, cid),
+                    )
+                    recheck_of = prior[0]["id"] if prior else None
                 checks = await evaluate_criteria(repo, [{"id": cid, "verify": verify}])
                 check = checks[0]
                 status = "SATISFIED" if check.passed else "FAILED"
                 self._record_criterion(
-                    project_id, req.id, cid, status, command, check.exit_code, check.output_tail, sha
+                    project_id, req.id, cid, status, command, check.exit_code, check.output_tail,
+                    sha, revision, recheck_of=recheck_of,
                 )
                 if not check.passed:
                     problems.append(f"criterion {cid} failed: {command} (exit={check.exit_code})")
@@ -1490,15 +1514,56 @@ RULES:
         exit_code: int | None,
         output_tail: str,
         sha: str,
-    ) -> None:
+        plan_revision: int = 0,
+        *,
+        context: str = "workdir",
+        capability: str = "REPLAYABLE",
+        recheck_of: str | None = None,
+        update_cache: bool = True,
+    ) -> str | None:
+        """Record one immutable criterion attempt; refresh the latest-status cache.
+
+        Attempts are never overwritten (P-14/P-25); criterion_results keeps the
+        current verdict per criterion for cheap reads. Fresh-checkout replays
+        pass update_cache=False so the workdir cache row (and its checked_at
+        restart-reuse key) is untouched. Returns the attempt id.
+        """
+        import uuid as _uuid
+
+        attempt_id = f"crit-{_uuid.uuid4().hex[:12]}"
+        try:
+            self.db.insert(
+                "criterion_attempts",
+                {
+                    "id": attempt_id,
+                    "project_id": project_id,
+                    "criterion_id": criterion_id,
+                    "requirement_id": requirement_id,
+                    "plan_revision": plan_revision,
+                    "command": command,
+                    "checked_sha": sha,
+                    "context": context,
+                    "capability": capability,
+                    "result": status,
+                    "exit_code": exit_code,
+                    "output_tail": (output_tail or "")[:3000],
+                    "recheck_of": recheck_of,
+                    "created_at": utcnow().isoformat(),
+                },
+            )
+        except Exception:
+            logger.debug("criterion attempt insert failed for %s", criterion_id, exc_info=True)
+            return None
+        if not update_cache:
+            return attempt_id
         self.db.execute(
             """INSERT INTO criterion_results(project_id, criterion_id, requirement_id, status, command,
-                   exit_code, output_tail, sha, checked_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(project_id, criterion_id) DO UPDATE SET
-                 requirement_id=excluded.requirement_id, status=excluded.status, command=excluded.command,
-                 exit_code=excluded.exit_code, output_tail=excluded.output_tail, sha=excluded.sha,
-                 checked_at=excluded.checked_at""",
+                   exit_code, output_tail, sha, checked_at, plan_revision, context)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, criterion_id) DO UPDATE SET
+                  requirement_id=excluded.requirement_id, status=excluded.status, command=excluded.command,
+                  exit_code=excluded.exit_code, output_tail=excluded.output_tail, sha=excluded.sha,
+                  checked_at=excluded.checked_at, plan_revision=excluded.plan_revision, context=excluded.context""",
             (
                 project_id,
                 criterion_id,
@@ -1506,14 +1571,80 @@ RULES:
                 status,
                 command,
                 exit_code,
-                output_tail[:3000],
+                (output_tail or "")[:3000],
                 sha,
                 utcnow().isoformat(),
+                plan_revision,
+                context,
             ),
         )
+        return attempt_id
 
-    def _record_criterion_waived(self, project_id: str, requirement_id: str, criterion_id: str, sha: str) -> None:
-        self._record_criterion(project_id, requirement_id, criterion_id, "WAIVED", "", None, "authorized waiver", sha)
+    def _record_criterion_waived(
+        self, project_id: str, requirement_id: str, criterion_id: str, sha: str, plan_revision: int = 0
+    ) -> None:
+        self._record_criterion(
+            project_id, requirement_id, criterion_id, "WAIVED", "", None, "authorized waiver",
+            sha, plan_revision,
+        )
+
+    async def _evidence_gate_findings(
+        self, project_id: str, plan: ProductPlan, repo: Path, sha: str
+    ) -> list[str]:
+        """Canonical artifact-evidence evaluation for the delivery candidate."""
+        import json as _json
+
+        from .provenance import EvidenceInputs, PhaseCandidate, evaluate_artifact_evidence
+
+        phases = self.db.query("SELECT * FROM project_phases WHERE project_id=? ORDER BY created_at ASC", (project_id,))
+        candidates: list[PhaseCandidate] = []
+        for phase in phases:
+            evidence: dict[str, Any] = {}
+            try:
+                raw = phase.get("evidence_json") or "{}"
+                evidence = _json.loads(raw) if isinstance(raw, str) else {}
+            except Exception:
+                evidence = {}
+            csha = evidence.get("git_head")
+            if not csha:
+                att = self.db.query(
+                    "SELECT result_sha FROM project_phase_attempts WHERE phase_id=? AND status='COMPLETED'"
+                    " ORDER BY attempt_number DESC LIMIT 1",
+                    (phase["id"],),
+                )
+                csha = att[0]["result_sha"] if att else None
+            candidates.append(
+                PhaseCandidate(
+                    phase_id=str(phase["id"]),
+                    phase_key=str(phase.get("phase_key", "")),
+                    candidate_sha=csha,
+                    mission_id=phase.get("mission_id"),
+                )
+            )
+        oldest_base: str | None = None
+        try:
+            first_writes = self.db.query(
+                "SELECT base_sha FROM write_provenance WHERE product_project_id=? AND base_sha IS NOT NULL"
+                " ORDER BY created_at ASC LIMIT 1",
+                (project_id,),
+            )
+            if first_writes:
+                oldest_base = first_writes[0].get("base_sha")
+        except Exception:
+            logger.debug("oldest base lookup failed", exc_info=True)
+        revision = int((self.db.get("product_projects", project_id) or {}).get("plan_revision") or 0)
+        status = await evaluate_artifact_evidence(
+            self.db,
+            EvidenceInputs(
+                project_id=project_id,
+                candidate_sha=sha,
+                plan_revision=revision,
+                repo=repo,
+                phases=candidates,
+                oldest_base_sha=oldest_base,
+            ),
+        )
+        return [f"evidence: {reason}" for reason in status.get("blocking_reasons", [])]
 
     def _blocking_findings_locked(self, project_id: str) -> list[str]:
         """Unresolved requirement/correctness findings across phase missions.
@@ -1577,13 +1708,30 @@ RULES:
                 if st.modified or st.untracked:
                     # Final checkpoint must contain the accepted state: commit
                     # actual changes (secret-safe) before recording the SHA.
+                    # Recorded as SYSTEM so later writer analysis can see the
+                    # acceptance commit is bookkeeping, not provider code —
+                    # but unattributed content inside still blocks delivery.
                     sha = await git_ops.checkpoint(repo, "chore: final acceptance checkpoint")
+                    if sha:
+                        try:
+                            from .provenance import ACTOR_SYSTEM, record_write
+
+                            record_write(
+                                self.db, run_id=None, product_project_id=project_id,
+                                actor_type=ACTOR_SYSTEM, actor_detail="final acceptance checkpoint",
+                                base_sha=st.head, result_sha=sha,
+                            )
+                        except Exception:
+                            logger.debug("acceptance checkpoint provenance failed", exc_info=True)
                     st = await git_ops.status(repo)
                     if st.modified or st.untracked:
                         findings.append(f"uncommittable changes remain: {st.modified + st.untracked}")
                 sha = sha or st.head
                 info = await inspect_workspace(repo)
-                report = await run_verification(info, self.db, self.events, "", repo)
+                report = await run_verification(
+                    info, self.db, self.events, "", repo, sha=sha,
+                    product_project_id=project_id,
+                )
                 verify_ok = report.all_passed
                 if not report.attempted:
                     findings.append("no toolchain commands detected — nothing objectively verified")
@@ -1597,9 +1745,14 @@ RULES:
                     findings.extend(self._blocking_findings_locked(project_id))
                 # 4. Fresh-checkout reproduction of the accepted SHA.
                 if sha and verify_ok and not findings:
-                    fresh_ok, fresh_detail = await self._fresh_checkout_verify(repo, sha)
+                    fresh_ok, fresh_detail = await self._fresh_checkout_verify(repo, sha, project_id, plan)
                     if not fresh_ok:
                         findings.append(f"fresh checkout of {sha} did not reproduce verification: {fresh_detail}")
+                # 5. Exact-SHA evidence gate (Increment 3, P-29): DELIVERED is
+                # forbidden unless review/verification/criteria/fresh-checkout
+                # all cover exactly this SHA with complete writer provenance.
+                if sha and not findings:
+                    findings.extend(await self._evidence_gate_findings(project_id, plan, repo, sha))
         if findings:
             blocked_state = AcceptanceState.EXTERNALLY_BLOCKED.value if open_gates else AcceptanceState.UNVERIFIED.value
             self.db.update(
@@ -1637,12 +1790,42 @@ RULES:
         self._set_state(project_id, ProductStatus.DELIVERED, reason="", finished=True)
         return {"ok": True, "sha": sha}
 
-    async def _fresh_checkout_verify(self, repo: Path, sha: str) -> tuple[bool, str]:
+    async def _fresh_checkout_verify(
+        self, repo: Path, sha: str, project_id: str | None = None, plan: ProductPlan | None = None
+    ) -> tuple[bool, str]:
         """Clone the accepted SHA fresh, install dependencies, reproduce verification.
 
         Returns (ok, detail). Dependency install is part of reproducibility:
         a checkout that cannot install + pass its toolchain is not accepted.
+        Persists an immutable fresh_checkout_attempts row plus fresh-context
+        criterion attempts for replayable criteria (P-15/P-27).
         """
+        import uuid as _uuid
+
+        attempt_id = f"fresh-{_uuid.uuid4().hex[:12]}"
+        revision = 0
+        if project_id:
+            revision = int((self.db.get("product_projects", project_id) or {}).get("plan_revision") or 0)
+
+        def _record_fresh(status: str, detail: str, commands: list[str]) -> tuple[bool, str]:
+            if project_id:
+                try:
+                    self.db.insert(
+                        "fresh_checkout_attempts",
+                        {
+                            "id": attempt_id,
+                            "project_id": project_id,
+                            "sha": sha,
+                            "repo_key": "",
+                            "status": status,
+                            "detail": detail[:2000],
+                            "commands_json": json.dumps(commands),
+                            "created_at": utcnow().isoformat(),
+                        },
+                    )
+                except Exception:
+                    logger.debug("fresh checkout attempt insert failed", exc_info=True)
+            return status == "passed", detail
 
         def _clone_and_checkout() -> Path | None:
             tmp = Path(tempfile.mkdtemp(prefix="gg-accept-"))
@@ -1675,11 +1858,11 @@ RULES:
         try:
             clone = await asyncio.to_thread(_clone_and_checkout)
             if clone is None:
-                return False, "git clone/checkout failed"
+                return _record_fresh("failed", "git clone/checkout failed", [])
             tmp_root = clone.parent
             info = await inspect_workspace(clone)
             if not (info.test_commands or info.build_commands):
-                return True, "no toolchain to reproduce beyond the recorded SHA"
+                return _record_fresh("passed", "no toolchain to reproduce beyond the recorded SHA", [])
             install_note = "no install step needed"
             # --ignore-scripts: this is freshly cloned, potentially AI-generated
             # code — lifecycle scripts (preinstall/postinstall) are an
@@ -1688,23 +1871,64 @@ RULES:
                 ok, log = await _install(["npm", "ci", "--no-audit", "--no-fund", "--ignore-scripts"], clone)
                 install_note = "npm ci " + ("ok" if ok else f"FAILED: {log[-500:]}")
                 if not ok:
-                    return False, install_note
+                    return _record_fresh("failed", install_note, [])
             elif (clone / "package.json").exists():
                 ok, log = await _install(["npm", "install", "--no-audit", "--no-fund", "--ignore-scripts"], clone)
                 install_note = "npm install " + ("ok" if ok else f"FAILED: {log[-500:]}")
                 if not ok:
-                    return False, install_note
+                    return _record_fresh("failed", install_note, [])
             elif (clone / "uv.lock").exists() or (clone / "pyproject.toml").exists():
                 ok, log = await _install(["uv", "sync", "--frozen"], clone)
                 install_note = "uv sync " + ("ok" if ok else f"FAILED: {log[-500:]}")
                 if not ok:
-                    return False, install_note
-            report = await run_verification(info, self.db, self.events, "", clone)
+                    return _record_fresh("failed", install_note, [])
+            report = await run_verification(
+                info, self.db, self.events, "", clone, sha=sha, kind="fresh-toolchain",
+                product_project_id=project_id,
+            )
             detail = f"{install_note}; {report.summary()}"
-            return report.all_passed, detail
+            if not report.all_passed:
+                return _record_fresh("failed", detail, [r.command for r in report.results])
+            # Replay requirement-specific criteria in the fresh clone (P-27):
+            # a criterion that passes only via leftover workdir state must fail
+            # here. Only executable (REPLAYABLE) criteria run; HUMAN_GATE and
+            # external-gated criteria keep their workdir evidence + policy.
+            if project_id and plan is not None:
+                _waived = self._waived_targets(project_id)
+                replay_specs = [
+                    {"id": a.id, "verify": a.verify}
+                    for r in plan.requirements
+                    for a in r.acceptance
+                    if is_executable_command(a.verify or "")[0]
+                    and _waived.get(f"criterion:{a.id}") != self._criterion_content_hash(a)
+                ]
+                if replay_specs:
+                    from .criterion import evaluate_criteria as _evaluate_fresh
+
+                    fresh_checks = await _evaluate_fresh(clone, replay_specs)
+                    for check in fresh_checks:
+                        req_id = next(
+                            (r.id for r in plan.requirements for a in r.acceptance if a.id == check.criterion_id),
+                            "",
+                        )
+                        self._record_criterion(
+                            project_id, req_id, check.criterion_id,
+                            "SATISFIED" if check.passed else "FAILED",
+                            check.command, check.exit_code, check.output_tail or "", sha, revision,
+                            context="fresh", capability="REPLAYABLE", update_cache=False,
+                        )
+                    failed_replay = [c for c in fresh_checks if not c.passed]
+                    if failed_replay:
+                        return _record_fresh(
+                            "failed",
+                            "fresh replay failed: "
+                            + "; ".join(f"{c.criterion_id}: {c.command}" for c in failed_replay)[:800],
+                            [r.command for r in report.results],
+                        )
+            return _record_fresh("passed", detail, [r.command for r in report.results])
         except Exception as exc:
             logger.exception("fresh checkout verify failed")
-            return False, str(exc)[:500]
+            return _record_fresh("failed", str(exc)[:500], [])
         finally:
             if tmp_root is not None:
                 shutil.rmtree(tmp_root, ignore_errors=True)
