@@ -1063,9 +1063,9 @@ class ParallelMissionEngine:
         eligible = [p for p in priorities if self.registry.is_eligible(p)]
 
         if role == Role.REVIEW and len(eligible) > 1:
-            from .provenance import mission_provider_writers
+            from .provenance import INDEPENDENCE_ROLES, mission_provider_writers
 
-            _writers, _ = mission_provider_writers(self.db, self.mission_id)
+            _writers, _ = mission_provider_writers(self.db, self.mission_id, INDEPENDENCE_ROLES)
             if not _writers:
                 _writers = {self._last_provider_for(Role.IMPLEMENTATION)} - {None}
             alternatives = [p for p in eligible if p not in _writers]
