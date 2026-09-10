@@ -919,11 +919,30 @@ class MissionEngine:
                 await git_ops._git(project_path, "checkout", "-b", mission_branch)
                 st = await git_ops.status(project_path)
             if not st.is_clean:
+                # Pre-existing changes predate any GG run in this mission, so
+                # on this single-operator box they are the operator's by
+                # elimination. Checkpoint them as HUMAN_OPERATOR (never
+                # attributed to a later provider); later evidence treats them
+                # as human-authored content requiring re-review like any edit.
+                _pre_base = st.head
                 try:
-                    await self._checkpoint("orchestrator: checkpoint before mission start (pre-existing changes)")
+                    _pre_sha = await self._checkpoint(
+                        "orchestrator: checkpoint before mission start (pre-existing changes)"
+                    )
                 except git_ops.GitCheckpointError as exc:
                     self._fail_checkpoint_exhaustion(str(exc))
                     return False
+                if _pre_sha and _pre_sha != _pre_base:
+                    from .provenance import ACTOR_HUMAN, record_write
+
+                    try:
+                        record_write(
+                            self.db, run_id=None, mission_id=self.mission_id,
+                            actor_type=ACTOR_HUMAN, actor_detail="pre-existing workspace changes at mission start",
+                            base_sha=_pre_base, result_sha=_pre_sha,
+                        )
+                    except Exception:
+                        logger.debug("pre-existing changes provenance failed", exc_info=True)
         self.db.update("projects", self._mission().project_id, {"detected_type": self.workspace.project_type})
         return True
 
