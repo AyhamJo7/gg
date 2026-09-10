@@ -371,9 +371,7 @@ class ProjectCoordinator:
                     return {"ok": False, "errors": ["planning cancelled"], "operation_id": op.id}
                 if attempt > 0:
                     prompt = build_plan_repair_prompt(raw_output, errors)
-                raw_output, _outcome = await self._run_planning_provider(
-                    prompt, project_id, op.id, attempt
-                )
+                raw_output, _outcome = await self._run_planning_provider(prompt, project_id, op.id, attempt)
                 # Provider-level failure is truthful invocation history, not
                 # a successful plan. Still attempt repair within budget.
                 plan_data = extract_product_plan(raw_output)
@@ -458,18 +456,50 @@ class ProjectCoordinator:
             log_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             log_dir = workdir
+        _plan_ctx: dict[str, Any] = {}
+        _effective_prompt = prompt
+        try:
+            from .context_compiler import ContextCompileSpec, prepare_invocation_context
+
+            _row = self.db.get("product_projects", project_id) or {}
+            _cc_spec = ContextCompileSpec(
+                role="planner",
+                stage=STAGE_PRODUCT_PLANNING,
+                product_project_id=project_id,
+                provider=provider_name,
+                task_objective=f"{_row.get('idea', '')}\n{_row.get('constraints_text', '')}",
+                task_title=str(_row.get("name", project_id)),
+                task_description=str(_row.get("idea", "")),
+                extra_context=prompt,
+                attempt=attempt_index + 1,
+            )
+            _effective_prompt, _plan_ctx = prepare_invocation_context(
+                legacy_prompt=prompt, spec=_cc_spec, db=self.db, config=self.config
+            )
+        except Exception:
+            logger.debug("product planning compilation unavailable", exc_info=True)
+            _effective_prompt, _plan_ctx = prompt, {}
         outcome = await self._invocations().execute(
             InvocationSpec(
                 owner=InvocationOwner(product_project_id=project_id, operation_id=operation_id),
                 stage=STAGE_PRODUCT_PLANNING,
                 role=Role.PLANNING.value,
-                prompt=prompt,
+                prompt=_effective_prompt,
                 workdir=workdir,
                 log_dir=log_dir,
                 provider=provider_name,
                 timeout_s=self.config.provider_timeout_s(provider_name),
                 model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
                 attempt_number=attempt_index + 1,
+                prompt_template_version=_plan_ctx.get("prompt_template_version"),
+                context_policy_version=_plan_ctx.get("context_policy_version"),
+                context_blocks_json=_plan_ctx.get("context_blocks_json"),
+                context_warnings_json=_plan_ctx.get("context_warnings_json"),
+                context_budget=_plan_ctx.get("context_budget"),
+                context_used=_plan_ctx.get("context_used"),
+                context_remaining=_plan_ctx.get("context_remaining"),
+                context_repeated_ratio=_plan_ctx.get("context_repeated_ratio"),
+                context_plan_revision=_plan_ctx.get("context_plan_revision"),
             )
         )
         ops.note_attempt(self.db, operation_id, outcome.run_id)

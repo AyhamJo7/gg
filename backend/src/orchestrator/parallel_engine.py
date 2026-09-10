@@ -760,6 +760,51 @@ class ParallelMissionEngine:
 
         _product_id, _phase_id = self._product_attribution()
         _stage = role.value if role.value in ("review", "repair") else role.value
+        _ctx_meta: dict[str, Any] = {}
+        try:
+            from .context_compiler import (
+                ContextCompileSpec,
+                finding_files,
+                finding_ids_in_text,
+                latest_candidate_shas,
+                prepare_invocation_context,
+                resolve_phase_requirements,
+                role_for_stage,
+            )
+
+            _mission = self._mission()
+            _p_base: str | None = None
+            _p_cand: str | None = None
+            _p_findings: list[str] = []
+            _p_files: list[str] = []
+            if _stage in ("review", "repair"):
+                _p_base, _p_cand = latest_candidate_shas(self.db, self.mission_id)
+                _p_files = finding_files(self.db, self.mission_id)
+                if _stage == "repair":
+                    _p_findings = finding_ids_in_text(extra_context)
+            _spec_cc = ContextCompileSpec(
+                role=role_for_stage(_stage, role.value),
+                stage=_stage,
+                product_project_id=_product_id,
+                project_phase_id=_phase_id,
+                mission_id=self.mission_id,
+                provider=provider_name,
+                base_sha=_p_base,
+                candidate_sha=_p_cand,
+                git_files_changed=_p_files,
+                finding_ids=_p_findings,
+                task_objective=f"{_mission.get('title', '')}\n{_mission.get('task', '')}",
+                task_title=str(_mission.get("title", "")),
+                task_description=str(_mission.get("task", "")),
+                requirement_ids=resolve_phase_requirements(self.db, _product_id, _phase_id),
+                failure_text=extra_context[:4000] if extra_context else "",
+            )
+            prompt, _ctx_meta = prepare_invocation_context(
+                legacy_prompt=prompt, spec=_spec_cc, db=self.db, config=self.config
+            )
+        except Exception:
+            logger.debug("context compilation unavailable, using legacy prompt", exc_info=True)
+            _ctx_meta = {}
         _pre_run_id = f"run-{_uuid.uuid4().hex[:12]}"
         _track_key = f"__role_{role.value}"
         self._active_invocation_runs[_track_key] = _pre_run_id
@@ -781,6 +826,15 @@ class ParallelMissionEngine:
                     model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
                     run_id=_pre_run_id,
                     cancel_event=self._cancel,
+                    prompt_template_version=_ctx_meta.get("prompt_template_version"),
+                    context_policy_version=_ctx_meta.get("context_policy_version"),
+                    context_blocks_json=_ctx_meta.get("context_blocks_json"),
+                    context_warnings_json=_ctx_meta.get("context_warnings_json"),
+                    context_budget=_ctx_meta.get("context_budget"),
+                    context_used=_ctx_meta.get("context_used"),
+                    context_remaining=_ctx_meta.get("context_remaining"),
+                    context_repeated_ratio=_ctx_meta.get("context_repeated_ratio"),
+                    context_plan_revision=_ctx_meta.get("context_plan_revision"),
                 )
             )
         except RuntimeError as exc:
@@ -1052,6 +1106,29 @@ class ParallelMissionEngine:
             _plan_key = "__dag_planning"
             _plan_run_id = f"run-{_uuid2.uuid4().hex[:12]}"
             self._active_invocation_runs[_plan_key] = _plan_run_id
+            _dag_ctx: dict[str, Any] = {}
+            try:
+                from .context_compiler import ContextCompileSpec, prepare_invocation_context
+
+                _mission_dag = self._mission()
+                _dag_spec = ContextCompileSpec(
+                    role="planner",
+                    stage="dag_plan",
+                    product_project_id=_product_id,
+                    project_phase_id=_phase_id,
+                    mission_id=self.mission_id,
+                    provider=provider_name,
+                    task_objective=f"{_mission_dag.get('title', '')}\n{_mission_dag.get('task', '')}",
+                    task_title=str(_mission_dag.get("title", "")),
+                    task_description=str(_mission_dag.get("task", "")),
+                    extra_context=prompt,
+                )
+                _compiled_prompt, _dag_ctx = prepare_invocation_context(
+                    legacy_prompt=prompt, spec=_dag_spec, db=self.db, config=self.config
+                )
+            except Exception:
+                logger.debug("dag planning compilation unavailable", exc_info=True)
+                _compiled_prompt, _dag_ctx = prompt, {}
             try:
                 outcome = await self._invocations().execute(
                     InvocationSpec(
@@ -1062,7 +1139,7 @@ class ParallelMissionEngine:
                         ),
                         stage=STAGE_DAG_PLANNING,
                         role=role.value,
-                        prompt=prompt,
+                        prompt=_compiled_prompt,
                         workdir=project_path,
                         log_dir=log_dir,
                         provider=provider_name,
@@ -1071,6 +1148,15 @@ class ParallelMissionEngine:
                         run_id=_plan_run_id,
                         attempt_number=attempt + 1,
                         cancel_event=self._cancel,
+                        prompt_template_version=_dag_ctx.get("prompt_template_version"),
+                        context_policy_version=_dag_ctx.get("context_policy_version"),
+                        context_blocks_json=_dag_ctx.get("context_blocks_json"),
+                        context_warnings_json=_dag_ctx.get("context_warnings_json"),
+                        context_budget=_dag_ctx.get("context_budget"),
+                        context_used=_dag_ctx.get("context_used"),
+                        context_remaining=_dag_ctx.get("context_remaining"),
+                        context_repeated_ratio=_dag_ctx.get("context_repeated_ratio"),
+                        context_plan_revision=_dag_ctx.get("context_plan_revision"),
                     )
                 )
             except RuntimeError as exc:
@@ -1412,6 +1498,44 @@ class ParallelMissionEngine:
         from .invocations import STAGE_TASK, InvocationOwner, InvocationSpec
 
         _product_id, _phase_id = self._product_attribution()
+        _task_ctx: dict[str, Any] = {}
+        try:
+            import json as _json2
+
+            from .context_compiler import (
+                ContextCompileSpec,
+                prepare_invocation_context,
+                resolve_phase_requirements,
+                role_for_stage,
+                task_dependency_ids,
+            )
+
+            try:
+                _scope = _json2.loads(task.get("workspace_scope") or "[]")
+            except Exception:
+                _scope = []
+            _task_ctx_spec = ContextCompileSpec(
+                role=role_for_stage(STAGE_TASK, str(task.get("role", "implementation"))),
+                stage=STAGE_TASK,
+                product_project_id=_product_id,
+                project_phase_id=_phase_id,
+                mission_id=self.mission_id,
+                task_id=task_id,
+                provider=provider_name,
+                base_sha=task.get("checkpoint_before") or None,
+                task_objective=f"{task.get('title', '')}\n{task.get('description', '')}",
+                task_title=str(task.get("title", "")),
+                task_description=str(task.get("description", "")),
+                requirement_ids=resolve_phase_requirements(self.db, _product_id, _phase_id),
+                dependency_ids=task_dependency_ids(self.db, task_id),
+                workspace_scope=list(_scope) if isinstance(_scope, list) else [],
+            )
+            prompt, _task_ctx = prepare_invocation_context(
+                legacy_prompt=prompt, spec=_task_ctx_spec, db=self.db, config=self.config
+            )
+        except Exception:
+            logger.debug("task compilation unavailable for %s", task_id, exc_info=True)
+            _task_ctx = {}
         _pre_run_id = f"run-{_uuid.uuid4().hex[:12]}"
         self._active_invocation_runs[task_id] = _pre_run_id
         try:
@@ -1433,6 +1557,15 @@ class ParallelMissionEngine:
                     model_requested=getattr(adapter, "model", None) if provider_name == "opencode" else None,
                     run_id=_pre_run_id,
                     cancel_event=self._cancel,
+                    prompt_template_version=_task_ctx.get("prompt_template_version"),
+                    context_policy_version=_task_ctx.get("context_policy_version"),
+                    context_blocks_json=_task_ctx.get("context_blocks_json"),
+                    context_warnings_json=_task_ctx.get("context_warnings_json"),
+                    context_budget=_task_ctx.get("context_budget"),
+                    context_used=_task_ctx.get("context_used"),
+                    context_remaining=_task_ctx.get("context_remaining"),
+                    context_repeated_ratio=_task_ctx.get("context_repeated_ratio"),
+                    context_plan_revision=_task_ctx.get("context_plan_revision"),
                 )
             )
         except RuntimeError as exc:

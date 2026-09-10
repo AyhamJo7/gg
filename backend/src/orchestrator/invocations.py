@@ -117,6 +117,18 @@ class InvocationSpec:
     retry_of_run_id: str | None = None
     cancel_event: asyncio.Event | None = None
     on_output: Any = None
+    # Compiled-v2 metadata (Increment 2). When present, the prompt is the
+    # compiler's rendered output and these versions/blocks are persisted
+    # instead of the legacy-v1 defaults. Compilation consumes no quota.
+    prompt_template_version: str | None = None
+    context_policy_version: str | None = None
+    context_blocks_json: str | None = None
+    context_warnings_json: str | None = None
+    context_budget: int | None = None
+    context_used: int | None = None
+    context_remaining: int | None = None
+    context_repeated_ratio: float | None = None
+    context_plan_revision: int | None = None
 
     def __post_init__(self) -> None:
         self.owner.validate()
@@ -430,7 +442,11 @@ class InvocationService:
 
         # Persist PREPARED run + manifest + UNKNOWN usage in one step so
         # recovery always has an attributable record before spawn.
+        # Compiled-v2 prompts carry their versions/blocks; otherwise legacy-v1.
         now = utcnow().isoformat()
+        template_version = spec.prompt_template_version or TEMPLATE_VERSION_LEGACY
+        policy_version = spec.context_policy_version or CONTEXT_POLICY_LEGACY
+        is_compiled = template_version != TEMPLATE_VERSION_LEGACY or spec.context_blocks_json is not None
         self._db.insert(
             "provider_runs",
             {
@@ -467,31 +483,53 @@ class InvocationService:
                 "cli_version": None,
                 "session_ref": None,
                 "duration_ms": None,
-                "prompt_template_version": TEMPLATE_VERSION_LEGACY,
-                "context_policy_version": CONTEXT_POLICY_LEGACY,
+                "prompt_template_version": template_version,
+                "context_policy_version": policy_version,
                 "cancel_requested": 0,
             },
         )
-        self._db.insert(
-            "run_context_manifests",
-            {
-                "run_id": run_id,
-                "schema_version": "v1",
-                "prompt_hash": manifest.prompt_hash,
-                "hash_basis": manifest.hash_basis,
-                "prompt_chars": manifest.prompt_chars,
-                "prompt_bytes": manifest.prompt_bytes,
-                "prompt_words": manifest.prompt_words,
-                "estimated_prompt_tokens": manifest.estimated_prompt_tokens,
-                "estimator_id": manifest.estimator_id,
-                "blocks_json": json.dumps(
-                    [{"block_type": "legacy_prompt", "chars": manifest.prompt_chars, "decision": "included"}]
-                ),
-                "capture_status": "CAPTURED",
-                "redaction_status": "REDACTED",
-                "created_at": now,
-            },
-        )
+        manifest_row: dict[str, Any] = {
+            "run_id": run_id,
+            "schema_version": "v2" if is_compiled else "v1",
+            "prompt_hash": manifest.prompt_hash,
+            "hash_basis": manifest.hash_basis,
+            "prompt_chars": manifest.prompt_chars,
+            "prompt_bytes": manifest.prompt_bytes,
+            "prompt_words": manifest.prompt_words,
+            "estimated_prompt_tokens": manifest.estimated_prompt_tokens,
+            "estimator_id": manifest.estimator_id,
+            "blocks_json": spec.context_blocks_json
+            or json.dumps([{"block_type": "legacy_prompt", "chars": manifest.prompt_chars, "decision": "included"}]),
+            "capture_status": "CAPTURED",
+            "redaction_status": "REDACTED",
+            "created_at": now,
+        }
+        # v2 budget/warning columns are additive (migration 0011); older DBs
+        # without them must still accept the base manifest row.
+        try:
+            manifest_row.update(
+                {
+                    "budget_estimated_tokens": spec.context_budget,
+                    "used_estimated_tokens": spec.context_used,
+                    "remaining_estimated_tokens": spec.context_remaining,
+                    "repeated_context_ratio": spec.context_repeated_ratio,
+                    "warnings_json": spec.context_warnings_json or "[]",
+                    "plan_revision": spec.context_plan_revision,
+                }
+            )
+            self._db.insert("run_context_manifests", manifest_row)
+        except Exception:
+            logger.debug("v2 manifest columns unavailable, writing v1 row for %s", run_id, exc_info=True)
+            for key in (
+                "budget_estimated_tokens",
+                "used_estimated_tokens",
+                "remaining_estimated_tokens",
+                "repeated_context_ratio",
+                "warnings_json",
+                "plan_revision",
+            ):
+                manifest_row.pop(key, None)
+            self._db.insert("run_context_manifests", manifest_row)
         self._db.insert(
             "run_usage",
             {

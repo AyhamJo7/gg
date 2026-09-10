@@ -383,6 +383,67 @@ class MissionEngine:
             self.events.publish(EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value)
             handoff_content = self._make_handoff(role, last_provider, provider_name, ROLE_PROMPTS[role])
             prompt = self._build_prompt(role, mission, handoff_content, extra_context)
+            # Role-specific context compiler (Increment 2): deterministic
+            # projection over requirements/acceptance/architecture/handoffs.
+            # Legacy prompt remains the fallback baseline (legacy-v1).
+            _product_id_early, _phase_id_early = self._product_attribution()
+            _ctx_meta: dict[str, Any] = {}
+            try:
+                from .context_compiler import (
+                    ContextCompileSpec,
+                    finding_files,
+                    finding_ids_in_text,
+                    latest_candidate_shas,
+                    prepare_invocation_context,
+                    resolve_phase_requirements,
+                    role_for_stage,
+                )
+
+                _stage_early = {
+                    Role.PLANNING: "mission_plan",
+                    Role.IMPLEMENTATION: "implementation",
+                    Role.TESTING: "testing",
+                    Role.REVIEW: "review",
+                    Role.REPAIR: "repair",
+                }.get(role, role.value)
+                _req_ids = resolve_phase_requirements(self.db, _product_id_early, _phase_id_early)
+                _base_sha: str | None = None
+                _candidate_sha: str | None = None
+                _finding_ids: list[str] = []
+                _finding_changed: list[str] = []
+                if _stage_early in ("review", "repair"):
+                    # Reviewer needs the exact candidate range; repairer needs
+                    # the defect contract. Fail open: compiler warns on unknown.
+                    _base_sha, _candidate_sha = latest_candidate_shas(self.db, self.mission_id)
+                    _finding_changed = finding_files(self.db, self.mission_id)
+                    if _stage_early == "repair":
+                        _finding_ids = finding_ids_in_text(extra_context)
+                _constituted_spec = ContextCompileSpec(
+                    role=role_for_stage(_stage_early, role.value),
+                    stage=_stage_early,
+                    product_project_id=_product_id_early,
+                    project_phase_id=_phase_id_early,
+                    mission_id=self.mission_id,
+                    provider=provider_name,
+                    base_sha=_base_sha,
+                    candidate_sha=_candidate_sha,
+                    git_files_changed=_finding_changed,
+                    finding_ids=_finding_ids,
+                    task_objective=f"{mission.title}\n{mission.task}",
+                    task_title=mission.title,
+                    task_description=mission.task,
+                    requirement_ids=_req_ids,
+                    failure_text=extra_context[:4000] if extra_context else "",
+                    extra_context="",
+                    workspace_scope=[],
+                    attempt=attempt + 1,
+                )
+                prompt, _ctx_meta = prepare_invocation_context(
+                    legacy_prompt=prompt, spec=_constituted_spec, db=self.db, config=self.config
+                )
+            except Exception:
+                logger.debug("context compilation unavailable, using legacy prompt", exc_info=True)
+                _ctx_meta = {}
 
             task = TaskRecord(
                 mission_id=self.mission_id, role=role, status="running", prompt=prompt[-4000:], attempts=1
@@ -456,6 +517,15 @@ class MissionEngine:
                 attempt_number=attempt + 1,
                 cancel_event=self._cancel,
                 on_output=on_output,
+                prompt_template_version=_ctx_meta.get("prompt_template_version"),
+                context_policy_version=_ctx_meta.get("context_policy_version"),
+                context_blocks_json=_ctx_meta.get("context_blocks_json"),
+                context_warnings_json=_ctx_meta.get("context_warnings_json"),
+                context_budget=_ctx_meta.get("context_budget"),
+                context_used=_ctx_meta.get("context_used"),
+                context_remaining=_ctx_meta.get("context_remaining"),
+                context_repeated_ratio=_ctx_meta.get("context_repeated_ratio"),
+                context_plan_revision=_ctx_meta.get("context_plan_revision"),
             )
             self._current_adapter, self._current_run_id = adapter, _pre_run_id
             try:
