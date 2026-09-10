@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Badge } from "../components/Badge";
+import { EvidencePanel } from "../components/EvidencePanel";
 import { api } from "../lib/api";
 import { usePolling } from "../lib/hooks";
 import type { ProductGateRow, ProductProjectDetail } from "../lib/types";
@@ -352,6 +353,7 @@ function DeliveryTab({ project, run }: { project: ProductProjectDetail; run: (fn
             {project.blocking_reason && <> — {project.blocking_reason}</>}
           </p>
         </div>
+        <EvidencePanel projectId={project.id} />
         {pendingWaivers.length > 0 && (
           <div className="card" style={{ marginTop: 8 }} data-testid="waiver-panel">
             <h4>Failed criteria — authorize a waiver to proceed without them</h4>
@@ -407,6 +409,7 @@ function DeliveryTab({ project, run }: { project: ProductProjectDetail; run: (fn
         <h3>{report.product_name} — delivered</h3>
         <p>Exact commit: <span className="mono" data-testid="delivery-sha">{report.git_sha}</span></p>
         <p className="muted mono" style={{ fontSize: 12 }}>{report.repo_path}</p>
+        <EvidencePanel projectId={project.id} />
         <p style={{ fontSize: 13, whiteSpace: "pre-wrap" }}>{report.run_instructions}</p>
         {report.env_vars && report.env_vars.length > 0 && (
           <p style={{ fontSize: 13 }}>Environment variables (names): <span className="mono">{report.env_vars.join(", ")}</span></p>

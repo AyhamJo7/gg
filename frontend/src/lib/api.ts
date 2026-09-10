@@ -28,6 +28,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 import type {
   Analytics,
+  ArtifactEvidence,
   ContextAnalytics,
   DagDependencyInput,
   DagTaskInput,
@@ -172,6 +173,7 @@ export const api = {
       req<{ ok: boolean; sha?: string; findings?: string[] }>(`/api/product-projects/${id}/acceptance`, {
         method: "POST",
       }),
+    evidence: (id: string) => req<ArtifactEvidence>(`/api/product-projects/${id}/evidence`),
     waive: (id: string, target_kind: string, target_id: string, reason: string) =>
       req<{ ok: boolean }>(`/api/product-projects/${id}/waivers`, {
         method: "POST",

@@ -495,3 +495,19 @@ export interface DagDependencyInput {
   from_task_id: string;
   to_task_id: string;
 }
+
+export interface ArtifactEvidence {
+  candidate_sha: string | null;
+  plan_revision: number;
+  writers: Array<{ actor_type: string; provider: string | null; result_sha: string }>;
+  writers_complete: boolean;
+  review: unknown;
+  verification: unknown;
+  criteria: unknown;
+  fresh_checkout: unknown;
+  delivery_ready: boolean;
+  blocking_reasons: string[];
+  acceptance_state?: string | null;
+  delivery_sha?: string | null;
+  phase_attempts?: Array<Record<string, unknown>>;
+}

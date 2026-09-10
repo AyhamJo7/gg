@@ -1199,6 +1199,20 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         )
         status["acceptance_state"] = product.get("acceptance_state")
         status["delivery_sha"] = product.get("delivery_sha")
+        attempts: list[dict[str, Any]] = []
+        for phase in orchestrator.db.query(
+            "SELECT id FROM project_phases WHERE project_id=?", (project_id,)
+        ):
+            for att in orchestrator.db.query(
+                "SELECT id, phase_id, attempt_number, mission_id, trigger, status, base_sha,"
+                " result_sha, started_at, finished_at FROM project_phase_attempts"
+                " WHERE phase_id=? ORDER BY attempt_number ASC",
+                (phase["id"],),
+            ):
+                attempts.append({k: att.get(k) for k in (
+                    "id", "phase_id", "attempt_number", "mission_id", "trigger", "status",
+                    "base_sha", "result_sha", "started_at", "finished_at")})
+        status["phase_attempts"] = attempts
         return status
 
     @app.post("/api/operations/{operation_id}/cancel")
