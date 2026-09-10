@@ -18,9 +18,10 @@ class OpencodeAdapter(ProviderAdapter):
     name = "opencode"
     executable = "opencode"
 
-    def __init__(self, executable: str | None = None, model: str | None = None):
+    def __init__(self, executable: str | None = None, model: str | None = None, variant: str | None = None):
         super().__init__(executable)
         self.model = model
+        self.variant = variant
 
     def get_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(streaming_json=True, supports_cwd_flag=True)
@@ -29,12 +30,16 @@ class OpencodeAdapter(ProviderAdapter):
         argv = [
             self.executable,
             "run",
-            "--format", "json",
+            "--format",
+            "json",
             "--auto",
-            "--dir", str(request.workdir),
+            "--dir",
+            str(request.workdir),
         ]
         if self.model:
             argv += ["-m", self.model]
+        if self.variant:
+            argv += ["--variant", self.variant]
         argv.append(request.prompt)
         return argv
 
@@ -79,8 +84,4 @@ class OpencodeAdapter(ProviderAdapter):
 
     def is_success_marker(self, text: str) -> bool:
         normalized = text.replace(" ", "")
-        return (
-            '"type":"finish"' in normalized
-            or '"type":"done"' in normalized
-            or '"step_finish"' in normalized
-        )
+        return '"type":"finish"' in normalized or '"type":"done"' in normalized or '"step_finish"' in normalized

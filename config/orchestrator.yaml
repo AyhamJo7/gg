@@ -19,7 +19,8 @@ providers:
     executable: opencode
     # opencode's interactive default model may hang in headless runs;
     # pin a model verified to respond non-interactively.
-    model: opencode-go/kimi-k2.7-code
+    model: opencode-go/muse-spark-1.3-contributor
+    variant: xhigh
     timeout_minutes: 60
 
 orchestration:
