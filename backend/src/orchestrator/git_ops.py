@@ -164,6 +164,81 @@ async def diff_names(root: Path, base: str, head: str, limit: int = 100) -> list
     return [p for p in raw.split("\x00") if p.strip()][:limit]
 
 
+async def merge_tree_write(root: Path, ours: str, theirs: str) -> tuple[str | None, str]:
+    """Pure in-memory two-way merge (no worktree, no index state).
+
+    The merge base is git-computed (best common ancestor), which is correct
+    for dependency results sharing DAG-base ancestry. Returns (tree_sha,
+    conflict_detail). tree_sha is None on conflict or error; conflict_detail
+    names the conflicting paths when detectable. No -X ours/theirs options
+    are ever used: conflicts must surface, never auto-resolve.
+    """
+    res = await _spawn_git(root, "merge-tree", "--write-tree", ours, theirs)
+    out = (res.text or "").strip()
+    if res.returncode == 0 and out and "\n" not in out and len(out) == 40:
+        return out, ""
+    # Conflict or error: surface conflicting paths if present.
+    names: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if "<<<<<<<" in line:
+            candidate = line.split("<<<<<<<", 1)[1].strip().split()[-1]
+            if candidate and candidate not in names:
+                names.append(candidate)
+    detail = f"conflicting paths: {', '.join(names[:10])}" if names else (res.err_text[:300] or "merge failed")
+    return None, detail
+
+
+async def commit_tree(
+    root: Path, tree: str, parents: list[str], message: str, author: str = "GG Orchestrator <orchestrator@local>"
+) -> str | None:
+    """Create a commit object from a tree with fixed parents/message.
+
+    Note: author/committer timestamps still vary per run, so SHAs differ
+    across executions by design; determinism is defined over tree/content
+    (see dependency integration docs), not commit SHA equality.
+    """
+    if not tree or not parents:
+        return None
+    env_name, env_email = "GG Orchestrator", "orchestrator@local"
+    args = ["-c", f"user.name={env_name}", "-c", f"user.email={env_email}", "commit-tree", tree]
+    for parent in parents:
+        args.extend(["-p", parent])
+    args.extend(["-m", message])
+    res = await _spawn_git(root, *args)
+    if res.returncode != 0:
+        return None
+    sha = (res.text or "").strip()
+    return sha if len(sha) == 40 else None
+
+
+async def operation_in_progress(root: Path) -> str | None:
+    """Detect unfinished Git operations (merge/cherry-pick/revert/rebase).
+
+    Returns a short label or None. Read-only; used as a pre-launch gate so a
+    provider never starts inside a half-merged tree.
+    """
+    import asyncio as _asyncio
+    import os as _os
+
+    for ref, label in (
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+    ):
+        res = await _spawn_git(root, "rev-parse", "--verify", ref)
+        if res.returncode == 0:
+            return label
+    res = await _spawn_git(root, "rev-parse", "--absolute-git-dir")
+    git_dir = (res.text or "").strip()
+    if git_dir:
+        for sub in ("rebase-merge", "rebase-apply"):
+            exists = await _asyncio.to_thread(_os.path.isdir, str(Path(git_dir) / sub))
+            if exists:
+                return "rebase"
+    return None
+
+
 async def common_dir(root: Path) -> str:
     """Stable repository identity for scoping SHA evidence (git common dir)."""
     res = await _spawn_git(root, "rev-parse", "--git-common-dir")
