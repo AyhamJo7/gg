@@ -17,8 +17,12 @@ operations, and workspace escape.
   streamed lines and events pass through redaction.
 - Provenance/evidence records carry IDs, SHAs, statuses, and bounded
   summaries only — never credentials, raw prompts, secret env values, or
-  provider session contents. Evidence APIs are project-scoped; unknown
-  provenance is reported UNKNOWN, never guessed or backfilled.
+  provider session contents. Evidence APIs are project-scoped and every
+  evidence class is additionally scoped by repository identity + SHA, so one
+  repository's rows cannot certify another's; unknown provenance is reported
+  UNKNOWN, never guessed or backfilled. Mission start never stages or commits
+  unattributed workspace changes; only an explicit operator adoption creates
+  HUMAN_OPERATOR attribution.
 
 ### Workspace safety
 - `validate_workspace_path`: must exist, be a directory, and not be `$HOME` or `/`.

@@ -47,5 +47,9 @@ via `context.mode` for comparison) — change role policies there, not in ad hoc
 string builders. Do not claim verification for a SHA different from the
 candidate being delivered. After any code-writing repair, independent review
 of the new candidate is required. Never attribute pre-existing workspace
-changes to the current provider run. Preserve failed/retried attempts as
-history; delivery evidence is evaluated per exact SHA via `provenance.py`.
+changes to the current provider run. Writer membership follows actual
+committed contribution, never invocation role. Evidence is scoped by
+repository identity + SHA; keyless history cannot certify new artifacts.
+Mission start never auto-commits dirt — explicit adoption only; unknown
+dirt stays unknown. Preserve failed/retried attempts as history; delivery
+evidence is evaluated per exact SHA via `provenance.py`.

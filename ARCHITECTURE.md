@@ -137,25 +137,37 @@ warnings — never raw prompts); unknown telemetry is shown as unknown, never ze
 ## Artifact evidence and writer provenance
 
 Every code-affecting checkpoint is linked to its producer in
-`write_provenance` (provider run + base/result SHA, or HUMAN_OPERATOR / SYSTEM /
-UNKNOWN_EXTERNAL). Provider runs carry `retry_of_run_id` chains; roadmap phases
-keep immutable `project_phase_attempts` while `project_phases` holds the current
-pointer. Each review attempt is bound to its exact reviewed range
-(`reviews.reviewed_base/head_sha` + writer set); findings keep origin and
-verified-resolution lineage as their status evolves. Reviewer independence means
-reviewer outside the full code-writer set (planning/testing bookkeeping is
-tracked but does not taint independence); otherwise review is recorded degraded,
-never certified. Verification, criterion, and fresh-checkout executions persist
-as immutable SHA-bound attempts (`verification_attempts`, `criterion_attempts`,
-`fresh_checkout_attempts`); criteria are additionally bound to plan revision,
-with explicit RECHECK creating new attempts instead of reusing cache.
+`write_provenance` (provider run + base/result SHA, changed paths, or
+HUMAN_OPERATOR / SYSTEM / UNKNOWN_EXTERNAL). Writer membership follows
+actual committed contribution in the evaluated range — never invocation
+role: a no-change run does not taint reviewer independence, while a
+testing/planning run that commits code does. Provider runs carry
+`retry_of_run_id` chains; roadmap phases keep immutable
+`project_phase_attempts` while `project_phases` holds the current pointer.
+Each review attempt is bound to its exact reviewed range
+(`reviews.reviewed_base/head_sha` + writer set/detail) and repository;
+findings keep origin and verified-resolution lineage as their status evolves.
+Reviewer independence means reviewer outside the contributing writer set of
+the exact reviewed artifact; otherwise review is recorded degraded, never
+certified. All evidence (writes, reviews, verification, criteria,
+fresh checkouts) is scoped by repository identity + SHA — same hash text in
+another repository certifies nothing; keyless historical rows stay visible
+but cannot certify current artifacts. Verification, criterion, and
+fresh-checkout executions persist as immutable SHA-bound attempts
+(`verification_attempts`, `criterion_attempts`, `fresh_checkout_attempts`);
+criteria are additionally bound to plan revision, with explicit RECHECK
+creating new attempts instead of reusing cache.
 `GET /api/product-projects/{id}/evidence` evaluates one candidate SHA
 (review/verification/criteria/fresh/writers) and product delivery requires all
 of them to cover exactly the delivery SHA — any post-evidence change makes
-prior evidence stale and blocks delivery. Dirty workspaces block code-writing
-runs before execution; pre-existing dirt is checkpointed as HUMAN_OPERATOR at
-mission start; the operator can explicitly adopt later dirt via
-`POST /api/missions/{id}/adopt-changes` (adoption never certifies correctness).
+prior evidence stale and blocks delivery; the final transition re-reads HEAD
+and cleanliness under the shared repo mutation lock and re-evaluates the
+current artifact, so a candidate that moves mid-acceptance can never deliver
+as its superseded SHA. Dirty workspaces block code-writing runs before
+execution, and mission start never stages, commits, or auto-labels dirt:
+pre-existing changes wait on an explicit operator decision (adopt via
+`POST /api/missions/{id}/adopt-changes`, which alone creates HUMAN_OPERATOR —
+unknown dirt is never converted to human to force completeness).
 
 Under `make dev`, database/token files live in `backend/.orchestrator/`. Paths are
 cwd-relative; desktop launch can use a different state directory. Verification
