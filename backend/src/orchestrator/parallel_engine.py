@@ -1081,9 +1081,9 @@ class ParallelMissionEngine:
         eligible = [p for p in priorities if self.registry.is_eligible(p)]
 
         if role == Role.REVIEW and len(eligible) > 1:
-            from .provenance import INDEPENDENCE_ROLES, mission_provider_writers
+            from .provenance import mission_provider_writers
 
-            _writers, _ = mission_provider_writers(self.db, self.mission_id, INDEPENDENCE_ROLES)
+            _writers, _ = mission_provider_writers(self.db, self.mission_id)
             if not _writers:
                 _last_impl = self._last_provider_for(Role.IMPLEMENTATION)
                 _writers = {_last_impl} if _last_impl is not None else set()
@@ -1320,8 +1320,9 @@ class ParallelMissionEngine:
             _plan_st = await git_ops.status(project_path)
             if not _plan_st.is_clean:
                 max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
-                await git_ops.checkpoint(project_path, f"agent({provider_name}): planning checkpoint",
-                                         max_file_mb=max_mb)
+                await git_ops.checkpoint(
+                    project_path, f"agent({provider_name}): planning checkpoint", max_file_mb=max_mb
+                )
         except git_ops.GitError:
             logger.debug("planning checkpoint skipped", exc_info=True)
         try:

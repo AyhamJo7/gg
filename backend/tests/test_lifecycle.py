@@ -17,6 +17,7 @@ import pytest
 
 from conftest import make_config
 from orchestrator.db import Database
+from orchestrator.models import MissionStatus
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.providers.fake import FakeAdapter, PlanProvider, default_test_plan, gated_test_plan
 from orchestrator.sandbox import sandbox_available
@@ -119,6 +120,29 @@ async def start_planned_project(
     target = orch.db.get("projects", orch.db.get("product_projects", project["id"])["target_project_id"])
     assert target is not None
     seed_toolchain(Path(target["path"]), extra_scripts=extra_scripts)
+    # Explicit operator adoption (F-PROV-03 contract): the seeded target
+    # content predates any GG run, so the first phase mission blocks at the
+    # analyze gate until the operator adopts it. Model that action here.
+    await orch.coordinator.advance_project(project["id"])
+    for _ in range(100):
+        phases = orch.db.query("SELECT mission_id FROM project_phases WHERE project_id=?", (project["id"],))
+        mids = [p["mission_id"] for p in phases if p.get("mission_id")]
+        if not mids:
+            await asyncio.sleep(0.05)
+            continue
+        mission = orch.db.get("missions", mids[0])
+        if mission and mission["status"] == MissionStatus.WAITING_FOR_HUMAN.value:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("phase mission did not reach the attribution gate")
+    from orchestrator.provenance import adopt_head_as_human
+
+    adopted = await adopt_head_as_human(orch.db, Path(target["path"]), mission_id=mids[0])
+    assert adopted["adopted"] is True, adopted
+    gates = orch.db.query("SELECT id FROM human_gates WHERE mission_id=? AND status='open'", (mids[0],))
+    assert gates, "attribution gate must be open"
+    orch.resolve_gate(gates[0]["id"], "Adopted/committed/cleaned — continue")
     return project["id"]
 
 

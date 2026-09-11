@@ -892,8 +892,18 @@ class ProjectCoordinator:
                 == MissionStatus.WAITING_FOR_HUMAN.value
             )
             if not blocking and not mission_blocked:
+                mission = self.db.get("missions", phase["mission_id"]) if phase.get("mission_id") else None
+                if mission and mission["status"] in TERMINAL_MISSION_VALUES:
+                    # Gate resolved after the mission already finished: evaluate,
+                    # never relaunch (a READY reset here would duplicate the mission).
+                    return await self._evaluate_phase_mission_locked(project_id, phase, mission)
                 self.db.update(
-                    "project_phases", phase["id"], {"status": ProjectPhaseStatus.READY.value, "updated_at": utcnow()}
+                    "project_phases",
+                    phase["id"],
+                    {
+                        "status": ProjectPhaseStatus.RUNNING.value if mission else ProjectPhaseStatus.READY.value,
+                        "updated_at": utcnow(),
+                    },
                 )
                 return True
             return False
@@ -923,6 +933,10 @@ class ProjectCoordinator:
                             {"status": ProjectPhaseStatus.RUNNING.value, "updated_at": utcnow()},
                         )
                     return False
+                if mission:
+                    # Terminal mission still linked (e.g. resolved gate after
+                    # finish): evaluate it — launching again would duplicate.
+                    return await self._evaluate_phase_mission_locked(project_id, phase, mission)
             self._launch_phase_mission_locked(project_id, phase)
             return True
         if status == ProjectPhaseStatus.RUNNING.value:
@@ -1917,9 +1931,7 @@ RULES:
             # Re-evaluate the CURRENT artifact — never trust the pre-lock object.
             fresh_findings = await self._evidence_gate_findings(project_id, plan, repo, current_head)
             if fresh_findings:
-                return self._blocked_delivery(
-                    project_id, "; ".join(fresh_findings)[:2000], has_open_gates
-                )
+                return self._blocked_delivery(project_id, "; ".join(fresh_findings)[:2000], has_open_gates)
             delivery = self._build_delivery_report(project_id, plan, repo, current_head)
             self.db.update(
                 "product_projects",
@@ -1968,9 +1980,7 @@ RULES:
             ProductStatus.BLOCKED if not has_open_gates else ProductStatus.WAITING_FOR_HUMAN,
             reason=reason[:2000],
         )
-        self.events.publish(
-            EventType.PRODUCT_ACCEPTANCE_RECORDED, None, product_project_id=project_id, passed=False
-        )
+        self.events.publish(EventType.PRODUCT_ACCEPTANCE_RECORDED, None, product_project_id=project_id, passed=False)
         return {"ok": False, "findings": [reason]}
 
     async def _fresh_checkout_verify(

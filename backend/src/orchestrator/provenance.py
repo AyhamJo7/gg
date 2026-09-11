@@ -74,14 +74,14 @@ def _new_id(prefix: str) -> str:
 
 # -- write provenance ----------------------------------------------------------
 
-#: Roles whose provider runs are checkpoint-linked. Planning/testing runs can
-#: genuinely emit files (fake "ok" writes agent_work.txt; testing may fix
-#: failures), so they are tracked too — only review is excluded (a reviewer
-#: must not write code; its stray writes surface as UNKNOWN_EXTERNAL).
-#: Joining this set only ever *widens* reviewer exclusion, never narrows it.
-TRACKED_WRITE_ROLES = frozenset({"planning", "implementation", "testing", "repair"})
+#: Roles whose provider runs are checkpoint-linked. Every repo-affecting
+#: role is tracked — including review: a reviewer that unexpectedly dirties
+#: the tree must show up as a contributing writer (P-32), never vanish into
+#: an unattributed checkpoint. No-change runs record base==result and do
+#: not contribute (S-01).
+TRACKED_WRITE_ROLES = frozenset({"planning", "implementation", "testing", "review", "repair"})
 
-#: Backwards-compatible alias (Increment 3 seal used this name).
+#: Backwards-compatible alias.
 CODE_WRITING_ROLES = TRACKED_WRITE_ROLES
 
 
@@ -278,16 +278,12 @@ async def range_writers(
     seen: dict[str, dict[str, Any]] = {}
     unattributed: list[str] = []
     for sha in commits:
-        rows = db.query(
-            "SELECT * FROM write_provenance WHERE result_sha=? AND repo_key=?", (sha, expected_key)
-        )
+        rows = db.query("SELECT * FROM write_provenance WHERE result_sha=? AND repo_key=?", (sha, expected_key))
         if rows:
             for r in rows:
                 role = r.get("role")
                 r_base = normalize_sha(r.get("base_sha"))
-                contributing = bool(
-                    r.get("actor_type") == ACTOR_PROVIDER and (r_base is None or r_base != sha)
-                )
+                contributing = bool(r.get("actor_type") == ACTOR_PROVIDER and (r_base is None or r_base != sha))
                 key = f"{r.get('actor_type')}:{r.get('provider')}:{r.get('run_id')}:{sha}"
                 paths: list[str] = []
                 if contributing and r_base:
@@ -359,7 +355,9 @@ INDEPENDENCE_ROLES = frozenset({"implementation", "repair"})
 
 
 #: Stages whose provider runs are expected to have write rows.
-WRITE_STAGES = frozenset({"product_plan", "mission_plan", "dag_plan", "implementation", "repair", "task", "testing"})
+WRITE_STAGES = frozenset(
+    {"product_plan", "mission_plan", "dag_plan", "implementation", "repair", "task", "testing", "review"}
+)
 
 
 def mission_provider_writers(db: Any, mission_id: str) -> tuple[set[str], bool]:
@@ -388,7 +386,7 @@ def mission_provider_writers(db: Any, mission_id: str) -> tuple[set[str], bool]:
             writers.add(str(r["provider"]))
     runs = db.query(
         "SELECT id FROM provider_runs WHERE mission_id=? AND failure_class='NONE' AND stage IN"
-        " ('product_plan','mission_plan','dag_plan','implementation','repair','task','testing')",
+        " ('product_plan','mission_plan','dag_plan','implementation','repair','task','testing','review')",
         (mission_id,),
     )
     if not runs:
@@ -521,6 +519,48 @@ async def adopt_head_as_human(
     return {"adopted": True, "base_sha": base, "result_sha": result, "row_id": row_id}
 
 
+async def _reviewer_outside_range_writers(db: Any, repo: Path | None, rev: dict[str, Any], candidate_sha: str) -> bool:
+    """True iff the reviewer did not contribute to the exact reviewed artifact.
+
+    Membership is resolved against writers of (reviewed_base..reviewed_head]
+    — NOT the full delivery history: a reviewer who later writes in a
+    subsequent phase does not retroactively taint their earlier review of
+    an earlier artifact. Falls back to the stored writer set when the range
+    cannot be resolved; fails closed when neither exists.
+    """
+    import json as _json
+
+    reviewer = str(rev.get("review_provider") or "")
+    if not reviewer:
+        return False
+    base = normalize_sha(rev.get("reviewed_base_sha"))
+    head = normalize_sha(rev.get("reviewed_head_sha")) or normalize_sha(candidate_sha)
+    if repo is not None and base and head:
+        try:
+            from . import git_ops
+
+            if await git_ops.commit_exists(repo, head) and (base == head or await git_ops.commit_exists(repo, base)):
+                exact = await range_writers(db, repo, base, head)
+                if exact["checked"]:
+                    return reviewer not in provider_writers(exact["writers"])
+        except Exception:
+            logger.debug("per-review range resolution failed", exc_info=True)
+    try:
+        stored = _json.loads(rev.get("writer_set_json") or "[]")
+    except Exception:
+        stored = []
+    if isinstance(stored, list) and stored:
+        return reviewer not in {str(p) for p in stored}
+    # No stored set: mission-wide contribution approximation (fail closed
+    # when provenance is incomplete; vacuously independent when nothing
+    # was ever written).
+    try:
+        writers, complete = mission_provider_writers(db, str(rev.get("mission_id") or ""))
+    except Exception:
+        return False
+    return (reviewer not in writers) and complete
+
+
 def _writer_details(range_detail: list[dict[str, Any]], writer_set: list[str]) -> list[dict[str, Any]]:
     """Stable safe writer representation (S-32): provider, role, run, actor.
 
@@ -544,8 +584,15 @@ def _writer_details(range_detail: list[dict[str, Any]], writer_set: list[str]) -
         )
     return [
         by_provider.get(
-            p, {"provider": p, "role": None, "run_id": None, "actor_type": ACTOR_PROVIDER, "result_sha": None,
-                "contributing": True}
+            p,
+            {
+                "provider": p,
+                "role": None,
+                "run_id": None,
+                "actor_type": ACTOR_PROVIDER,
+                "result_sha": None,
+                "contributing": True,
+            },
         )
         for p in writer_set
     ]
@@ -793,7 +840,8 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
         blocking.append(
             f"writer provenance INCOMPLETE: unattributed commits {', '.join(s[:8] for s in full['unattributed'][:5])}"
         )
-    provider_set = provider_writers(full["writers"])
+    # Full-range writers feed display + completeness; per-review membership
+    # is resolved against each review's own range below.
 
     # Review: every phase candidate needs an independent exact review, and no
     # non-SYSTEM commit may sit uncovered after the last reviewed tip.
@@ -851,10 +899,15 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
                     f"phase {phase.phase_key or phase.phase_id} changed after review "
                     f"(reviewed {str(rev.get('reviewed_head_sha') or '?')[:8]}, now {csha[:8]})"
                 )
-            elif str(rev.get("review_provider") or "") in provider_set:
+            elif not await _reviewer_outside_range_writers(
+                db,
+                assert_path(inputs.repo) if repo_ok else None,
+                rev,
+                csha,
+            ):
                 entry.update(
                     state=STATE_FAILED,
-                    detail=f"reviewer {rev.get('review_provider')} is in the candidate writer set",
+                    detail=f"reviewer {rev.get('review_provider')} contributed to the reviewed artifact",
                     reviewer=rev.get("review_provider"),
                 )
                 review_state = STATE_FAILED
@@ -916,9 +969,7 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
         out["verification"] = {"state": STATE_VALID, "sha": candidate, "attempt_id": vrows[0]["id"]}
     else:
         any_rows = [
-            r
-            for r in db.query("SELECT * FROM verification_attempts WHERE sha=?", (candidate,))
-            if _verify_in_scope(r)
+            r for r in db.query("SELECT * FROM verification_attempts WHERE sha=?", (candidate,)) if _verify_in_scope(r)
         ]
         out["verification"] = {
             "state": STATE_MISSING if not any_rows else STATE_FAILED,
@@ -1024,9 +1075,7 @@ def assert_path(repo: Path | None) -> Path:
 
 def _sha_has_provenance(db: Any, sha: str, repo_key: str = "") -> bool:
     if repo_key:
-        rows = db.query(
-            "SELECT id FROM write_provenance WHERE result_sha=? AND repo_key=? LIMIT 1", (sha, repo_key)
-        )
+        rows = db.query("SELECT id FROM write_provenance WHERE result_sha=? AND repo_key=? LIMIT 1", (sha, repo_key))
     else:
         rows = db.query("SELECT id FROM write_provenance WHERE result_sha=? LIMIT 1", (sha,))
     return bool(rows)

@@ -55,6 +55,11 @@ def test_single_writer_bound_to_exact_sha(tmp_path: Path, workspace: Path):
         mission = orch.create_mission("p1", "Build thing", "Create a file", "AUTONOMOUS", "balanced")
         await _run_mission(orch, mission["id"])
         assert orch.db.get("missions", mission["id"])["status"] == MissionStatus.COMPLETED.value
+        # S-10: provenance tracking adds zero provider calls — exactly the
+        # four phase executions, each with exactly one durable run.
+        total_calls = sum(a.calls for a in adapters.values())
+        total_runs = orch.db.query("SELECT COUNT(*) as n FROM provider_runs")[0]["n"]
+        assert total_calls == total_runs == 4, (total_calls, total_runs)
         impl_runs = orch.db.query(
             "SELECT * FROM provider_runs WHERE mission_id=? AND stage='implementation'", (mission["id"],)
         )
@@ -132,9 +137,10 @@ def test_retry_chain_links_runs(tmp_path: Path, workspace: Path):
     asyncio.run(main())
 
 
-def test_dirty_workspace_owned_as_human_at_analyze(tmp_path: Path, workspace: Path):
-    """P-03/P-06: pre-existing dirt is checkpointed as HUMAN at analyze time —
-    never attributed to the provider."""
+def test_dirty_workspace_blocks_start_without_commit(tmp_path: Path, workspace: Path):
+    """F-PROV-03/P-36/S-03/S-04/§17: dirty mission start stages/commits
+    nothing, launches nothing, and waits honestly — then explicit adoption
+    unblocks with HUMAN_OPERATOR provenance for the new SHA."""
 
     async def main() -> None:
         adapters = {"fake-a": FakeAdapter("fake-a", ["ok"]), "fake-b": FakeAdapter("fake-b", ["ok"])}
@@ -145,34 +151,53 @@ def test_dirty_workspace_owned_as_human_at_analyze(tmp_path: Path, workspace: Pa
         _git(workspace, "config", "user.name", "t")
         _git(workspace, "add", ".")
         _git(workspace, "commit", "-m", "init")
-        (workspace / "human_edit.txt").write_text("operator was here\n")
+        head_a = _git(workspace, "rev-parse", "HEAD")
+        (workspace / "README.md").write_text("# operator edit\n")
+        (workspace / "notes.txt").write_text("untracked operator note\n")
         _seed_project(orch, workspace)
         mission = orch.create_mission("p1", "Build thing", "Create a file", "AUTONOMOUS", "balanced")
-        await _run_mission(orch, mission["id"])
-        # Analyze owns pre-existing dirt as HUMAN; the mission can proceed.
-        assert orch.db.get("missions", mission["id"])["status"] == MissionStatus.COMPLETED.value
+        orch.start_mission(mission["id"])
+        engine_task = orch._engine_tasks[mission["id"]]
+        # Wait for the honest block (bounded; never hangs the suite).
+        for _ in range(200):
+            row = orch.db.get("missions", mission["id"])
+            if row["status"] == MissionStatus.WAITING_FOR_HUMAN.value:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("mission did not block for operator decision")
+        # Proof of no automatic adoption: nothing executed, HEAD pinned,
+        # contents untouched, zero provenance rows.
+        assert all(a.calls == 0 for a in adapters.values()), "provider execute calls = 0"
+        assert orch.db.query("SELECT COUNT(*) as n FROM provider_runs")[0]["n"] == 0
+        assert _git(workspace, "rev-parse", "HEAD") == head_a, "HEAD remains A"
+        assert (workspace / "README.md").read_text() == "# operator edit\n", "X untouched"
+        assert (workspace / "notes.txt").read_text() == "untracked operator note\n", "Y untouched"
+        assert orch.db.query("SELECT COUNT(*) as n FROM write_provenance")[0]["n"] == 0, "no HUMAN row"
+        gates = orch.db.query("SELECT * FROM human_gates WHERE mission_id=? AND status='open'", (mission["id"],))
+        assert gates, "explicit operator gate required"
+        assert "nattribut" in (gates[0]["reason"] + gates[0]["detail"]), "reason must explain attribution"
+        # Operator explicitly adopts -> new SHA B with HUMAN_OPERATOR row.
+        adopted = await adopt_head_as_human(orch.db, workspace, mission_id=mission["id"])
+        assert adopted["adopted"] is True
+        head_b = adopted["result_sha"]
+        assert head_b != head_a
         human_rows = orch.db.query(
             "SELECT * FROM write_provenance WHERE mission_id=? AND actor_type='HUMAN_OPERATOR'", (mission["id"],)
         )
-        assert len(human_rows) == 1, "pre-existing changes get exactly one HUMAN row"
-        # ...and no provider row claims to have PRODUCED the human commit
-        # (no-change rows legitimately reference the same HEAD as base==result).
-        human_sha = human_rows[0]["result_sha"]
-        producers = orch.db.query(
-            "SELECT base_sha FROM write_provenance WHERE mission_id=? AND actor_type='PROVIDER' AND result_sha=?",
-            (mission["id"], human_sha),
-        )
-        assert producers, "expected rows referencing the human HEAD"
-        assert all(p["base_sha"] == human_sha for p in producers), (
-            "only no-change provider rows may reference the human commit"
-        )
+        assert len(human_rows) == 1 and human_rows[0]["result_sha"] == head_b
+        # Resolve the gate -> mission resumes and completes on clean tree.
+        orch.resolve_gate(gates[0]["id"], "Adopted/committed/cleaned — continue")
+        await asyncio.wait_for(engine_task, timeout=60)
+        assert orch.db.get("missions", mission["id"])["status"] == MissionStatus.COMPLETED.value
         await orch.shutdown()
 
     asyncio.run(main())
 
 
 def test_dirty_workspace_no_checkpoint_backend(tmp_path: Path, workspace: Path):
-    """P-03: with auto-checkpoint disabled, unattributed dirt fails closed pre-execution."""
+    """P-03: with auto-checkpoint disabled, unattributed dirt still blocks
+    via gate (never fails closed into silent legacy execution)."""
     from conftest import make_config as _make_config
 
     async def main() -> None:
@@ -189,12 +214,19 @@ def test_dirty_workspace_no_checkpoint_backend(tmp_path: Path, workspace: Path):
         (workspace / "uncommitted.txt").write_text("dirt\n")
         _seed_project(orch, workspace)
         mission = orch.create_mission("p1", "Build thing", "Create a file", "AUTONOMOUS", "balanced")
-        await _run_mission(orch, mission["id"])
-        final = orch.db.get("missions", mission["id"])
-        assert final["status"] == MissionStatus.FAILED.value
-        assert "unattributed changes" in (final.get("blocking_issue") or "")
+        orch.start_mission(mission["id"])
+        for _ in range(200):
+            row = orch.db.get("missions", mission["id"])
+            if row["status"] == MissionStatus.WAITING_FOR_HUMAN.value:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("mission did not block for operator decision")
         assert all(a.calls == 0 for a in adapters.values())
         assert orch.db.query("SELECT COUNT(*) as n FROM provider_runs")[0]["n"] == 0
+        assert orch.db.query("SELECT COUNT(*) as n FROM write_provenance")[0]["n"] == 0
+        orch.cancel_mission(mission["id"])
+        await asyncio.wait_for(orch._engine_tasks[mission["id"]], timeout=30)
         await orch.shutdown()
 
     asyncio.run(main())
@@ -553,6 +585,149 @@ def test_criterion_recheck_creates_new_attempt(tmp_path: Path):
         await orch.shutdown()
 
     _asyncio.run(main())
+
+
+def test_delivery_race_candidate_change_blocks(tmp_path: Path):
+    """F-PROV-04/P-34/S-07/S-08/S-09/§21: repo advances to B during
+    acceptance sampled at A -> BLOCKED, never DELIVERED(A). Deterministic:
+    barrier inside fresh-checkout verification, no sleeps."""
+    import asyncio as _asyncio
+
+    from test_lifecycle import drive_project, standard_adapters, start_planned_project
+    from test_lifecycle import make_orch as _make_lifecycle_orch
+
+    async def main() -> None:
+        orch = await _make_lifecycle_orch(tmp_path, standard_adapters())
+        pid = await start_planned_project(tmp_path, orch)
+        project = await drive_project(orch, pid)
+        assert project["state"] == "DELIVERED", project.get("blocking_reason")
+        sha_a = project["delivery_sha"]
+        target = orch.db.get("projects", orch.db.get("product_projects", pid)["target_project_id"])
+        repo = Path(target["path"])
+        assert _git(repo, "rev-parse", "HEAD") == sha_a
+
+        # Re-open acceptance, then advance the repo mid-acceptance via a
+        # barrier inside fresh-checkout verification.
+        orch.db.update("product_projects", pid, {"state": "FINAL_ACCEPTANCE", "acceptance_state": "PENDING"})
+        real_fresh = orch.coordinator._fresh_checkout_verify
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _barrier_fresh(r, s, p=None, plan=None):  # noqa: ANN001, ANN202
+            entered.set()
+            await asyncio.wait_for(release.wait(), timeout=120)
+            return await real_fresh(r, s, p, plan)
+
+        orch.coordinator._fresh_checkout_verify = _barrier_fresh  # type: ignore[method-assign]
+        accept_task = asyncio.create_task(orch.coordinator.run_acceptance(pid))
+        await asyncio.wait_for(entered.wait(), timeout=120)
+        # External advancement while acceptance is inside fresh checkout.
+        (repo / "race.txt").write_text("external commit\n")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-m", "race B")
+        sha_b = _git(repo, "rev-parse", "HEAD")
+        assert sha_b != sha_a
+        release.set()
+        result = await asyncio.wait_for(accept_task, timeout=300)
+        assert result["ok"] is False, result
+        final = orch.db.get("product_projects", pid)
+        assert final["state"] != "DELIVERED", "superseded SHA must never deliver"
+        assert final.get("delivery_sha") != sha_b, "no delivery record for the moved candidate"
+        assert _git(repo, "rev-parse", "HEAD") == sha_b, "operator repo untouched by the fence"
+        reason = (final.get("blocking_reason") or "") + str(result.get("findings"))
+        assert "candidate changed" in reason or "changed during acceptance" in reason, reason
+        await orch.shutdown()
+
+    _asyncio.run(main())
+
+
+def test_delivery_race_dirty_workspace_blocks(tmp_path: Path):
+    """F-PROV-04 dirty variant: HEAD still A but tree dirtied mid-acceptance."""
+    import asyncio as _asyncio
+
+    from test_lifecycle import drive_project, standard_adapters, start_planned_project
+    from test_lifecycle import make_orch as _make_lifecycle_orch
+
+    async def main() -> None:
+        orch = await _make_lifecycle_orch(tmp_path, standard_adapters())
+        pid = await start_planned_project(tmp_path, orch)
+        project = await drive_project(orch, pid)
+        assert project["state"] == "DELIVERED", project.get("blocking_reason")
+        target = orch.db.get("projects", orch.db.get("product_projects", pid)["target_project_id"])
+        repo = Path(target["path"])
+        orch.db.update("product_projects", pid, {"state": "FINAL_ACCEPTANCE", "acceptance_state": "PENDING"})
+        real_fresh = orch.coordinator._fresh_checkout_verify
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _barrier_fresh(r, s, p=None, plan=None):  # noqa: ANN001, ANN202
+            entered.set()
+            await asyncio.wait_for(release.wait(), timeout=120)
+            return await real_fresh(r, s, p, plan)
+
+        orch.coordinator._fresh_checkout_verify = _barrier_fresh  # type: ignore[method-assign]
+        accept_task = asyncio.create_task(orch.coordinator.run_acceptance(pid))
+        await asyncio.wait_for(entered.wait(), timeout=120)
+        (repo / "uncommitted.txt").write_text("dirt\n")
+        release.set()
+        result = await asyncio.wait_for(accept_task, timeout=300)
+        assert result["ok"] is False, result
+        final = orch.db.get("product_projects", pid)
+        assert final["state"] != "DELIVERED"
+        assert "dirty" in ((final.get("blocking_reason") or "") + str(result.get("findings"))).lower()
+        # P-28: the dirt is still there (fence never auto-commits/discards).
+        assert (repo / "uncommitted.txt").read_text() == "dirt\n"
+        await orch.shutdown()
+
+    _asyncio.run(main())
+
+
+def test_reviewer_mutation_is_attributed_not_certified(tmp_path: Path, workspace: Path):
+    """P-32/§36: a reviewer that dirties the tree gets a PROVIDER write row
+    for its own commit (attributed, never UNKNOWN) — and therefore joins the
+    writer set for later ranges instead of silently certifying them."""
+    from orchestrator.providers.fake import WorkspaceWriterProvider
+
+    async def main() -> None:
+        adapters = {
+            "fake-impl": FakeAdapter("fake-impl", ["ok", "ok", "ok"]),
+            "fake-rev": WorkspaceWriterProvider("fake-rev", filename="reviewer_note.txt", content="review"),
+        }
+        cfg = make_config(providers=["fake-impl", "fake-rev"])
+        cfg.raw.setdefault("priority", {}).update(
+            {
+                "planning": ["fake-impl"],
+                "implementation": ["fake-impl"],
+                "testing": ["fake-impl"],
+                "review": ["fake-rev"],
+                "repair": ["fake-impl"],
+            }
+        )
+        orch = make_orchestrator(tmp_path, adapters, config=cfg)
+        await orch.registry.detect_all()
+        _seed_project(orch, workspace)
+        mission = orch.create_mission("p1", "Build thing", "Create a file", "AUTONOMOUS", "balanced")
+        await _run_mission(orch, mission["id"])
+        db = orch.db
+        # Review output is unparseable (writer provider emits no findings
+        # block) -> mission UNVERIFIED, but provenance must be exact.
+        assert db.get("missions", mission["id"])["status"] == MissionStatus.UNVERIFIED.value
+        rev_runs = db.query("SELECT * FROM provider_runs WHERE mission_id=? AND role='review'", (mission["id"],))
+        assert rev_runs, "review run must exist"
+        rev_rows = db.query("SELECT * FROM write_provenance WHERE run_id=?", (rev_runs[0]["id"],))
+        assert len(rev_rows) == 1, "review run gets its own write row"
+        assert rev_rows[0]["actor_type"] == "PROVIDER"
+        assert rev_rows[0]["provider"] == "fake-rev"
+        assert rev_rows[0]["result_sha"] != rev_rows[0]["base_sha"], "reviewer change is a real commit"
+        # ...so a later range containing it names the reviewer as a writer.
+        from orchestrator.provenance import mission_provider_writers
+
+        writers, complete = mission_provider_writers(db, mission["id"])
+        assert "fake-rev" in writers
+        assert complete, "attributed reviewer dirt keeps provenance complete (not UNKNOWN)"
+        await orch.shutdown()
+
+    asyncio.run(main())
 
 
 def test_evidence_and_adopt_endpoints(tmp_path: Path, workspace: Path):
