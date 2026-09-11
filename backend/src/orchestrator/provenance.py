@@ -350,10 +350,6 @@ def provider_writers(writers: list[dict[str, Any]]) -> set[str]:
     }
 
 
-#: Kept for import compatibility; independence no longer consults roles.
-INDEPENDENCE_ROLES = frozenset({"implementation", "repair"})
-
-
 #: Stages whose provider runs are expected to have write rows.
 WRITE_STAGES = frozenset(
     {"product_plan", "mission_plan", "dag_plan", "implementation", "repair", "task", "testing", "review"}
