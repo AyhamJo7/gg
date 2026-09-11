@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,13 @@ from orchestrator import git_ops
 from orchestrator.models import FailureClass, MissionStatus
 from orchestrator.providers.classify import classify_output
 from orchestrator.providers.fake import FakeAdapter
+
+
+def _commit_fixture(workspace: Path) -> None:
+    """Commit fixture files so missions start clean (F-PROV-03): these tests
+    pin exhaustion counting, not the dirty-start gate."""
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=workspace, check=True, capture_output=True)
 
 # ===========================================================================
 # AGY quota classification
@@ -46,6 +54,7 @@ def test_agy_quota_phrase_in_source_code_exit_zero_is_none():
 def test_checkpoint_failure_survives_restart(tmp_path: Path, workspace: Path):
     async def scenario():
         await git_ops.init_repo(workspace)
+        _commit_fixture(workspace)
         providers = {"fake-a": FakeAdapter("fake-a", ["ok"])}
         orch = make_orchestrator(tmp_path, providers)
         orch.db.insert("projects", {
@@ -82,6 +91,7 @@ def test_checkpoint_failure_survives_restart(tmp_path: Path, workspace: Path):
 def test_checkpoint_success_resets_failure_count(tmp_path: Path, workspace: Path):
     async def scenario():
         await git_ops.init_repo(workspace)
+        _commit_fixture(workspace)
         providers = {"fake-a": FakeAdapter("fake-a", ["ok"])}
         orch = make_orchestrator(tmp_path, providers)
         orch.db.insert("projects", {

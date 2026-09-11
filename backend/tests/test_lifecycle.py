@@ -111,6 +111,7 @@ async def start_planned_project(
     orch: Orchestrator,
     plan: dict[str, Any] | None = None,
     extra_scripts: dict[str, str] | None = None,
+    extra_files: dict[str, str] | None = None,
     **kwargs: Any,
 ) -> str:
     project = orch.coordinator.create_project("Test Product", "prove the lifecycle", **kwargs)
@@ -120,6 +121,12 @@ async def start_planned_project(
     target = orch.db.get("projects", orch.db.get("product_projects", project["id"])["target_project_id"])
     assert target is not None
     seed_toolchain(Path(target["path"]), extra_scripts=extra_scripts)
+    # Setup files land BEFORE any mission launches so the single explicit
+    # adoption below covers all pre-existing content deterministically.
+    for rel, content in (extra_files or {}).items():
+        dest = Path(target["path"]) / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
     # Explicit operator adoption (F-PROV-03 contract): the seeded target
     # content predates any GG run, so the first phase mission blocks at the
     # analyze gate until the operator adopts it. Model that action here.

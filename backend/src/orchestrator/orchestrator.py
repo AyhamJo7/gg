@@ -400,6 +400,26 @@ class Orchestrator:
             gate_id,
             {"status": "resolved", "resolution": resolution, "resolved_at": utcnow()},
         )
+        # Cascade to project-gate mirrors so product phases tracking this
+        # mission gate unblock together (mirrors are derivative, never
+        # authoritative on their own).
+        try:
+            for mirror in self.db.query(
+                "SELECT id, project_id FROM project_gates WHERE mission_gate_id=? AND status='open'", (gate_id,)
+            ):
+                self.db.update(
+                    "project_gates",
+                    mirror["id"],
+                    {"status": "resolved", "resolution": resolution, "resolved_at": utcnow()},
+                )
+                self.events.publish(
+                    EventType.PRODUCT_GATE_RESOLVED,
+                    mission_id,
+                    product_project_id=mirror.get("project_id"),
+                    gate_id=mirror["id"],
+                )
+        except Exception:
+            logger.debug("project gate mirror cascade failed for %s", gate_id, exc_info=True)
         mission_id = gate["mission_id"]
         self.events.publish(EventType.HUMAN_GATE_RESOLVED, mission_id, gate_id=gate_id, resolution=resolution)
         if resolution.lower() in ("cancel", "cancel mission"):

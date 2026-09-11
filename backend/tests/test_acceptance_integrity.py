@@ -41,12 +41,13 @@ async def _run_with_plan(
     plan: dict[str, Any],
     extra_adapters: dict[str, FakeAdapter] | None = None,
     extra_scripts: dict[str, str] | None = None,
+    extra_files: dict[str, str] | None = None,
 ) -> tuple[Orchestrator, str]:
     adapters = standard_adapters(plan)
     if extra_adapters:
         adapters.update(extra_adapters)
     orch = await make_orch(tmp_path, adapters)
-    pid = await start_planned_project(tmp_path, orch, extra_scripts=extra_scripts)
+    pid = await start_planned_project(tmp_path, orch, extra_scripts=extra_scripts, extra_files=extra_files)
     return orch, pid
 
 
@@ -320,14 +321,16 @@ async def test_restart_reuses_criterion_results(tmp_path: Path):
     # correctly rejected, same as it would be for a real escape attempt.
     probe_script = 'node -e \'require("fs").appendFileSync("probe-count.txt","x")\''
     plan = _plan_with_verify("npm run probe")
-    orch, pid = await _run_with_plan(tmp_path, plan, extra_scripts={"probe": probe_script})
+    orch, pid = await _run_with_plan(
+        tmp_path, plan, extra_scripts={"probe": probe_script}, extra_files={".gitignore": "probe-count.txt\n"}
+    )
     target = orch.db.get("projects", orch.db.get("product_projects", pid)["target_project_id"])
     repo = Path(target["path"])
     counter = repo / "probe-count.txt"
     # Gitignored: the probe's side-effect file must not itself perturb the
     # repo's checkpointed SHA (which the restart-reuse cache below keys on)
     # — it's an out-of-band test probe, not part of the product being built.
-    (repo / ".gitignore").write_text("probe-count.txt\n")
+    # (Written via extra_files so the single explicit adoption covers it.)
     project = await drive_project(orch, pid)
     assert project["state"] == "DELIVERED", project.get("blocking_reason")
     assert counter.read_text() == "xx"  # one run per criterion

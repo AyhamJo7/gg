@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 
 from conftest import make_orchestrator
 from orchestrator import git_ops
 from orchestrator.models import EventType, MissionStatus
 from orchestrator.providers.fake import FakeAdapter
+
+
+def _commit_fixture(workspace: Path) -> None:
+    """Commit fixture files so the mission starts clean (F-PROV-03): these
+    tests pin checkpoint-exhaustion behavior, not the dirty-start gate —
+    a dirty start must gate, which would mask the exhaustion path."""
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=workspace, check=True, capture_output=True)
 
 
 def _seed_project(orch, workspace: Path) -> None:
@@ -19,6 +28,7 @@ def _seed_project(orch, workspace: Path) -> None:
 def test_checkpoint_exhaustion_prevents_completed(tmp_path: Path, workspace: Path) -> None:
     async def scenario() -> None:
         await git_ops.init_repo(workspace)
+        _commit_fixture(workspace)
         providers = {"fake-a": FakeAdapter("fake-a", ["ok"])}
         orch = make_orchestrator(tmp_path, providers)
         _seed_project(orch, workspace)
@@ -59,6 +69,7 @@ def test_checkpoint_exhaustion_prevents_completed(tmp_path: Path, workspace: Pat
 def test_transient_checkpoint_failure_allows_completion(tmp_path: Path, workspace: Path) -> None:
     async def scenario() -> None:
         await git_ops.init_repo(workspace)
+        _commit_fixture(workspace)
         providers = {"fake-a": FakeAdapter("fake-a", ["ok"])}
         orch = make_orchestrator(tmp_path, providers)
         _seed_project(orch, workspace)

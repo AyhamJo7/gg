@@ -912,6 +912,47 @@ class MissionEngine:
         self._set_status(MissionStatus.COMPLETED, current_provider=None, git_head=head)
         self.events.publish(EventType.MISSION_COMPLETED, self.mission_id)
 
+    async def _gate_unattributed_dirt(
+        self, project_path: Path, st: Any, second: bool = False, paths: list[str] | None = None
+    ) -> None:
+        """Block mission start on unattributed dirt (F-PROV-03/S-03/S-04).
+
+        Nothing is staged, committed, or attributed. The operator adopts
+        (explicit HUMAN_OPERATOR), commits/cleans manually, then resolves.
+        """
+        from .provenance import capture_write_start
+
+        if paths is None:
+            _, _, paths = await capture_write_start(project_path)
+        listed = ", ".join((paths or [])[:8]) or "unlisted paths"
+        head = st.head if st else None
+        if second:
+            await self._create_gate(
+                reason="Workspace still has unattributed changes",
+                detail=(
+                    "The workspace is still dirty after the gate resolution"
+                    f" ({listed}). Adopt, commit, or clean"
+                    " the remaining changes, then resolve. No provider has been started."
+                ),
+                choices=["Adopted/committed/cleaned — continue", "Cancel mission"],
+                recommended="Adopted/committed/cleaned — continue",
+            )
+            return
+        await self._create_gate(
+            reason="Unattributed workspace changes need an operator decision",
+            detail=(
+                "Pre-existing repository changes were detected before any provider ran"
+                f" (HEAD {head or 'unknown'}; {listed}). GG cannot safely attribute"
+                " these changes, so nothing was staged, committed, or assigned to a provider."
+                " Choose: explicitly adopt them (POST"
+                f" /api/missions/{self.mission_id}/adopt-changes, records HUMAN_OPERATOR),"
+                " commit/manage them manually, or clean/revert them manually — then resolve"
+                " this gate. No provider has been started."
+            ),
+            choices=["Adopted/committed/cleaned — continue", "Cancel mission"],
+            recommended="Adopted/committed/cleaned — continue",
+        )
+
     async def _phase_analyze(self) -> bool:
         project_path = self._project_path()
         self.project_path = project_path
@@ -934,56 +975,49 @@ class MissionEngine:
                 st = await git_ops.status(project_path)
             if not st.is_clean:
                 # Pre-existing dirt is NEVER staged, committed, or attributed
-                # automatically: GG cannot know who authored it or whether the
-                # operator approves it. Block for an explicit operator action
-                # (adopt via POST /api/missions/{id}/adopt-changes, commit or
-                # clean it manually, then resolve the gate). No provider runs.
-                from .provenance import capture_write_start
-
-                _, _, _blocking_paths = await capture_write_start(project_path)
-                _listed = ", ".join(_blocking_paths[:8]) or "unlisted paths"
-                _git_head = st.head
-                await self._create_gate(
-                    reason="Unattributed workspace changes need an operator decision",
-                    detail=(
-                        "Pre-existing repository changes were detected before any provider ran"
-                        f" (HEAD {_git_head or 'unknown'}; {_listed}). GG cannot safely attribute"
-                        " these changes, so nothing was staged, committed, or assigned to a provider."
-                        " Choose: explicitly adopt them (POST"
-                        f" /api/missions/{self.mission_id}/adopt-changes, records HUMAN_OPERATOR),"
-                        " commit/manage them manually, or clean/revert them manually — then resolve"
-                        " this gate. No provider has been started."
-                    ),
-                    choices=["Adopted/committed/cleaned — continue", "Cancel mission"],
-                    recommended="Adopted/committed/cleaned — continue",
+                # automatically — but only at true mission start. Mid-flight
+                # re-entry (recovery/resume with provider history) leaves
+                # uncommitted provider work behind when checkpointing is
+                # broken; that belongs to the checkpoint-exhaustion path,
+                # which owns the outcome. Gate only when GG has no history
+                # here yet, i.e. the dirt provably predates any GG run.
+                _has_history = bool(
+                    self.db.query(
+                        "SELECT id FROM provider_runs WHERE mission_id=? LIMIT 1", (self.mission_id,)
+                    )
+                    or self.db.query(
+                        "SELECT id FROM write_provenance WHERE mission_id=? LIMIT 1", (self.mission_id,)
+                    )
                 )
-                if self._cancel.is_set() or self._pause.is_set():
-                    return False
-                # Re-inspect after the operator decision; still dirty → gate again.
-                st = await git_ops.status(project_path)
-                if not st.is_clean:
-                    _, _, _still_blocking = await capture_write_start(project_path)
-                    if _still_blocking:
-                        await self._create_gate(
-                            reason="Workspace still has unattributed changes",
-                            detail=(
-                                "The workspace is still dirty after the gate resolution"
-                                f" ({', '.join(_still_blocking[:8])}). Adopt, commit, or clean"
-                                " the remaining changes, then resolve. No provider has been started."
-                            ),
-                            choices=["Adopted/committed/cleaned — continue", "Cancel mission"],
-                            recommended="Adopted/committed/cleaned — continue",
-                        )
-                        if self._cancel.is_set() or self._pause.is_set():
-                            return False
-                        st = await git_ops.status(project_path)
-                        if not st.is_clean:
-                            self._fail(
-                                "workspace still has unattributed changes after two operator gates;"
-                                " clean, commit, or adopt them, then retry the mission."
-                                " Provider was NOT invoked."
+                if _has_history:
+                    try:
+                        await self._checkpoint("orchestrator: checkpoint before mission start (pre-existing changes)")
+                    except git_ops.GitCheckpointError as exc:
+                        self._fail_checkpoint_exhaustion(str(exc))
+                        return False
+                else:
+                    await self._gate_unattributed_dirt(project_path, st)
+                    if self._cancel.is_set() or self._pause.is_set():
+                        return False
+                    st = await git_ops.status(project_path)
+                    if not st.is_clean:
+                        from .provenance import capture_write_start as _capture_analyze
+
+                        _, _, _still_blocking = await _capture_analyze(project_path)
+                        if _still_blocking:
+                            await self._gate_unattributed_dirt(
+                                project_path, st, second=True, paths=_still_blocking
                             )
-                            return False
+                            if self._cancel.is_set() or self._pause.is_set():
+                                return False
+                            st = await git_ops.status(project_path)
+                            if not st.is_clean:
+                                self._fail(
+                                    "workspace still has unattributed changes after two operator gates;"
+                                    " clean, commit, or adopt them, then retry the mission."
+                                    " Provider was NOT invoked."
+                                )
+                                return False
         self.db.update("projects", self._mission().project_id, {"detected_type": self.workspace.project_type})
         return True
 

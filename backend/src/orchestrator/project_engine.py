@@ -1683,7 +1683,13 @@ RULES:
         return attempt_id
 
     def _record_criterion_waived(
-        self, project_id: str, requirement_id: str, criterion_id: str, sha: str, plan_revision: int = 0
+        self,
+        project_id: str,
+        requirement_id: str,
+        criterion_id: str,
+        sha: str,
+        plan_revision: int = 0,
+        repo_key_value: str = "",
     ) -> None:
         self._record_criterion(
             project_id,
@@ -1695,6 +1701,7 @@ RULES:
             "authorized waiver",
             sha,
             plan_revision,
+            repo_key_value=repo_key_value,
         )
 
     async def _evidence_gate_findings(self, project_id: str, plan: ProductPlan, repo: Path, sha: str) -> list[str]:
