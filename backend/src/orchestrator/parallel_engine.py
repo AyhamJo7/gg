@@ -940,6 +940,10 @@ class ParallelMissionEngine:
                                 "created_at": utcnow().isoformat(),
                             },
                         )
+            except git_ops.GitCheckpointError:
+                _failures = int(self._mission().get("checkpoint_failures") or 0) + 1
+                self.db.update("missions", self.mission_id, {"checkpoint_failures": _failures})
+                logger.debug("repair checkpoint failed (count=%d)", _failures, exc_info=True)
             except git_ops.GitError:
                 logger.debug("repair checkpoint deferred to final checkpoint", exc_info=True)
             from .provenance import record_provider_write as _record_repair_write
@@ -1320,9 +1324,14 @@ class ParallelMissionEngine:
             _plan_st = await git_ops.status(project_path)
             if not _plan_st.is_clean:
                 max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
-                await git_ops.checkpoint(
-                    project_path, f"agent({provider_name}): planning checkpoint", max_file_mb=max_mb
-                )
+                await git_ops.checkpoint(project_path, f"agent({provider_name}): planning checkpoint",
+                                         max_file_mb=max_mb)
+        except git_ops.GitCheckpointError:
+            # Bookkeeping failure feeds the shared exhaustion counter so
+            # dirty-gates and final accounting see one world state.
+            _failures = int(self._mission().get("checkpoint_failures") or 0) + 1
+            self.db.update("missions", self.mission_id, {"checkpoint_failures": _failures})
+            logger.debug("planning checkpoint failed (count=%d)", _failures, exc_info=True)
         except git_ops.GitError:
             logger.debug("planning checkpoint skipped", exc_info=True)
         try:
