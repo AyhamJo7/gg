@@ -33,11 +33,33 @@ def _head(repo: Path) -> str:
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
 
 
+def _head_blob_size(repo: Path, rel: str) -> int:
+    proc = subprocess.run(
+        ["git", "cat-file", "-s", f"HEAD:{rel}"], cwd=repo, capture_output=True, text=True, check=False
+    )
+    try:
+        return int(proc.stdout.strip()) if proc.returncode == 0 else -1
+    except ValueError:
+        return -1
+
+
 def _commit_server(repo: Path, content: str, message: str) -> str:
+    # Crash-staging helper. Same-size overwrite + immediate add/commit is
+    # git's racy stat hazard: with equal size and a stat match, git may
+    # report "nothing to commit" despite changed bytes (reproduced under
+    # parallel load: 13-byte STATUS=201 overwritten by 13-byte STATUS=400).
+    # File size is compared exactly, so padding past HEAD's blob size removes
+    # the hazard deterministically (no sleeps). The oracle only requires the
+    # STATUS line, so the marker is behavior-neutral.
+    if len(content.encode("utf-8")) == _head_blob_size(repo, "server.py"):
+        content += "# crash-staged\n"
+    before = _head(repo)
     (repo / "server.py").write_text(content)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", message)
-    return _head(repo)
+    after = _head(repo)
+    assert after != before, f"staging commit did not land in {repo}"
+    return after
 
 
 CHECK_JS = (
