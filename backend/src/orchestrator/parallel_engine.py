@@ -1526,28 +1526,14 @@ class ParallelMissionEngine:
         if tid in self._running_tasks:
             return False
 
-        # Select provider (read-only arbitration; no capacity consumed yet).
-        role = Role(task.get("role", "implementation"))
-        preferred_raw = task.get("preferred_providers") or "[]"
-        if isinstance(preferred_raw, str):
-            preferred = json.loads(preferred_raw)
-        else:
-            preferred = list(preferred_raw)
-
-        provider_name = self._arbitrate_provider(task, role, preferred)
-        if not provider_name:
-            # No provider available — mark waiting
-            if task["status"] != TaskStatus.WAITING_FOR_PROVIDER.value:
-                self.db.update("tasks", tid, {"status": TaskStatus.WAITING_FOR_PROVIDER.value})
-            return False
-
         mission = self._mission()
         project_path = self._require_project_path()
 
         # Dependency artifact preparation FIRST (Increment 3B): local Git
-        # work only — no provider reservation, lease, or BUSY until the exact
-        # input artifact exists and is validated. Any failure blocks the task
-        # with zero provider side effects (D-09).
+        # work only — before provider selection, reservation, lease, or BUSY.
+        # Any failure blocks the task with zero provider side effects (D-09).
+        # Prepared rows are content-matched and reused across scheduler ticks
+        # and backend restarts (D-24/D-40/D-56).
         try:
             from .dep_inputs import DependencyInputError, prepare_task_input
 
@@ -1586,6 +1572,22 @@ class ParallelMissionEngine:
             )
             return False
         self.db.update("tasks", tid, {"input_sha": prepared.input_sha})
+
+        # Select provider (read-only arbitration; no capacity consumed yet).
+        role = Role(task.get("role", "implementation"))
+        preferred_raw = task.get("preferred_providers") or "[]"
+        if isinstance(preferred_raw, str):
+            preferred = json.loads(preferred_raw)
+        else:
+            preferred = list(preferred_raw)
+
+        provider_name = self._arbitrate_provider(task, role, preferred)
+        if not provider_name:
+            # No provider available — mark waiting (input artifact stays
+            # prepared and reusable for a later tick/restart).
+            if task["status"] != TaskStatus.WAITING_FOR_PROVIDER.value:
+                self.db.update("tasks", tid, {"status": TaskStatus.WAITING_FOR_PROVIDER.value})
+            return False
 
         # Atomic reservation (only now that artifact preconditions hold).
         reserved = try_reserve_provider(self.db, self.events, tid, provider_name, self.config.raw)
