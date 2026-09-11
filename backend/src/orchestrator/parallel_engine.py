@@ -1638,7 +1638,11 @@ class ParallelMissionEngine:
             )
             _fresh_head: str | None = None
             try:
-                _fresh_head = await git_ops.head_sha(Path(branch_record.worktree_path))
+                _fresh_head = (
+                    await git_ops.head_sha(Path(branch_record.worktree_path))
+                    if branch_record.worktree_path
+                    else None
+                )
             except Exception:
                 _fresh_head = None
             if branch_record.base_commit != prepared.input_sha or _fresh_head != prepared.input_sha:
@@ -1656,18 +1660,24 @@ class ParallelMissionEngine:
             return False
 
         # Verify worktree matches the planned input before anyone runs.
-        wt_path = branch_record.worktree_path
+        wt_path: str | None = branch_record.worktree_path
+        if not wt_path:
+            release_provider_reservation(self.db, self.events, tid)
+            task_locks.release_locks_for_task(self.db, self.events, tid)
+            self.db.update(
+                "tasks", tid,
+                {"status": TaskStatus.FAILED.value, "blocking_issue": "worktree path missing"},
+            )
+            return False
         try:
-            wt_head = await git_ops.head_sha(Path(wt_path)) if wt_path else None
-            wt_status = await git_ops.status(Path(wt_path)) if wt_path else None
-            wt_op = await git_ops.operation_in_progress(Path(wt_path)) if wt_path else "missing"
+            wt_head = await git_ops.head_sha(Path(wt_path))
+            wt_status = await git_ops.status(Path(wt_path))
+            wt_op = await git_ops.operation_in_progress(Path(wt_path))
         except Exception as exc:
             logger.warning("worktree verification failed for task %s: %s", tid, exc)
             wt_head, wt_status, wt_op = None, None, f"verify failed: {exc}"
         _wt_problems: list[str] = []
-        if not wt_path:
-            _wt_problems.append("worktree path missing")
-        elif wt_head != prepared.input_sha:
+        if wt_head != prepared.input_sha:
             _wt_problems.append(f"HEAD {wt_head} != pinned input {prepared.input_sha[:8]}")
         if wt_op:
             _wt_problems.append(f"unfinished git operation: {wt_op}")
@@ -1807,7 +1817,7 @@ class ParallelMissionEngine:
             try:
                 contains = bool(dep_input) and (
                     dep_input == new_result_sha
-                    or await git_ops.is_ancestor(self._require_project_path(), new_result_sha, dep_input)
+                    or await git_ops.is_ancestor(self._require_project_path(), new_result_sha, str(dep_input))
                 )
             except Exception:
                 contains = False
@@ -2195,7 +2205,7 @@ class ParallelMissionEngine:
             # completed direct dependents STALE unless they already contain it.
             _new_result = _final_result
             if _previous_result and _new_result and _previous_result != _new_result:
-                await self._mark_descendants_stale(task_id, _new_result)
+                await self._mark_descendants_stale(task_id, str(_new_result))
             self.events.publish(
                 EventType.TASK_COMPLETED,
                 mission_id=self.mission_id,
