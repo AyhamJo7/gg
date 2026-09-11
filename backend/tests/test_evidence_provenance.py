@@ -575,13 +575,22 @@ def test_criterion_recheck_creates_new_attempt(tmp_path: Path):
         coord = orch.coordinator
         assert await coord._evaluate_requirement_criteria_locked(pid, plan, repo, sha) == []
         assert await coord._evaluate_requirement_criteria_locked(pid, plan, repo, sha) == []
-        rows = orch.db.query("SELECT * FROM criterion_attempts WHERE project_id=? ORDER BY created_at ASC", (pid,))
+        # Order by rowid (insertion sequence): created_at ties on coarse
+        # clocks, and per-criterion lineage must follow attempt order.
+        rows = orch.db.query("SELECT * FROM criterion_attempts WHERE project_id=? ORDER BY rowid ASC", (pid,))
         assert len(rows) == 2, "one attempt per criterion, cache hit creates none"
+        by_criterion: dict[str, list[dict[str, object]]] = {}
+        for r in rows:
+            by_criterion.setdefault(str(r["criterion_id"]), []).append(r)
         assert await coord._evaluate_requirement_criteria_locked(pid, plan, repo, sha, force=True) == []
-        rows2 = orch.db.query("SELECT * FROM criterion_attempts WHERE project_id=? ORDER BY created_at ASC", (pid,))
+        rows2 = orch.db.query("SELECT * FROM criterion_attempts WHERE project_id=? ORDER BY rowid ASC", (pid,))
         assert len(rows2) == 4, "recheck executes anew"
-        assert rows2[2]["recheck_of"] == rows2[0]["id"]
-        assert rows2[3]["recheck_of"] == rows2[1]["id"]
+        by_criterion2: dict[str, list[dict[str, object]]] = {}
+        for r in rows2:
+            by_criterion2.setdefault(str(r["criterion_id"]), []).append(r)
+        assert set(by_criterion2) == set(by_criterion) and all(len(v) == 2 for v in by_criterion2.values())
+        for cid, attempts in by_criterion2.items():
+            assert attempts[1]["recheck_of"] == attempts[0]["id"], f"{cid} recheck must link prior attempt"
         await orch.shutdown()
 
     _asyncio.run(main())
