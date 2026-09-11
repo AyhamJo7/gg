@@ -1295,6 +1295,7 @@ RULES:
             row = self.db.get("product_projects", project_id)
             if not row:
                 raise KeyError(f"product project {project_id} not found")
+            self.db.update("product_projects", project_id, {"paused": 1, "updated_at": utcnow()})
             for phase in self.db.query(
                 "SELECT mission_id FROM project_phases WHERE project_id=? AND status='RUNNING'", (project_id,)
             ):
@@ -1303,6 +1304,14 @@ RULES:
                         self.orch.pause_mission(phase["mission_id"])
                     except Exception:
                         logger.debug("pause of %s failed", phase["mission_id"], exc_info=True)
+
+    async def resume_project(self, project_id: str) -> None:
+        """Clear a durable pause; durable repair cycles may continue after this."""
+        async with self._advance_lock:
+            row = self.db.get("product_projects", project_id)
+            if not row:
+                raise KeyError(f"product project {project_id} not found")
+            self.db.update("product_projects", project_id, {"paused": 0, "updated_at": utcnow()})
 
     async def cancel_project(self, project_id: str) -> None:
         async with self._advance_lock:

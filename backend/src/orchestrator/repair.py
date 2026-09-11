@@ -463,6 +463,23 @@ class RepairCoordinator:
         existing = self.active_cycle_for_trigger(project_id, trigger_type, trigger_evidence_id)
         if existing:
             return {"cycle": existing, "deduplicated": True}
+        # Terminal states are respected: the identical immutable trigger
+        # (same evidence + same SHA) never reopens automatically, so canonical
+        # acceptance cannot ping-pong an exhausted/blocked cycle forever.
+        # A genuinely new observation (new attempt id after an explicit
+        # recheck) carries a new evidence id and may open a fresh cycle.
+        prior = self.db.query(
+            "SELECT * FROM repair_cycles WHERE project_id=? AND trigger_type=?"
+            " AND trigger_evidence_id=? AND trigger_sha=?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (project_id, trigger_type, trigger_evidence_id, trigger_sha.lower()),
+        )
+        if prior:
+            return {
+                "cycle": prior[0],
+                "deduplicated": True,
+                "reason": f"trigger already terminalized as {prior[0]['status']}",
+            }
         conflicting = self.active_cycle_for_project(project_id)
         if conflicting:
             return {"cycle": None, "reason": f"active repair cycle {conflicting['id']} already targets this project"}

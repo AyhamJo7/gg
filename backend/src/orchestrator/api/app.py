@@ -471,6 +471,14 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             raise HTTPException(404, "product project not found") from None
         return {"status": "pausing"}
 
+    @app.post("/api/product-projects/{project_id}/resume")
+    async def resume_product_project(project_id: str) -> dict[str, str]:
+        try:
+            await orchestrator.coordinator.resume_project(project_id)
+        except KeyError:
+            raise HTTPException(404, "product project not found") from None
+        return {"status": "resumed"}
+
     @app.post("/api/product-projects/{project_id}/cancel")
     async def cancel_product_project(project_id: str) -> dict[str, str]:
         try:

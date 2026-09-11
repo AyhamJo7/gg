@@ -61,6 +61,9 @@ class Orchestrator:
         self._scheduler_task: asyncio.Task[None] | None = None
         self._shutdown = asyncio.Event()
         self.coordinator = ProjectCoordinator(self)
+        from .repair_worker import RepairWorker
+
+        self.repair_worker = RepairWorker(self)
 
     # -- lifecycle ------------------------------------------------------------
     async def start(self) -> None:
@@ -68,6 +71,7 @@ class Orchestrator:
         self._reap_orphaned_processes()
         await self._recover_missions()
         await self.coordinator.recover()
+        self.repair_worker.start()
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     async def shutdown(self) -> None:
@@ -78,6 +82,7 @@ class Orchestrator:
             self._scheduler_task.cancel()
         if self._engine_tasks:
             await asyncio.gather(*self._engine_tasks.values(), return_exceptions=True)
+        await self.repair_worker.stop()
 
     # -- recovery ---------------------------------------------------------------
     def _verify_process_ownership(
@@ -166,6 +171,12 @@ class Orchestrator:
                 for engine in list(self._engines.values()):
                     engine.wake()
                 await self.coordinator.advance_all()
+                # Bounded autonomous repair: discover runnable repair cycles
+                # and spawn one worker task each (non-blocking pump).
+                try:
+                    await self.repair_worker.pump()
+                except Exception:
+                    logger.debug("repair pump failed", exc_info=True)
                 # re-launch missions that are waiting (provider availability or
                 # workspace ownership) when their constraint clears
                 waiting = self.db.query(
