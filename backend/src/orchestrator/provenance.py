@@ -46,9 +46,22 @@ def normalize_sha(value: str | None) -> str | None:
     return value.strip().lower()
 
 
-def repo_key(project_id: str | None, common_dir: str) -> str:
-    """Repository identity scoping SHA evidence (project + git common dir)."""
-    return f"{project_id or ''}@{common_dir or ''}"
+async def repo_identity(repo: Path | None) -> str:
+    """Stable physical repository identity (git common dir). '' when unknown.
+
+    Physical, not project-scoped: a fresh clone has a DIFFERENT identity
+    from its origin, so origin evidence never certifies the clone by hash
+    equality alone — fresh runs record under the origin key explicitly.
+    """
+    if repo is None:
+        return ""
+    try:
+        from . import git_ops
+
+        return await git_ops.common_dir(repo)
+    except Exception:
+        logger.debug("repo identity failed", exc_info=True)
+        return ""
 
 
 def _now() -> str:
@@ -136,9 +149,12 @@ async def record_provider_write(
     try:
         result = await git_ops.head_sha(workdir)
         tree = await git_ops.tree_sha(workdir, result) if result else None
+        identity = await repo_identity(workdir)
     except Exception:
         logger.debug("write-result capture failed for run %s", run_id, exc_info=True)
         return None
+    if not repo_key_value:
+        repo_key_value = identity
     try:
         return record_write(
             db,
@@ -224,10 +240,19 @@ async def range_writers(
 ) -> dict[str, Any]:
     """Compute the writer set for commits in (base..candidate].
 
-    Returns {writers: [{actor_type, provider, run_id, result_sha, dirty_before}],
-    unattributed: [sha], complete: bool}. Merge commits with no provenance row
-    are derived SYSTEM (content comes from matched parents); any other
-    unmatched commit is UNKNOWN_EXTERNAL. No guessing.
+    Writer membership follows ACTUAL COMMITTED CONTRIBUTION, never invocation
+    role: a provider belongs to the set iff a PROVIDER-actor write row links
+    it to a commit in range whose result differs from its base (a real
+    change). Runs that executed without changing anything participate in
+    history but do not taint reviewer independence.
+
+    Returns {writers: [{actor_type, provider, run_id, provider_run_id, role,
+    base_sha, result_sha, repo_key, dirty_before, contributing, changed_paths}],
+    unattributed: [sha], complete: bool}. Rows are repo-filtered: a row from
+    another repository never enters this repo's writer set even when the
+    commit hash text matches. Merge commits with no provenance row are
+    derived SYSTEM (content comes from matched parents); any other unmatched
+    commit is UNKNOWN_EXTERNAL. No guessing.
     """
     from . import git_ops
 
@@ -237,6 +262,10 @@ async def range_writers(
         result["complete"] = False
         return result
     if not await git_ops.commit_exists(repo, candidate):
+        result["complete"] = False
+        return result
+    expected_key = await repo_identity(repo)
+    if not expected_key:
         result["complete"] = False
         return result
     base = normalize_sha(base_sha)
@@ -249,16 +278,35 @@ async def range_writers(
     seen: dict[str, dict[str, Any]] = {}
     unattributed: list[str] = []
     for sha in commits:
-        rows = db.query("SELECT * FROM write_provenance WHERE result_sha=?", (sha,))
+        rows = db.query(
+            "SELECT * FROM write_provenance WHERE result_sha=? AND repo_key=?", (sha, expected_key)
+        )
         if rows:
             for r in rows:
-                key = f"{r.get('actor_type')}:{r.get('provider')}:{r.get('run_id')}"
+                role = r.get("role")
+                r_base = normalize_sha(r.get("base_sha"))
+                contributing = bool(
+                    r.get("actor_type") == ACTOR_PROVIDER and (r_base is None or r_base != sha)
+                )
+                key = f"{r.get('actor_type')}:{r.get('provider')}:{r.get('run_id')}:{sha}"
+                paths: list[str] = []
+                if contributing and r_base:
+                    try:
+                        paths = await git_ops.diff_names(repo, r_base, sha)
+                    except Exception:
+                        logger.debug("changed-path probe failed for %s", sha, exc_info=True)
                 seen[key] = {
                     "actor_type": r.get("actor_type"),
                     "provider": r.get("provider"),
                     "run_id": r.get("run_id"),
+                    "provider_run_id": r.get("run_id"),
+                    "role": role,
+                    "base_sha": r_base,
                     "result_sha": sha,
+                    "repo_key": r.get("repo_key"),
                     "dirty_before": bool(r.get("dirty_before")),
+                    "contributing": contributing,
+                    "changed_paths": paths,
                 }
                 if r.get("actor_type") == ACTOR_UNKNOWN or r.get("dirty_before"):
                     unattributed.append(sha) if sha not in unattributed else None
@@ -270,8 +318,14 @@ async def range_writers(
                 "actor_type": ACTOR_SYSTEM,
                 "provider": None,
                 "run_id": None,
+                "provider_run_id": None,
+                "role": "integration",
+                "base_sha": None,
                 "result_sha": sha,
+                "repo_key": expected_key,
                 "dirty_before": False,
+                "contributing": True,
+                "changed_paths": [],
             }
         else:
             unattributed.append(sha)
@@ -284,24 +338,23 @@ async def range_writers(
     return result
 
 
-def provider_writers(
-    writers: list[dict[str, Any]], roles: frozenset[str] | None = None
-) -> set[str]:
-    """Provider names with PROVIDER-actor writes (independence boundary is provider-level).
+def provider_writers(writers: list[dict[str, Any]]) -> set[str]:
+    """Provider names that actually contributed committed changes.
 
-    When roles is given, only writers in those roles count — planning/testing
-    bookkeeping swept into checkpoints is tracked for completeness but does
-    not taint reviewer independence (which guards code under review).
+    Contribution-based, never role-based: a PROVIDER actor counts iff its
+    record is marked contributing (result commit differs from base). A run
+    that executed without changing anything does not taint independence.
+    Provider-level boundary: model variants of one provider are never
+    treated as independent from each other.
     """
     return {
         str(w["provider"])
         for w in writers
-        if w.get("actor_type") == ACTOR_PROVIDER and w.get("provider") and (roles is None or w.get("role") in roles)
+        if w.get("actor_type") == ACTOR_PROVIDER and w.get("provider") and w.get("contributing", True)
     }
 
 
-#: Roles whose writes disqualify a provider from independently reviewing the
-#: candidate containing them.
+#: Kept for import compatibility; independence no longer consults roles.
 INDEPENDENCE_ROLES = frozenset({"implementation", "repair"})
 
 
@@ -309,30 +362,30 @@ INDEPENDENCE_ROLES = frozenset({"implementation", "repair"})
 WRITE_STAGES = frozenset({"product_plan", "mission_plan", "dag_plan", "implementation", "repair", "task", "testing"})
 
 
-def mission_provider_writers(
-    db: Any, mission_id: str, roles: frozenset[str] | None = None
-) -> tuple[set[str], bool]:
-    """(provider writers, complete) for one mission, from write_provenance.
+def mission_provider_writers(db: Any, mission_id: str) -> tuple[set[str], bool]:
+    """(contributing provider writers, complete) for one mission.
+
+    Contribution-approximated without git: a PROVIDER row counts iff its
+    result differs from its base (unknown base counts as contributing —
+    the fail-closed direction). No-change runs participate in history but
+    do not exclude a reviewer. Mission-scoped (selection is per-mission);
+    exact ranges are resolved with git where available.
 
     Complete is False when a successful tracked run has no write row
     (legacy/unlinked) or when dirt/unknown actors were captured — in that
-    case independence cannot be certified. Pass INDEPENDENCE_ROLES to get
-    the reviewer-exclusion set.
+    case independence cannot be certified.
     """
-    if roles is None:
-        rows = db.query(
-            "SELECT DISTINCT provider FROM write_provenance WHERE mission_id=? AND actor_type=?"
-            " AND provider IS NOT NULL",
-            (mission_id, ACTOR_PROVIDER),
-        )
-    else:
-        placeholders = ",".join("?" for _ in roles)
-        rows = db.query(
-            f"SELECT DISTINCT provider FROM write_provenance WHERE mission_id=? AND actor_type=?"  # noqa: S608
-            f" AND provider IS NOT NULL AND role IN ({placeholders})",
-            (mission_id, ACTOR_PROVIDER, *sorted(roles)),
-        )
-    writers = {str(r["provider"]) for r in rows}
+    rows = db.query(
+        "SELECT provider, base_sha, result_sha FROM write_provenance WHERE mission_id=? AND actor_type=?"
+        " AND provider IS NOT NULL",
+        (mission_id, ACTOR_PROVIDER),
+    )
+    writers: set[str] = set()
+    for r in rows:
+        base = normalize_sha(r.get("base_sha"))
+        res = normalize_sha(r.get("result_sha"))
+        if base is None or (res is not None and base != res):
+            writers.add(str(r["provider"]))
     runs = db.query(
         "SELECT id FROM provider_runs WHERE mission_id=? AND failure_class='NONE' AND stage IN"
         " ('product_plan','mission_plan','dag_plan','implementation','repair','task','testing')",
@@ -463,9 +516,39 @@ async def adopt_head_as_human(
         base_sha=base,
         result_sha=result,
         tree_sha=tree,
-        repo_key_value=repo_key(product_project_id, common),
+        repo_key_value=common,
     )
     return {"adopted": True, "base_sha": base, "result_sha": result, "row_id": row_id}
+
+
+def _writer_details(range_detail: list[dict[str, Any]], writer_set: list[str]) -> list[dict[str, Any]]:
+    """Stable safe writer representation (S-32): provider, role, run, actor.
+
+    Falls back to provider-name entries when exact range detail is
+    unavailable (e.g. no repo at record time). Never includes raw logs.
+    """
+    by_provider: dict[str, dict[str, Any]] = {}
+    for w in range_detail:
+        if w.get("actor_type") != ACTOR_PROVIDER or not w.get("provider"):
+            continue
+        by_provider.setdefault(
+            str(w["provider"]),
+            {
+                "provider": str(w["provider"]),
+                "role": w.get("role"),
+                "run_id": w.get("run_id"),
+                "actor_type": w.get("actor_type"),
+                "result_sha": w.get("result_sha"),
+                "contributing": bool(w.get("contributing", True)),
+            },
+        )
+    return [
+        by_provider.get(
+            p, {"provider": p, "role": None, "run_id": None, "actor_type": ACTOR_PROVIDER, "result_sha": None,
+                "contributing": True}
+        )
+        for p in writer_set
+    ]
 
 
 def latest_review_for_mission(db: Any, mission_id: str) -> dict[str, Any] | None:
@@ -485,8 +568,9 @@ async def record_review_attempt(
 ) -> dict[str, Any] | None:
     """Persist one immutable review attempt bound to its exact reviewed range.
 
-    Independence rule: reviewer ∉ full candidate provider-writer set, and
-    writer provenance must be complete (no UNKNOWN/dirty). Self-review stays
+    Independence rule: reviewer ∉ contributing candidate provider-writer set
+    (actual committed writes in the reviewed range, any role), and writer
+    provenance must be complete (no UNKNOWN/dirty). Self-review stays
     possible but is recorded independent=0, never certified.
     """
     import json as _json
@@ -510,7 +594,6 @@ async def record_review_attempt(
     implementer = str(impl_rows[0]["provider"]) if impl_rows else None
 
     writers, complete = mission_provider_writers(db, mission_id)
-    code_writers, _ = mission_provider_writers(db, mission_id, INDEPENDENCE_ROLES)
     earliest_base: str | None = None
     if writers or complete:
         bases = db.query(
@@ -524,8 +607,8 @@ async def record_review_attempt(
 
     # Exact range writers when the repo is available (stronger than the
     # mission-wide approximation above).
-    range_provider_writers = set(writers)
-    range_code_writers = set(code_writers)
+    range_writers_set = set(writers)
+    range_detail: list[dict[str, Any]] = []
     range_complete = complete
     if repo is not None and reviewed_base and reviewed_head:
         from . import git_ops
@@ -535,9 +618,14 @@ async def record_review_attempt(
         ):
             exact = await range_writers(db, repo, reviewed_base, reviewed_head)
             if exact["checked"]:
-                range_provider_writers = provider_writers(exact["writers"])
-                range_code_writers = provider_writers(exact["writers"], INDEPENDENCE_ROLES)
+                range_writers_set = provider_writers(exact["writers"])
+                range_detail = list(exact["writers"])
                 range_complete = bool(exact["complete"])
+    else:
+        # No repo to resolve exact ranges: fall back to mission-wide
+        # contribution approximation for display; certification still
+        # requires completeness below.
+        pass
 
     if not reviewer:
         independent, reason = False, "reviewer unknown"
@@ -545,15 +633,14 @@ async def record_review_attempt(
         independent, reason = False, "implementation provider unknown (cannot prove independence)"
     elif not range_complete:
         independent, reason = False, "writer provenance incomplete (cannot certify independence)"
-    elif implementer is not None and reviewer == implementer:
-        independent, reason = False, f"reviewer {reviewer} is the implementer (self-review)"
-    elif reviewer in range_code_writers:
+    elif reviewer in range_writers_set:
         independent, reason = False, f"reviewer {reviewer} is in the candidate writer set (self-review)"
     else:
         independent, reason = True, None
 
-    writer_set = sorted(range_provider_writers)
+    writer_set = sorted(range_writers_set)
     review_id = _new_id("rev")
+    review_repo_key = await repo_identity(repo) if repo is not None else ""
     db.insert(
         "reviews",
         {
@@ -567,6 +654,8 @@ async def record_review_attempt(
             "reviewed_base_sha": reviewed_base,
             "reviewed_head_sha": reviewed_head,
             "writer_set_json": _json.dumps(writer_set),
+            "writer_detail_json": _json.dumps(_writer_details(range_detail, writer_set)),
+            "repo_key": review_repo_key,
             "created_at": _now(),
         },
     )
@@ -679,6 +768,17 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
         out["blocking_reasons"] = blocking
         return out
 
+    # Repository identity for ALL evidence scoping below: only rows recorded
+    # for THIS repository certify this candidate. Historical rows without a
+    # key (LEGACY/UNKNOWN) can never certify a current artifact.
+    expected_key = await repo_identity(assert_path(inputs.repo)) if repo_ok else ""
+    out["repo_key"] = expected_key
+    if repo_ok and not expected_key:
+        blocking.append("repository identity unavailable — evidence cannot be scoped")
+        out["blocking_reasons"] = blocking
+        return out
+    mission_ids = {p.mission_id for p in inputs.phases if p.mission_id}
+
     # Writers over the full range.
     full: dict[str, Any] = (
         await range_writers(db, assert_path(inputs.repo), inputs.oldest_base_sha, candidate)
@@ -693,7 +793,7 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
         blocking.append(
             f"writer provenance INCOMPLETE: unattributed commits {', '.join(s[:8] for s in full['unattributed'][:5])}"
         )
-    provider_set = provider_writers(full["writers"], INDEPENDENCE_ROLES)
+    provider_set = provider_writers(full["writers"])
 
     # Review: every phase candidate needs an independent exact review, and no
     # non-SYSTEM commit may sit uncovered after the last reviewed tip.
@@ -759,6 +859,14 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
                 )
                 review_state = STATE_FAILED
                 blocking.append(f"phase {phase.phase_key or phase.phase_id} reviewer is a candidate writer")
+            elif (rev.get("repo_key") or "") != expected_key or not expected_key:
+                entry.update(
+                    state=STATE_FAILED,
+                    detail="review has no repository binding for this repository (cannot certify)",
+                    reviewer=rev.get("review_provider"),
+                )
+                review_state = STATE_FAILED
+                blocking.append(f"phase {phase.phase_key or phase.phase_id} review is not bound to this repository")
             elif not full["complete"]:
                 entry.update(
                     state=STATE_FAILED,
@@ -777,7 +885,7 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
             tip_strs = [t for t in tips if t]
             if tip_strs and candidate not in tip_strs:
                 extra = await git_ops.rev_list(assert_path(inputs.repo), tip_strs[-1], candidate)
-                uncovered = [s for s in extra if not _sha_has_provenance(db, s)]
+                uncovered = [s for s in extra if not _sha_has_provenance(db, s, expected_key)]
                 if uncovered:
                     review_state = STATE_STALE
                     blocking.append(
@@ -786,17 +894,32 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
         review_detail["state"] = review_state
     out["review"] = review_detail
 
-    # Generic verification at exact candidate.
-    vrows = db.query(
-        "SELECT * FROM verification_attempts WHERE sha=? AND status='passed' ORDER BY finished_at DESC LIMIT 1",
-        (candidate,),
-    )
-    vrows = [r for r in vrows if _row_in_scope(r, inputs)]
+    # Generic verification at exact candidate, scoped to (project, repo).
+    # A NULL-product row still needs a project mission AND the same repo key
+    # (S-06); historical keyless rows never certify.
+    def _verify_in_scope(r: dict[str, Any]) -> bool:
+        if (r.get("repo_key") or "") != expected_key or not expected_key:
+            return False
+        if r.get("product_project_id"):
+            return r.get("product_project_id") == inputs.project_id
+        return bool(r.get("mission_id")) and r.get("mission_id") in mission_ids
+
+    vrows = [
+        r
+        for r in db.query(
+            "SELECT * FROM verification_attempts WHERE sha=? AND status='passed' ORDER BY finished_at DESC",
+            (candidate,),
+        )
+        if _verify_in_scope(r)
+    ]
     if vrows:
         out["verification"] = {"state": STATE_VALID, "sha": candidate, "attempt_id": vrows[0]["id"]}
     else:
-        any_rows = db.query("SELECT id FROM verification_attempts WHERE sha=? LIMIT 1", (candidate,))
-        any_rows = [r for r in any_rows if _verification_row_in_scope(db, r["id"], inputs)]
+        any_rows = [
+            r
+            for r in db.query("SELECT * FROM verification_attempts WHERE sha=?", (candidate,))
+            if _verify_in_scope(r)
+        ]
         out["verification"] = {
             "state": STATE_MISSING if not any_rows else STATE_FAILED,
             "sha": candidate,
@@ -814,12 +937,13 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
             continue
         att = db.query(
             "SELECT * FROM criterion_attempts WHERE project_id=? AND criterion_id=?"
-            " AND checked_sha=? AND plan_revision=? ORDER BY created_at DESC LIMIT 1",
-            (inputs.project_id, cid, candidate, inputs.plan_revision),
+            " AND checked_sha=? AND plan_revision=? AND repo_key=? ORDER BY created_at DESC LIMIT 1",
+            (inputs.project_id, cid, candidate, inputs.plan_revision, expected_key),
         )
         if not att:
             # Legacy fallback: a current criterion_results row at this SHA/rev
-            # counts (migration-era evidence), but it cannot show history.
+            # counts (migration-era evidence), but it cannot show history —
+            # and only with a matching repository binding.
             legacy = db.query(
                 "SELECT * FROM criterion_results WHERE project_id=? AND criterion_id=?", (inputs.project_id, cid)
             )
@@ -829,6 +953,8 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
                 if r.get("sha") == candidate
                 and (r.get("plan_revision") in (None, inputs.plan_revision))
                 and r.get("status") == "SATISFIED"
+                and (r.get("repo_key") or "") == expected_key
+                and expected_key
             ]
             if legacy_ok:
                 out["criteria"]["passed"] += 1
@@ -843,8 +969,9 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
             if row.get("capability") == "REPLAYABLE" and row.get("context") != "fresh":
                 fresh = db.query(
                     "SELECT id FROM criterion_attempts WHERE project_id=? AND criterion_id=?"
-                    " AND checked_sha=? AND plan_revision=? AND result='SATISFIED' AND context='fresh' LIMIT 1",
-                    (inputs.project_id, cid, candidate, inputs.plan_revision),
+                    " AND checked_sha=? AND plan_revision=? AND result='SATISFIED' AND context='fresh'"
+                    " AND repo_key=? LIMIT 1",
+                    (inputs.project_id, cid, candidate, inputs.plan_revision, expected_key),
                 )
                 if not fresh:
                     out["criteria"]["stale"] += 1
@@ -860,19 +987,27 @@ async def evaluate_artifact_evidence(db: Any, inputs: EvidenceInputs) -> dict[st
             out["criteria"]["details"].append({"criterion_id": cid, "state": STATE_FAILED})
             blocking.append(f"criterion {cid} latest attempt at {candidate[:8]} is {row.get('result')}")
 
-    # Fresh checkout at exact candidate.
-    frows = db.query(
-        "SELECT * FROM fresh_checkout_attempts WHERE project_id=? AND sha=? AND status='passed'"
-        " ORDER BY created_at DESC LIMIT 1",
-        (inputs.project_id, candidate),
-    )
+    # Fresh checkout at exact candidate, scoped to (project, repo).
+    frows = [
+        r
+        for r in db.query(
+            "SELECT * FROM fresh_checkout_attempts WHERE project_id=? AND sha=? AND status='passed'"
+            " ORDER BY created_at DESC",
+            (inputs.project_id, candidate),
+        )
+        if (r.get("repo_key") or "") == expected_key and expected_key
+    ]
     if frows:
         out["fresh_checkout"] = {"state": STATE_VALID, "sha": candidate, "attempt_id": frows[0]["id"]}
     else:
-        any_fresh = db.query(
-            "SELECT id FROM fresh_checkout_attempts WHERE project_id=? AND sha=? LIMIT 1",
-            (inputs.project_id, candidate),
-        )
+        any_fresh = [
+            r
+            for r in db.query(
+                "SELECT * FROM fresh_checkout_attempts WHERE project_id=? AND sha=?",
+                (inputs.project_id, candidate),
+            )
+            if (r.get("repo_key") or "") == expected_key and expected_key
+        ]
         out["fresh_checkout"] = {"state": STATE_MISSING if not any_fresh else STATE_FAILED, "sha": candidate}
         blocking.append(f"no passing fresh-checkout attempt for {candidate[:8]}")
 
@@ -887,22 +1022,14 @@ def assert_path(repo: Path | None) -> Path:
     return repo
 
 
-def _sha_has_provenance(db: Any, sha: str) -> bool:
-    rows = db.query("SELECT id FROM write_provenance WHERE result_sha=? LIMIT 1", (sha,))
+def _sha_has_provenance(db: Any, sha: str, repo_key: str = "") -> bool:
+    if repo_key:
+        rows = db.query(
+            "SELECT id FROM write_provenance WHERE result_sha=? AND repo_key=? LIMIT 1", (sha, repo_key)
+        )
+    else:
+        rows = db.query("SELECT id FROM write_provenance WHERE result_sha=? LIMIT 1", (sha,))
     return bool(rows)
-
-
-def _row_in_scope(row: dict[str, Any], inputs: EvidenceInputs) -> bool:
-    if row.get("product_project_id") and row.get("product_project_id") != inputs.project_id:
-        return False
-    return True
-
-
-def _verification_row_in_scope(db: Any, attempt_id: str, inputs: EvidenceInputs) -> bool:
-    row = db.get("verification_attempts", attempt_id)
-    if not row:
-        return False
-    return _row_in_scope(row, inputs)
 
 
 def _required_criteria(db: Any, project_id: str, plan_revision: int) -> list[dict[str, Any]]:

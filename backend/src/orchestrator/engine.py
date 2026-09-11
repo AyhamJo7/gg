@@ -323,9 +323,9 @@ class MissionEngine:
         # candidate provider-writer set (not merely != last implementer) —
         # repairers join the writer set once they write.
         if role == Role.REVIEW and len(eligible) > 1:
-            from .provenance import INDEPENDENCE_ROLES, mission_provider_writers
+            from .provenance import mission_provider_writers
 
-            writers, _complete = mission_provider_writers(self.db, self.mission_id, INDEPENDENCE_ROLES)
+            writers, _complete = mission_provider_writers(self.db, self.mission_id)
             if not writers:
                 _last_impl = self._last_provider_for(Role.IMPLEMENTATION)
                 writers = {_last_impl} if _last_impl is not None else set()
@@ -641,11 +641,11 @@ class MissionEngine:
                 if role.value in CODE_WRITING_ROLES:
                     # Bind this run to its checkpoint SHA (or the unchanged
                     # HEAD when the run modified nothing — recorded honestly).
-                    from .provenance import record_provider_write, repo_key
+                    from .provenance import record_provider_write, repo_identity
 
                     _repo_key = ""
                     try:
-                        _repo_key = repo_key(_product_id, await git_ops.common_dir(self.project_path))
+                        _repo_key = await repo_identity(self.project_path)
                     except Exception:
                         logger.debug("repo key capture failed", exc_info=True)
                     await record_provider_write(
@@ -933,30 +933,57 @@ class MissionEngine:
                 await git_ops._git(project_path, "checkout", "-b", mission_branch)
                 st = await git_ops.status(project_path)
             if not st.is_clean:
-                # Pre-existing changes predate any GG run in this mission, so
-                # on this single-operator box they are the operator's by
-                # elimination. Checkpoint them as HUMAN_OPERATOR (never
-                # attributed to a later provider); later evidence treats them
-                # as human-authored content requiring re-review like any edit.
-                _pre_base = st.head
-                try:
-                    _pre_sha = await self._checkpoint(
-                        "orchestrator: checkpoint before mission start (pre-existing changes)"
-                    )
-                except git_ops.GitCheckpointError as exc:
-                    self._fail_checkpoint_exhaustion(str(exc))
-                    return False
-                if _pre_sha and _pre_sha != _pre_base:
-                    from .provenance import ACTOR_HUMAN, record_write
+                # Pre-existing dirt is NEVER staged, committed, or attributed
+                # automatically: GG cannot know who authored it or whether the
+                # operator approves it. Block for an explicit operator action
+                # (adopt via POST /api/missions/{id}/adopt-changes, commit or
+                # clean it manually, then resolve the gate). No provider runs.
+                from .provenance import capture_write_start
 
-                    try:
-                        record_write(
-                            self.db, run_id=None, mission_id=self.mission_id,
-                            actor_type=ACTOR_HUMAN, actor_detail="pre-existing workspace changes at mission start",
-                            base_sha=_pre_base, result_sha=_pre_sha,
+                _, _, _blocking_paths = await capture_write_start(project_path)
+                _listed = ", ".join(_blocking_paths[:8]) or "unlisted paths"
+                _git_head = st.head
+                await self._create_gate(
+                    reason="Unattributed workspace changes need an operator decision",
+                    detail=(
+                        "Pre-existing repository changes were detected before any provider ran"
+                        f" (HEAD {_git_head or 'unknown'}; {_listed}). GG cannot safely attribute"
+                        " these changes, so nothing was staged, committed, or assigned to a provider."
+                        " Choose: explicitly adopt them (POST"
+                        f" /api/missions/{self.mission_id}/adopt-changes, records HUMAN_OPERATOR),"
+                        " commit/manage them manually, or clean/revert them manually — then resolve"
+                        " this gate. No provider has been started."
+                    ),
+                    choices=["Adopted/committed/cleaned — continue", "Cancel mission"],
+                    recommended="Adopted/committed/cleaned — continue",
+                )
+                if self._cancel.is_set() or self._pause.is_set():
+                    return False
+                # Re-inspect after the operator decision; still dirty → gate again.
+                st = await git_ops.status(project_path)
+                if not st.is_clean:
+                    _, _, _still_blocking = await capture_write_start(project_path)
+                    if _still_blocking:
+                        await self._create_gate(
+                            reason="Workspace still has unattributed changes",
+                            detail=(
+                                "The workspace is still dirty after the gate resolution"
+                                f" ({', '.join(_still_blocking[:8])}). Adopt, commit, or clean"
+                                " the remaining changes, then resolve. No provider has been started."
+                            ),
+                            choices=["Adopted/committed/cleaned — continue", "Cancel mission"],
+                            recommended="Adopted/committed/cleaned — continue",
                         )
-                    except Exception:
-                        logger.debug("pre-existing changes provenance failed", exc_info=True)
+                        if self._cancel.is_set() or self._pause.is_set():
+                            return False
+                        st = await git_ops.status(project_path)
+                        if not st.is_clean:
+                            self._fail(
+                                "workspace still has unattributed changes after two operator gates;"
+                                " clean, commit, or adopt them, then retry the mission."
+                                " Provider was NOT invoked."
+                            )
+                            return False
         self.db.update("projects", self._mission().project_id, {"detected_type": self.workspace.project_type})
         return True
 

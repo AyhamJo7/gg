@@ -1496,12 +1496,18 @@ RULES:
         problems: list[str] = []
         waived = self._waived_targets(project_id)
         revision = int((self.db.get("product_projects", project_id) or {}).get("plan_revision") or 0)
+        # Repository identity for evidence scoping: criteria certify (repo, SHA).
+        _crit_repo_key = ""
+        try:
+            _crit_repo_key = await git_ops.common_dir(repo)
+        except Exception:
+            logger.debug("criterion repo key failed", exc_info=True)
         for req in plan.requirements:
             req_ok = True
             for criterion in req.acceptance:
                 cid = criterion.id
                 if waived.get(f"criterion:{cid}") == self._criterion_content_hash(criterion):
-                    self._record_criterion_waived(project_id, req.id, cid, sha, revision)
+                    self._record_criterion_waived(project_id, req.id, cid, sha, revision, repo_key_value=_crit_repo_key)
                     continue
                 verify = criterion.verify or ""
                 ok, command = is_executable_command(verify)
@@ -1521,6 +1527,7 @@ RULES:
                         sha,
                         revision,
                         capability="HUMAN_GATE",
+                        repo_key_value=_crit_repo_key,
                     )
                     req_ok = False
                     continue
@@ -1533,6 +1540,7 @@ RULES:
                         and recorded[0].get("command") == command
                         and recorded[0].get("sha") == sha
                         and int(recorded[0].get("plan_revision") or 0) == revision
+                        and (recorded[0].get("repo_key") or "") == _crit_repo_key
                     ):
                         if recorded[0]["status"] != "SATISFIED":
                             problems.append(f"criterion {cid} failed: {command} (exit={recorded[0].get('exit_code')})")
@@ -1560,6 +1568,7 @@ RULES:
                     sha,
                     revision,
                     recheck_of=recheck_of,
+                    repo_key_value=_crit_repo_key,
                 )
                 if not check.passed:
                     problems.append(f"criterion {cid} failed: {command} (exit={check.exit_code})")
@@ -1595,6 +1604,7 @@ RULES:
         capability: str = "REPLAYABLE",
         recheck_of: str | None = None,
         update_cache: bool = True,
+        repo_key_value: str = "",
     ) -> str | None:
         """Record one immutable criterion attempt; refresh the latest-status cache.
 
@@ -1623,6 +1633,7 @@ RULES:
                     "exit_code": exit_code,
                     "output_tail": (output_tail or "")[:3000],
                     "recheck_of": recheck_of,
+                    "repo_key": repo_key_value,
                     "created_at": utcnow().isoformat(),
                 },
             )
@@ -1633,12 +1644,13 @@ RULES:
             return attempt_id
         self.db.execute(
             """INSERT INTO criterion_results(project_id, criterion_id, requirement_id, status, command,
-                   exit_code, output_tail, sha, checked_at, plan_revision, context)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   exit_code, output_tail, sha, checked_at, plan_revision, context, repo_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, criterion_id) DO UPDATE SET
                   requirement_id=excluded.requirement_id, status=excluded.status, command=excluded.command,
                   exit_code=excluded.exit_code, output_tail=excluded.output_tail, sha=excluded.sha,
-                  checked_at=excluded.checked_at, plan_revision=excluded.plan_revision, context=excluded.context""",
+                  checked_at=excluded.checked_at, plan_revision=excluded.plan_revision, context=excluded.context,
+                  repo_key=excluded.repo_key""",
             (
                 project_id,
                 criterion_id,
@@ -1651,6 +1663,7 @@ RULES:
                 utcnow().isoformat(),
                 plan_revision,
                 context,
+                repo_key_value,
             ),
         )
         return attempt_id
@@ -1794,7 +1807,7 @@ RULES:
                     sha = await git_ops.checkpoint(repo, "chore: final acceptance checkpoint")
                     if sha:
                         try:
-                            from .provenance import ACTOR_SYSTEM, record_write
+                            from .provenance import ACTOR_SYSTEM, record_write, repo_identity
 
                             record_write(
                                 self.db,
@@ -1804,6 +1817,7 @@ RULES:
                                 actor_detail="final acceptance checkpoint",
                                 base_sha=st.head,
                                 result_sha=sha,
+                                repo_key_value=await repo_identity(repo),
                             )
                         except Exception:
                             logger.debug("acceptance checkpoint provenance failed", exc_info=True)
@@ -1864,22 +1878,100 @@ RULES:
                 EventType.PRODUCT_ACCEPTANCE_RECORDED, None, product_project_id=project_id, passed=False
             )
             return {"ok": False, "findings": findings}
-        # Accepted: record SHA + delivery report, then DELIVERED.
-        delivery = self._build_delivery_report(project_id, plan, repo, sha or "")
+        # Fenced delivery transition (F-PROV-04): the candidate sampled above
+        # may have moved during long checks. Re-read HEAD/cleanliness under
+        # the shared repo mutation lock, re-evaluate the CURRENT artifact,
+        # and only then transition. GG-controlled writers honor the same
+        # lock; external git activity is fenced by the recheck + post-write
+        # consistency check (advisory locks cannot bind foreign processes).
+        if repo is None:
+            return {"ok": False, "findings": ["target repository missing"]}
+        return await self._fenced_delivery_transition(project_id, plan, repo, sha or "", bool(open_gates))
+
+    async def _fenced_delivery_transition(
+        self, project_id: str, plan: ProductPlan, repo: Path, sampled_sha: str, has_open_gates: bool
+    ) -> dict[str, Any]:
+        """Last-HEAD + cleanliness + fresh-evidence check under the repo lock."""
+        git_lock = self.orch.locks.git()
+        async with git_lock:
+            current_head = await git_ops.head_sha(repo)
+            try:
+                current_status = await git_ops.status(repo)
+                current_clean = current_status.is_clean
+            except Exception:
+                current_clean = False
+            if not current_head or current_head != sampled_sha:
+                return self._blocked_delivery(
+                    project_id,
+                    f"candidate changed during acceptance (sampled {sampled_sha[:8]}, HEAD is"
+                    f" {(current_head or '?')[:8]}); previous evidence is stale, re-run acceptance",
+                    has_open_gates,
+                )
+            if not current_clean:
+                return self._blocked_delivery(
+                    project_id,
+                    f"workspace became dirty during acceptance at {sampled_sha[:8]}; adopt, commit, or"
+                    " clean the changes and re-run acceptance",
+                    has_open_gates,
+                )
+            # Re-evaluate the CURRENT artifact — never trust the pre-lock object.
+            fresh_findings = await self._evidence_gate_findings(project_id, plan, repo, current_head)
+            if fresh_findings:
+                return self._blocked_delivery(
+                    project_id, "; ".join(fresh_findings)[:2000], has_open_gates
+                )
+            delivery = self._build_delivery_report(project_id, plan, repo, current_head)
+            self.db.update(
+                "product_projects",
+                project_id,
+                {
+                    "acceptance_state": AcceptanceState.DELIVERED.value,
+                    "delivery_sha": current_head,
+                    "delivery_report": delivery,
+                    "blocking_reason": None,
+                    "updated_at": utcnow(),
+                },
+            )
+            self.events.publish(EventType.PRODUCT_DELIVERED, None, product_project_id=project_id, sha=current_head)
+            self._set_state(project_id, ProductStatus.DELIVERED, reason="", finished=True)
+        # Post-transition consistency check: an external git writer could
+        # have raced the final DB write (advisory lock boundary). Invalidate
+        # immediately rather than leaving a superseded DELIVERED in place.
+        try:
+            post_head = await git_ops.head_sha(repo)
+        except Exception:
+            post_head = None
+        if post_head != current_head:
+            return self._blocked_delivery(
+                project_id,
+                f"repository changed during delivery transition (delivered {(current_head or '')[:8]},"
+                f" HEAD is now {(post_head or '?')[:8]}); delivery invalidated, re-run acceptance",
+                has_open_gates,
+            )
+        return {"ok": True, "sha": current_head}
+
+    def _blocked_delivery(self, project_id: str, reason: str, has_open_gates: bool) -> dict[str, Any]:
+        """Record an honest BLOCKED/UNVERIFIED outcome (never DELIVERED)."""
         self.db.update(
             "product_projects",
             project_id,
             {
-                "acceptance_state": AcceptanceState.DELIVERED.value,
-                "delivery_sha": sha,
-                "delivery_report": delivery,
-                "blocking_reason": None,
+                "acceptance_state": (
+                    AcceptanceState.EXTERNALLY_BLOCKED.value if has_open_gates else AcceptanceState.UNVERIFIED.value
+                ),
+                "blocking_reason": reason[:2000],
                 "updated_at": utcnow(),
             },
         )
-        self.events.publish(EventType.PRODUCT_DELIVERED, None, product_project_id=project_id, sha=sha)
-        self._set_state(project_id, ProductStatus.DELIVERED, reason="", finished=True)
-        return {"ok": True, "sha": sha}
+        self._set_state(
+            project_id,
+            ProductStatus.BLOCKED if not has_open_gates else ProductStatus.WAITING_FOR_HUMAN,
+            reason=reason[:2000],
+        )
+        self.events.publish(
+            EventType.PRODUCT_ACCEPTANCE_RECORDED, None, product_project_id=project_id, passed=False
+        )
+        return {"ok": False, "findings": [reason]}
 
     async def _fresh_checkout_verify(
         self, repo: Path, sha: str, project_id: str | None = None, plan: ProductPlan | None = None
@@ -1897,6 +1989,13 @@ RULES:
         revision = 0
         if project_id:
             revision = int((self.db.get("product_projects", project_id) or {}).get("plan_revision") or 0)
+        # Fresh clone has its own common dir; evidence belongs to the ORIGIN
+        # repository being certified, so record under the origin key.
+        _origin_repo_key = ""
+        try:
+            _origin_repo_key = await git_ops.common_dir(repo)
+        except Exception:
+            logger.debug("fresh origin repo key failed", exc_info=True)
 
         def _record_fresh(status: str, detail: str, commands: list[str]) -> tuple[bool, str]:
             if project_id:
@@ -1907,7 +2006,7 @@ RULES:
                             "id": attempt_id,
                             "project_id": project_id,
                             "sha": sha,
-                            "repo_key": "",
+                            "repo_key": _origin_repo_key,
                             "status": status,
                             "detail": detail[:2000],
                             "commands_json": json.dumps(commands),
@@ -1982,6 +2081,7 @@ RULES:
                 sha=sha,
                 kind="fresh-toolchain",
                 product_project_id=project_id,
+                repo_key=_origin_repo_key,
             )
             detail = f"{install_note}; {report.summary()}"
             if not report.all_passed:
@@ -2021,6 +2121,7 @@ RULES:
                             context="fresh",
                             capability="REPLAYABLE",
                             update_cache=False,
+                            repo_key_value=_origin_repo_key,
                         )
                     failed_replay = [c for c in fresh_checks if not c.passed]
                     if failed_replay:

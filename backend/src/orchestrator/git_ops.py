@@ -153,6 +153,17 @@ async def rev_list_parents(root: Path, sha: str) -> list[str]:
     return parts[1:] if len(parts) > 1 else []
 
 
+async def diff_names(root: Path, base: str, head: str, limit: int = 100) -> list[str]:
+    """Project-relative changed paths between two commits (bounded, empty on error)."""
+    if not base or not head or base == head:
+        return []
+    res = await _spawn_git(root, "diff", "--name-only", "-z", f"{base}", f"{head}")
+    if res.returncode != 0:
+        return []
+    raw = res.stdout.decode(errors="replace")
+    return [p for p in raw.split("\x00") if p.strip()][:limit]
+
+
 async def common_dir(root: Path) -> str:
     """Stable repository identity for scoping SHA evidence (git common dir)."""
     res = await _spawn_git(root, "rev-parse", "--git-common-dir")

@@ -149,6 +149,12 @@ async def run_verification(
         except Exception:
             sha = None
     report = VerificationReport()
+    _repo_key = repo_key
+    if not _repo_key:
+        try:
+            _repo_key = await git_ops.common_dir(workdir)
+        except Exception:
+            _repo_key = ""
     commands: list[str] = []
     commands.extend(workspace.test_commands)
     commands.extend(workspace.lint_commands)
@@ -201,7 +207,7 @@ async def run_verification(
         product_project_id=product_project_id,
         task_id=task_id,
         sha=sha,
-        repo_key=repo_key,
+        repo_key=_repo_key,
         kind=kind,
         report=report,
         started_at=started,
