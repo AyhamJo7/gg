@@ -54,7 +54,7 @@ export function TaskPanel({
               Cancel
             </button>
           )}
-          {(task.status === "FAILED" || task.status === "CANCELLED") && (
+          {(task.status === "FAILED" || task.status === "CANCELLED" || task.status === "STALE") && (
             <button style={{ padding: "3px 8px", fontSize: 11 }} onClick={retry}>
               Retry
             </button>
@@ -86,6 +86,16 @@ export function TaskPanel({
         {task.checkpoint_after && (
           <span className="muted" style={{ fontSize: 11 }}>
             Checkpoint: <span className="mono">{task.checkpoint_after.slice(0, 7)}</span>
+          </span>
+        )}
+        {task.input_sha && (
+          <span className="muted" style={{ fontSize: 11 }} title="Exact pinned input artifact for this attempt">
+            Input: <span className="mono">{task.input_sha.slice(0, 7)}</span>
+          </span>
+        )}
+        {task.result_sha && (
+          <span className="muted" style={{ fontSize: 11 }} title="Immutable result artifact for this attempt">
+            Output: <span className="mono">{task.result_sha.slice(0, 7)}</span>
           </span>
         )}
       </div>

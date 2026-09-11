@@ -78,6 +78,16 @@ export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: Dag
                     <Badge value={t.status} pulse={["RUNNING", "CLAIMED", "WAITING_FOR_PROVIDER"].includes(t.status)} />
                   </div>
                   <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 4 }}>{t.title || t.role}</div>
+                  {t.input_sha && (
+                    <div className="muted" style={{ fontSize: 11 }} title="Pinned input artifact">
+                      In: <span className="mono">{t.input_sha.slice(0, 7)}</span>
+                      {t.result_sha ? (
+                        <> Out: <span className="mono">{t.result_sha.slice(0, 7)}</span></>
+                      ) : (
+                        <span style={{ color: "var(--yellow)" }}> · artifact-pending</span>
+                      )}
+                    </div>
+                  )}
                   {t.assigned_provider && (
                     <div className="muted" style={{ fontSize: 11 }}>
                       Provider: <span className="mono">{t.assigned_provider}</span>

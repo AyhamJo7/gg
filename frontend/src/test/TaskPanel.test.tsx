@@ -8,7 +8,7 @@ const baseTask: TaskRecord = {
   title: "Create greeting", description: "Make src/greeting.py", preferred_providers: "[\"agy\"]",
   assigned_provider: "agy", workspace_scope: "[\"src/*\"]", resource_locks: "[]",
   max_attempts: 3, priority: 0, ready_at: null, started_at: null, provider_run_id: null,
-  checkpoint_before: null, checkpoint_after: null, result: "{}", blocking_issue: null,
+  checkpoint_before: null, checkpoint_after: null, input_sha: null, result_sha: null, result: "{}", blocking_issue: null,
   dag_revision: 1, prompt: "", summary: "Working…", attempts: 0, created_at: "", finished_at: null,
 };
 
@@ -33,5 +33,23 @@ describe("TaskPanel", () => {
     const failed = { ...baseTask, status: "FAILED" };
     render(<TaskPanel task={failed} missionId="m1" onRefresh={() => {}} />);
     expect(screen.getByText("Retry")).toBeInTheDocument();
+  });
+
+  it("shows retry button for stale task", () => {
+    const stale = { ...baseTask, status: "STALE" };
+    render(<TaskPanel task={stale} missionId="m1" onRefresh={() => {}} />);
+    expect(screen.getByText("Retry")).toBeInTheDocument();
+  });
+
+  it("shows pinned input and output artifacts", () => {
+    const done = {
+      ...baseTask,
+      status: "COMPLETED",
+      input_sha: "abc1234567890",
+      result_sha: "def1234567890",
+    };
+    render(<TaskPanel task={done} missionId="m1" onRefresh={() => {}} />);
+    expect(screen.getByText(/Input:/)).toBeInTheDocument();
+    expect(screen.getByText(/Output:/)).toBeInTheDocument();
   });
 });

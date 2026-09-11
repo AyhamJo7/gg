@@ -52,4 +52,6 @@ committed contribution, never invocation role. Evidence is scoped by
 repository identity + SHA; keyless history cannot certify new artifacts.
 Mission start never auto-commits dirt — explicit adoption only; unknown
 dirt stays unknown. Preserve failed/retried attempts as history; delivery
-evidence is evaluated per exact SHA via `provenance.py`.
+evidence is evaluated per exact SHA via `provenance.py`. DAG task execution
+is artifact-pinned via `dep_inputs.py`: input SHA before provider capacity,
+ancestry-validated results, no silent global-integration consumption.

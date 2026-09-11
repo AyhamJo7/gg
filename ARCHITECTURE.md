@@ -169,6 +169,28 @@ pre-existing changes wait on an explicit operator decision (adopt via
 `POST /api/missions/{id}/adopt-changes`, which alone creates HUMAN_OPERATOR —
 unknown dirt is never converted to human to force completeness).
 
+## DAG dependency execution
+
+Parallel DAG tasks distinguish scheduling order (readiness), context handoffs,
+and filesystem artifacts — all three must agree. Every executable task pins one
+immutable `input_sha` (`tasks.input_sha`, history in `task_dependency_inputs`):
+roots use the mission DAG base (`missions.dag_base_sha`, never moving
+integration HEAD), single-dependency tasks use the dependency's committed
+result, and multi-dependency tasks use a deterministic SYSTEM merge artifact
+(task-ID order, fast-forward when one result already covers the rest; recorded
+with `role=dependency_integration` so constituent provider writers stay
+visible). Preparation is local Git work (merge-tree/commit-tree plumbing, no
+worktree state) and runs before provider reservation/lease; conflicts,
+missing/bad results, and history rewrites block the task with zero provider
+calls. Worktrees are created from the exact input SHA and re-verified
+(HEAD/pinned, clean, no unfinished Git operation) immediately before provider
+launch; task results must descend from their input (`tasks.result_sha`).
+Completed upstream retries mark descendants STALE (resubmit creates a new
+attempt; history immutable). Final integration is ancestry-verified to contain
+every completed task result before review/validation run on the exact merged
+candidate. Tasks expose input/output SHAs in the DAG API, TaskPanel, and
+DagGraph; dependency handoffs state verified artifact presence.
+
 Under `make dev`, database/token files live in `backend/.orchestrator/`. Paths are
 cwd-relative; desktop launch can use a different state directory. Verification
 uses Linux bubblewrap and fails closed; dependency installation enables network

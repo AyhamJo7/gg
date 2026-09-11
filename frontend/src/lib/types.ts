@@ -75,6 +75,8 @@ export interface TaskRecord {
   provider_run_id: string | null;
   checkpoint_before: string | null;
   checkpoint_after: string | null;
+  input_sha: string | null;
+  result_sha: string | null;
   result: string;
   blocking_issue: string | null;
   dag_revision: number;
