@@ -115,6 +115,17 @@ waivers stay operator-only. A repaired candidate returns to canonical
 acceptance — repair success never delivers directly. All stages are
 restart-resumable without duplicating completed provider work.
 
+Production runner (`repair_worker.py`, migration 0016 `paused`): the sealed
+engine never self-executes — the orchestrator scheduler pumps a durable
+worker that discovers runnable `IMPLEMENTATION_DEFECT` cycles, claims exactly
+one worker per cycle via `orchestration_operations(kind=repair:{cycle})`
+(partial unique index, crash-recovered at boot), checks pause/cancel/
+supersede/dirt gates, then invokes the sealed `execute_repair_cycle` through
+real `InvocationService` + compiled-v2 + Git + provenance + criterion
+recheck hooks. Claims are short transactions; provider work runs outside
+them. Success hands back to canonical `advance_project` (never `DELIVERED`
+from the worker); identical terminal triggers never reopen.
+
 ## Prompts, metrics, and security
 
 All provider prompts go through the deterministic role-specific context
