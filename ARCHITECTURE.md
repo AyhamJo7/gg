@@ -1,7 +1,8 @@
 # Current architecture
 
-Source baseline: invocation-integrity increment on top of `c06079e`
-(2026-09-10 audit baseline `6ebcc7d`). Proposals remain in
+Runtime baseline: `649e67e` (Increments 1–4, including dependency correctness
+3B); `f2c17c0` adds only test-harness stabilization. Original audit source:
+`6ebcc7d`, documentation commit `c06079e`. Proposals remain in
 [the audit/blueprint](docs/ARCHITECTURE.md); this file describes implemented
 behavior.
 
@@ -44,6 +45,8 @@ Backend modules are under `backend/src/orchestrator/`.
 | `providers/*`, `process.py`, `_spawn_gate.py`, `orphans.py` | CLI argv/output, cooldowns, process groups, identity handshake, owned-process recovery |
 | `invocations.py`, `usage.py`, `context_manifest.py`, `operations.py` | Shared invocation boundary, usage parsers, prompt manifests, durable operations |
 | `context_compiler.py` | Deterministic role-specific context compiler (`compiled-v2` / `context-policy-v2`) |
+| `provenance.py`, `dep_inputs.py` | Repo-scoped exact-artifact evidence, writer sets, deterministic dependency inputs |
+| `repair.py`, `repair_worker.py` | Bounded repair state machine and production worker/claim execution |
 | `review.py` | Finding parsing, fingerprints, explicit repair verification |
 | `workspace.py`, `verify.py`, `criterion.py`, `sandbox.py` | Root-manifest toolchain detection and confined objective commands |
 | `events.py`, `security.py` | Durable events, transient output, redaction and path boundaries |
@@ -56,11 +59,13 @@ Missions own tasks, runs, handoffs, findings, reviews, and mission gates.
 DAG edges, reservations, locks, branches, and integrations support parallel work.
 `provider_profiles` exists in the schema but is not used by routing.
 
-`db.py` uses one SQLite connection, WAL, foreign keys and a thread lock. Eleven
+`db.py` uses one SQLite connection, WAL, foreign keys and a thread lock. Sixteen
 numbered migrations are applied at startup (0010: run attribution/stage/status/
 model columns, `run_context_manifests`, `run_usage`, `invocation_leases`,
 `orchestration_operations`; 0011: compiler manifest columns — budget/used/
-remaining estimates, repeated-context ratio, warnings, plan revision). Individual database
+remaining estimates, repeated-context ratio, warnings, plan revision;
+0012–0013: artifact evidence/provenance and repository scope; 0014: dependency
+artifacts; 0015: repair cycles/attempts; 0016: product pause). Individual database
 calls usually commit separately; multi-step lifecycle mutations are not all atomic
 transactions. Run one backend owner per state directory; multi-process scheduling
 is unsupported. Historical runs keep NULL/UNKNOWN telemetry; never zero-filled.
@@ -75,13 +80,13 @@ Restart: active missions → RECOVERING → persisted phase
 ```
 
 The sequential runner retries provider failures, checkpoints before switches, and
-uses bounded repair cycles. Final-validation repairs rerun verification but do not
-re-enter independent review. Environment signatures such as DNS failure skip this
+uses bounded repair cycles. Code-changing final-validation repairs rerun verification
+and re-enter independent review of the repaired SHA. Environment signatures such as DNS failure skip this
 code-repair path. Parallel final validation reports failure without that same loop.
 
-Parallel tasks wait for dependency completion but their worktrees currently start
-from repository HEAD; dependency branches merge only in final integration.
-Dependent tasks must not be assumed to see upstream code. Task scopes are scheduling
+Parallel tasks consume pinned, ancestry-validated dependency artifacts; roots use
+the pinned mission base, not moving repository HEAD. See DAG dependency execution
+below. Unverified upstream tasks terminally block descendants. Task scopes are scheduling
 hints, not filesystem confinement. Several parallel output callbacks suppress the
 mission live stream; raw task logs remain available separately. Automatic dynamic
 DAG replanning is not implemented.
@@ -95,9 +100,10 @@ advances to acceptance; it does not invoke a separate product-wide reviewer.
 
 Acceptance caches criterion results by criterion ID, command and SHA, including
 failures. It checks selected unresolved finding categories, gates, working-tree
-toolchain results, and a fresh clone's toolchain. Fresh-checkout criterion replay,
-durable acceptance attempts, and post-check SHA binding need strengthening; see
-the audit for evidence and proposals.
+toolchain results, and a fresh clone's toolchain plus executable criterion replay.
+Immutable attempts are repository/SHA-bound; explicit rechecks bypass the cache.
+The final delivery fence rechecks HEAD, cleanliness, and current evidence. See
+Artifact evidence and writer provenance below for the exact-artifact contract.
 
 Bounded autonomous repair (Increment 4, `repair.py`, migration 0015): a blocked
 acceptance is triaged into at most one persistent `repair_cycles` row per

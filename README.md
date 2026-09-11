@@ -30,12 +30,15 @@ Vite embeds this checkout's bearer token.
   phase becomes a sequential mission. External prerequisites appear as Human
   Gates. Final acceptance checks requirements and replays the detected toolchain
   in a fresh checkout before recording a delivery SHA and report.
-- **Projects → New Mission:** register an existing repository and request work.
+- **Repositories → New Mission:** register an existing repository and request work.
   Choose sequential execution or **Parallel Safe**, optionally supplying a task
   DAG. Parallel tasks use separate Git worktrees and a later integration step.
 
-These are distinct entities: “Projects” registers repositories; “Idea → Product”
-manages product lifecycles. Product creation and plan generation are separate
+The **Overview** groups attention, ongoing work, recent outcomes, and provider
+availability. **Repositories** registers codebases; **Products** manages product
+lifecycles; **Missions** opens individual execution details. Product pages default
+to current work, repair progress, and verification, with plans and exact evidence
+in separate sections. Product creation and plan generation are separate
 steps. Use the explicit Start action: the current auto-execute/approval fields do
 not provide a reliable unattended approval workflow.
 
@@ -50,8 +53,10 @@ degrade to disclosed self-review. Unavailable or failed verification can produce
 Requirement checks run allowlisted commands in a sandbox. Human Gates support
 external setup and variable-name checks; configure secret values in your own
 editor, never in plan text or resolution notes. Waivers are explicit exceptions,
-not proof that a requirement passed. Fresh-checkout verification currently repeats
-the detected toolchain, **not every requirement-specific criterion**.
+not proof that a requirement passed. Fresh-checkout verification repeats
+the detected toolchain and executable requirement-specific criteria. Delivery
+requires current repository/SHA-bound evidence; historical passes cannot certify
+a changed checkout.
 
 Blocked acceptance is triaged into bounded autonomous repair: only well-scoped
 implementation defects with deterministic evidence are repaired automatically
@@ -83,7 +88,9 @@ and lease-owned cancellation/recovery. Inspect runs at `/api/runs`,
 Run Inspector shows the same without ever rendering unknown as zero.
 Artifact evidence (writers, exact-SHA review/verification/criteria/fresh
 status, delivery readiness) is read-only at
-`/api/product-projects/{id}/evidence` and in the Lifecycle delivery tab.
+`/api/product-projects/{id}/evidence` and on the product Overview and Delivery &
+evidence sections. Activity shows the latest 50 attributed provider invocations;
+it is not a complete lifecycle event timeline.
 
 ## Development and documentation
 
@@ -97,6 +104,8 @@ status, delivery readiness) is read-only at
 - [AGENTS.md](AGENTS.md): concise contributor instructions.
 - [Architecture audit and proposed blueprint](docs/ARCHITECTURE.md): assessment
   dated 2026-09-10; proposals are not implemented features.
+- [Operator experience retrospective](docs/OPERATOR_EXPERIENCE_REVIEW.md):
+  implementation review, browser evidence, and frontend evolution.
 
 Historical release reports and ADRs live under `docs/`. Their verification claims
 apply to their recorded versions; current source takes precedence.
