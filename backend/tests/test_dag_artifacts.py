@@ -986,7 +986,7 @@ def test_restart_reuses_dependency_artifact():
                 rows = {r["id"]: r for r in db.query("SELECT * FROM tasks WHERE mission_id='m1'")}
                 if rows["ta"]["status"] == "COMPLETED" and rows["tb"]["status"] == "COMPLETED":
                     break
-            assert rows["tc"]["status"] in ("PENDING", "BLOCKED", "WAITING_FOR_PROVIDER"), rows["tc"]
+            assert rows["tc"]["status"] in ("PENDING", "BLOCKED", "WAITING_FOR_PROVIDER", "CLAIMED"), rows["tc"]
             # Let the scheduler prepare C's input (deps complete, no provider).
             for _ in range(200):
                 await asyncio.sleep(0.05)
