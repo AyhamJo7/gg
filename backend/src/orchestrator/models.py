@@ -193,6 +193,11 @@ class TaskStatus(StrValueEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     UNVERIFIED = "UNVERIFIED"
+    # Increment 3B: a completed descendant whose upstream dependency produced
+    # a newer result it does not contain. Non-runnable and non-terminal: the
+    # mission cannot complete with STALE tasks; operator resubmits/retries
+    # them into new attempts against the current upstream results.
+    STALE = "STALE"
 
 
 TERMINAL_TASK_STATUSES = frozenset(

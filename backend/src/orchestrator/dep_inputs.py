@@ -165,7 +165,7 @@ async def prepare_task_input(
     dep_set = [{"task_id": r.task_id, "result_sha": r.result_sha} for r in results]
     dep_set_json = _stable_json(dep_set)
 
-    reused = _find_reusable_input(db, repo, task_id, dep_set_json)
+    reused = await _find_reusable_input(db, repo, task_id, dep_set_json)
     if reused is not None:
         return reused
 

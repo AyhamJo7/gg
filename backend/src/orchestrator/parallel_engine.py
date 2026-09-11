@@ -496,7 +496,7 @@ class ParallelMissionEngine:
     def _all_tasks_terminal(self) -> bool:
         rows = self.db.query(
             "SELECT COUNT(*) as cnt FROM tasks WHERE mission_id=? "
-            "AND status NOT IN ('COMPLETED','FAILED','CANCELLED','UNVERIFIED')",
+            "AND status NOT IN ('COMPLETED','FAILED','CANCELLED','UNVERIFIED','STALE')",
             (self.mission_id,),
         )
         return int(rows[0]["cnt"]) == 0
@@ -517,6 +517,20 @@ class ParallelMissionEngine:
             self._set_mission_status(
                 MissionStatus.FAILED,
                 blocking_issue=f"{failed} task(s) failed",
+            )
+            return
+
+        # Stale descendants (upstream retried after they completed) block
+        # completion until the operator resubmits them as new attempts.
+        stale = self.db.query(
+            "SELECT id, blocking_issue FROM tasks WHERE mission_id=? AND status='STALE'",
+            (self.mission_id,),
+        )
+        if stale:
+            self._set_mission_status(
+                MissionStatus.FAILED,
+                blocking_issue="stale descendant attempts: "
+                + ", ".join(f"{r['id']} ({(r.get('blocking_issue') or '')[:160]})" for r in stale[:5]),
             )
             return
 
@@ -546,6 +560,18 @@ class ParallelMissionEngine:
                     blocking_issue=f"integration failed: {result['summary']}",
                 )
                 return
+            merged_commit = result.get("merged_commit")
+
+        # Final coverage (D-31/§78/§107): every required COMPLETED task result
+        # must be represented through ancestry in the final candidate. DB
+        # status alone never suffices.
+        missing = await self._final_coverage_missing(project_path, merged_commit)
+        if missing:
+            self._set_mission_status(
+                MissionStatus.FAILED,
+                blocking_issue="final candidate missing required task outputs: " + ", ".join(missing[:8]),
+            )
+            return
 
         # Certified review pipeline
         review_ok = await self._phase_review_loop()
@@ -1375,7 +1401,7 @@ class ParallelMissionEngine:
                 },
             )
         for task in tasks:
-            for dep in task.dependencies:
+            for dep in dict.fromkeys(task.dependencies):
                 self.db.insert(
                     "task_dependencies",
                     {
@@ -1384,6 +1410,18 @@ class ParallelMissionEngine:
                         "created_at": utcnow().isoformat(),
                     },
                 )
+        # Pin the mission DAG base: root tasks execute against this exact
+        # artifact, never moving integration HEAD (D-02/D-16).
+        try:
+            _dag_head = await git_ops.head_sha(project_path)
+        except Exception:
+            _dag_head = None
+            logger.debug("dag base capture failed", exc_info=True)
+        if _dag_head:
+            try:
+                self.db.update("missions", self.mission_id, {"dag_base_sha": _dag_head})
+            except Exception:
+                logger.debug("dag base persist failed", exc_info=True)
 
         self.db.insert(
             "dag_revisions",
@@ -1488,7 +1526,7 @@ class ParallelMissionEngine:
         if tid in self._running_tasks:
             return False
 
-        # Select provider
+        # Select provider (read-only arbitration; no capacity consumed yet).
         role = Role(task.get("role", "implementation"))
         preferred_raw = task.get("preferred_providers") or "[]"
         if isinstance(preferred_raw, str):
@@ -1503,7 +1541,53 @@ class ParallelMissionEngine:
                 self.db.update("tasks", tid, {"status": TaskStatus.WAITING_FOR_PROVIDER.value})
             return False
 
-        # Atomic reservation
+        mission = self._mission()
+        project_path = self._require_project_path()
+
+        # Dependency artifact preparation FIRST (Increment 3B): local Git
+        # work only — no provider reservation, lease, or BUSY until the exact
+        # input artifact exists and is validated. Any failure blocks the task
+        # with zero provider side effects (D-09).
+        try:
+            from .dep_inputs import DependencyInputError, prepare_task_input
+
+            dag_base = mission.get("dag_base_sha") or await self._ensure_dag_base(project_path)
+            prepared = await prepare_task_input(
+                self.db, project_path, self.mission_id, tid, dag_base,
+                attempt_number=int(task.get("attempts") or 0),
+            )
+        except DependencyInputError as exc:
+            if exc.code == "CONFLICT":
+                self.db.update(
+                    "tasks", tid,
+                    {"status": TaskStatus.FAILED.value,
+                     "blocking_issue": f"dependency integration conflict: {exc}"[:1000],
+                     "finished_at": utcnow().isoformat()},
+                )
+                self.events.publish(
+                    EventType.MERGE_CONFLICT, mission_id=self.mission_id, task_id=tid,
+                    reason="dependency_input_conflict", detail=str(exc)[:500],
+                )
+            else:
+                self.db.update(
+                    "tasks", tid,
+                    {"status": TaskStatus.FAILED.value,
+                     "blocking_issue": f"dependency artifact unavailable ({exc.code}): {exc}"[:1000],
+                     "finished_at": utcnow().isoformat()},
+                )
+            return False
+        except Exception as exc:
+            logger.debug("dependency preparation failed for %s", tid, exc_info=True)
+            self.db.update(
+                "tasks", tid,
+                {"status": TaskStatus.FAILED.value,
+                 "blocking_issue": f"dependency preparation failed: {exc}"[:1000],
+                 "finished_at": utcnow().isoformat()},
+            )
+            return False
+        self.db.update("tasks", tid, {"input_sha": prepared.input_sha})
+
+        # Atomic reservation (only now that artifact preconditions hold).
         reserved = try_reserve_provider(self.db, self.events, tid, provider_name, self.config.raw)
         if not reserved:
             return False
@@ -1516,13 +1600,17 @@ class ParallelMissionEngine:
             self.db.update("tasks", tid, {"status": TaskStatus.BLOCKED.value, "blocking_issue": lock_reason})
             return False
 
-        # Create worktree
-        mission = self._mission()
-        project_path = self._require_project_path()
+        # Create worktree from the pinned input SHA (never moving HEAD).
+        # Retry with a new input: drop the stale worktree/branch first.
         try:
             branch_record = await task_worktree.create_task_worktree(
-                self.db, self.events, project_path, mission["id"], tid
+                self.db, self.events, project_path, mission["id"], tid, base_commit=prepared.input_sha
             )
+            if branch_record.base_commit != prepared.input_sha:
+                await task_worktree.remove_task_worktree(self.db, self.events, project_path, tid)
+                branch_record = await task_worktree.create_task_worktree(
+                    self.db, self.events, project_path, mission["id"], tid, base_commit=prepared.input_sha
+                )
         except git_ops.GitError as exc:
             logger.warning("worktree creation failed for task %s: %s", tid, exc)
             release_provider_reservation(self.db, self.events, tid)
@@ -1530,7 +1618,41 @@ class ParallelMissionEngine:
             self.db.update("tasks", tid, {"status": TaskStatus.FAILED.value, "blocking_issue": f"worktree: {exc}"})
             return False
 
-        # Mark RUNNING and start
+        # Verify worktree matches the planned input before anyone runs.
+        wt_path = branch_record.worktree_path
+        try:
+            wt_head = await git_ops.head_sha(Path(wt_path)) if wt_path else None
+            wt_status = await git_ops.status(Path(wt_path)) if wt_path else None
+            wt_op = await git_ops.operation_in_progress(Path(wt_path)) if wt_path else "missing"
+        except Exception as exc:
+            logger.warning("worktree verification failed for task %s: %s", tid, exc)
+            wt_head, wt_status, wt_op = None, None, f"verify failed: {exc}"
+        _wt_problems: list[str] = []
+        if not wt_path:
+            _wt_problems.append("worktree path missing")
+        elif wt_head != prepared.input_sha:
+            _wt_problems.append(f"HEAD {wt_head} != pinned input {prepared.input_sha[:8]}")
+        if wt_op:
+            _wt_problems.append(f"unfinished git operation: {wt_op}")
+        if wt_status is not None and not wt_status.is_clean:
+            _wt_problems.append("unattributed changes present in fresh worktree")
+        if _wt_problems:
+            release_provider_reservation(self.db, self.events, tid)
+            task_locks.release_locks_for_task(self.db, self.events, tid)
+            self.db.update(
+                "tasks",
+                tid,
+                {
+                    "status": TaskStatus.FAILED.value,
+                    "blocking_issue": (
+                        f"worktree failed pre-launch verification ({'; '.join(_wt_problems)})."
+                        " Provider was NOT invoked."
+                    )[:1000],
+                },
+            )
+            return False
+
+        # Mark RUNNING and start (wt_path already verified above).
         self.db.update(
             "tasks",
             tid,
@@ -1547,16 +1669,109 @@ class ParallelMissionEngine:
             provider=provider_name,
         )
 
-        wt_path = branch_record.worktree_path
-        if not wt_path:
-            logger.error("worktree path missing for task %s", tid)
-            release_provider_reservation(self.db, self.events, tid)
-            task_locks.release_locks_for_task(self.db, self.events, tid)
-            self.db.update("tasks", tid, {"status": TaskStatus.FAILED.value, "blocking_issue": "worktree path missing"})
-            return False
         coro = self._task_runner(tid, provider_name, wt_path)
         self._running_tasks[tid] = asyncio.create_task(coro)
         return True
+
+    async def _ensure_dag_base(self, project_path: Path) -> str | None:
+        """Mission DAG base SHA, persisting a lazy fallback when planning did not set one.
+
+        Root tasks must share one immutable base even if siblings finish
+        first (main HEAD only moves via planning/repair/integration/final
+        checkpoints, never via task completion, so a lazily sampled HEAD is
+        stable across the scheduling window — and planning always sets it).
+        """
+        mission = self._mission()
+        base = mission.get("dag_base_sha")
+        if base:
+            return str(base)
+        try:
+            head = await git_ops.head_sha(project_path)
+        except Exception:
+            return None
+        if head:
+            try:
+                self.db.update("missions", self.mission_id, {"dag_base_sha": head})
+            except Exception:
+                logger.debug("dag base persist failed", exc_info=True)
+            return head
+        return None
+
+    async def _final_coverage_missing(self, project_path: Path, final_sha: str | None) -> list[str]:
+        """Task results absent from the final candidate through Git ancestry.
+
+        Returns ['task-id@sha...'] for required COMPLETED tasks whose
+        effective result is neither the final SHA nor its ancestor.
+        """
+        if not final_sha:
+            return ["final integration produced no candidate SHA"]
+        try:
+            if not await git_ops.commit_exists(project_path, final_sha):
+                return [f"final candidate {(final_sha or '')[:8]} does not exist"]
+        except Exception:
+            return ["final candidate unverifiable"]
+        missing: list[str] = []
+        try:
+            completed = self.db.query(
+                "SELECT id, result_sha, checkpoint_after FROM tasks WHERE mission_id=? AND status='COMPLETED'",
+                (self.mission_id,),
+            )
+        except Exception:
+            return ["task results unreadable"]
+        for t in completed:
+            tid = str(t.get("id"))
+            result = t.get("result_sha") or t.get("checkpoint_after")
+            if not result:
+                missing.append(f"{tid}@missing-result")
+                continue
+            try:
+                covered = result == final_sha or await git_ops.is_ancestor(project_path, str(result), final_sha)
+            except Exception:
+                covered = False
+            if not covered:
+                missing.append(f"{tid}@{str(result)[:8]}")
+        return missing
+
+    async def _mark_descendants_stale(self, task_id: str, new_result_sha: str) -> None:
+        """Mark completed direct dependents STALE when an upstream retry produced new output (D-18/§59).
+
+        Their recorded history (consumed old result) stays immutable; they
+        simply cannot remain valid outputs of the new DAG state. Operator
+        resubmits them (task retry) into new attempts against current results.
+        """
+        try:
+            dependents = self.db.query(
+                "SELECT to_task_id FROM task_dependencies WHERE from_task_id=?", (task_id,)
+            )
+        except Exception:
+            return
+        for dep in dependents:
+            tid = str(dep.get("to_task_id") or "")
+            row = self.db.get("tasks", tid)
+            if not row or row.get("mission_id") != self.mission_id:
+                continue
+            if row.get("status") != TaskStatus.COMPLETED.value:
+                continue
+            dep_input = row.get("input_sha")
+            try:
+                contains = bool(dep_input) and (
+                    dep_input == new_result_sha
+                    or await git_ops.is_ancestor(self._require_project_path(), new_result_sha, dep_input)
+                )
+            except Exception:
+                contains = False
+            if contains:
+                continue
+            self.db.update(
+                "tasks", tid,
+                {"status": TaskStatus.STALE.value,
+                 "blocking_issue": f"upstream {task_id} produced a newer result {(new_result_sha or '')[:8]}"
+                 " not contained in this attempt's input; resubmit for a new attempt"[:500],
+                 "finished_at": utcnow().isoformat()},
+            )
+            self.events.publish(
+                EventType.TASK_FAILED, mission_id=self.mission_id, task_id=tid, reason="upstream_retry_stale",
+            )
 
     async def _task_runner(self, task_id: str, provider_name: str, worktree_path: str) -> None:
         """Run a single task to completion in its worktree."""
@@ -1603,21 +1818,43 @@ class ParallelMissionEngine:
         log_dir.mkdir(parents=True, exist_ok=True)
 
         prompt = self._build_task_prompt(task, provider_name)
+        _wt = Path(worktree_path)
         try:
-            commit_before = await git_ops.head_sha(Path(worktree_path))
+            commit_before = await git_ops.head_sha(_wt)
         except Exception:
             commit_before = None
             logger.debug("git head failed for task %s", task_id, exc_info=True)
 
-        # Exact-SHA write provenance: a task worktree must start clean, or
-        # prior dirt (another task's leftovers, human edits) would be
-        # silently attributed to this task's provider. Skipped while
-        # checkpointing itself is broken (exhaustion path owns that).
-        from .provenance import capture_write_start as _capture_task_start
+        # Input/filesystem agreement immediately before provider invocation
+        # (D-10/D-11/D-25/D-67): the worktree must still be exactly the
+        # pinned input artifact, clean, with no unfinished Git operation.
+        # Unattributed dirt fails closed exactly like at launch.
+        _planned_input = task.get("input_sha")
+        _agree_problem: str | None = None
+        try:
+            _agree_head = await git_ops.head_sha(_wt)
+            _agree_status = await git_ops.status(_wt)
+            _agree_op = await git_ops.operation_in_progress(_wt)
+            if _planned_input and _agree_head != _planned_input:
+                _agree_problem = f"worktree HEAD {_agree_head} != pinned input {_planned_input[:8]}"
+            elif not _agree_status.is_clean or _agree_op:
+                _agree_problem = f"worktree not clean for launch (op={_agree_op})"
+        except Exception as exc:
+            _agree_problem = f"worktree verification failed: {exc}"
+            logger.debug("pre-launch worktree verification failed for %s", task_id, exc_info=True)
+        if _agree_problem is None:
+            from .provenance import capture_write_start as _capture_task_start
 
-        _, _task_dirty, _task_paths = await _capture_task_start(Path(worktree_path))
-        _task_ckpt_failures = int((self.db.get("missions", self.mission_id) or {}).get("checkpoint_failures") or 0)
-        if _task_dirty and _task_ckpt_failures == 0:
+            _, _task_dirty, _task_paths = await _capture_task_start(_wt)
+            _task_ckpt_failures = int(
+                (self.db.get("missions", self.mission_id) or {}).get("checkpoint_failures") or 0
+            )
+            if _task_dirty and _task_ckpt_failures == 0:
+                _agree_problem = (
+                    f"task worktree has unattributed changes before provider run "
+                    f"({', '.join(_task_paths[:5])}); clean or adopt them, then retry."
+                )
+        if _agree_problem is not None:
             release_provider_reservation(self.db, self.events, task_id)
             task_locks.release_locks_for_task(self.db, self.events, task_id)
             self.db.update(
@@ -1625,11 +1862,7 @@ class ParallelMissionEngine:
                 task_id,
                 {
                     "status": TaskStatus.FAILED.value,
-                    "blocking_issue": (
-                        f"task worktree has unattributed changes before provider run "
-                        f"({', '.join(_task_paths[:5])}); clean or adopt them, then retry. "
-                        "Provider was NOT invoked."
-                    )[:1000],
+                    "blocking_issue": f"{_agree_problem} Provider was NOT invoked."[:1000],
                     "finished_at": utcnow().isoformat(),
                 },
             )
@@ -1637,7 +1870,7 @@ class ParallelMissionEngine:
                 EventType.TASK_FAILED,
                 mission_id=self.mission_id,
                 task_id=task_id,
-                reason="dirty_worktree_unattributed",
+                reason="worktree_input_mismatch",
             )
             return
 
@@ -1663,13 +1896,22 @@ class ParallelMissionEngine:
                 prepare_invocation_context,
                 resolve_phase_requirements,
                 role_for_stage,
-                task_dependency_ids,
             )
 
             try:
                 _scope = _json2.loads(task.get("workspace_scope") or "[]")
             except Exception:
                 _scope = []
+            from .dep_inputs import dependency_ids as _dep_ids_for_spec
+            from .dep_inputs import verify_input_covers as _verify_input_covers
+
+            _dep_list = _dep_ids_for_spec(self.db, task_id)
+            _verified_map: dict[str, bool] = {}
+            if _planned_input:
+                try:
+                    _verified_map = await _verify_input_covers(self.db, _wt, _planned_input, _dep_list)
+                except Exception:
+                    logger.debug("dependency presence proof failed for %s", task_id, exc_info=True)
             _task_ctx_spec = ContextCompileSpec(
                 role=role_for_stage(STAGE_TASK, str(task.get("role", "implementation"))),
                 stage=STAGE_TASK,
@@ -1678,12 +1920,13 @@ class ParallelMissionEngine:
                 mission_id=self.mission_id,
                 task_id=task_id,
                 provider=provider_name,
-                base_sha=task.get("checkpoint_before") or None,
+                base_sha=_planned_input or task.get("checkpoint_before") or None,
                 task_objective=f"{task.get('title', '')}\n{task.get('description', '')}",
                 task_title=str(task.get("title", "")),
                 task_description=str(task.get("description", "")),
                 requirement_ids=resolve_phase_requirements(self.db, _product_id, _phase_id),
-                dependency_ids=task_dependency_ids(self.db, task_id),
+                dependency_ids=_dep_list,
+                dependency_verified=_verified_map,
                 workspace_scope=list(_scope) if isinstance(_scope, list) else [],
             )
             prompt, _task_ctx = prepare_invocation_context(
@@ -1792,6 +2035,31 @@ class ParallelMissionEngine:
         except Exception:
             logger.debug("git linkage failed for run %s", run_id, exc_info=True)
 
+        # Ancestry validation (D-14/D-15/§49/§65): the result must descend
+        # from the pinned input. A provider that rewrites history (reset,
+        # divergent commit) fails provenance here — its output is never
+        # checkpointed as a valid result nor integrated downstream.
+        if result.ok and _planned_input and commit_after and commit_after != _planned_input:
+            try:
+                _descends = await git_ops.is_ancestor(Path(worktree_path), _planned_input, commit_after)
+            except Exception:
+                _descends = False
+            if not _descends:
+                release_provider_reservation(self.db, self.events, task_id, run_id)
+                task_locks.release_locks_for_task(self.db, self.events, task_id)
+                self.db.update(
+                    "tasks", task_id,
+                    {"status": TaskStatus.FAILED.value,
+                     "blocking_issue": f"provider rewrote task history (input {_planned_input[:8]}"
+                     f" not ancestor of result {(commit_after or '')[:8]}); output rejected"[:1000],
+                     "finished_at": utcnow().isoformat()},
+                )
+                self.events.publish(
+                    EventType.TASK_FAILED, mission_id=self.mission_id, task_id=task_id,
+                    reason="history_rewrite_rejected",
+                )
+                return
+
         # Late cancellation guard: a task cancelled while the provider was
         # still running must stay CANCELLED; the late result only releases
         # capacity, never resurrects the task.
@@ -1835,6 +2103,7 @@ class ParallelMissionEngine:
                 )
                 return
 
+            _previous_result = task.get("result_sha")
             self.db.update(
                 "tasks",
                 task_id,
@@ -1844,6 +2113,9 @@ class ParallelMissionEngine:
                     "summary": result.summary,
                     "provider_run_id": run_id,
                     "checkpoint_after": checkpoint_sha,
+                    # Immutable per attempt: explicit checkpoint, else the
+                    # unchanged input (no-change runs are honest no-ops).
+                    "result_sha": checkpoint_sha or _planned_input,
                 },
             )
             # Bind this task run to its checkpoint SHA (P-02).
@@ -1861,6 +2133,12 @@ class ParallelMissionEngine:
                 role=role.value,
                 base_sha=commit_before,
             )
+            # Upstream retry invalidates completed descendants (D-18/§59):
+            # a new result that obsoletes a previously recorded one marks
+            # completed direct dependents STALE unless they already contain it.
+            _new_result = checkpoint_sha or _planned_input
+            if _previous_result and _new_result and _previous_result != _new_result:
+                await self._mark_descendants_stale(task_id, _new_result)
             self.events.publish(
                 EventType.TASK_COMPLETED,
                 mission_id=self.mission_id,

@@ -160,6 +160,11 @@ class ContextCompileSpec:
     task_description: str = ""
     requirement_ids: list[str] = field(default_factory=list)
     dependency_ids: list[str] = field(default_factory=list)
+    # Verified artifact presence per dependency ({dep_id: result-ancestor-of
+    # task-input}). Computed by the caller from Git ancestry AFTER dependency
+    # input preparation. An explicit False fails closed (UNVERIFIED_DEPENDENCY_ARTIFACT);
+    # absent entries keep the legacy DEPENDENCY_CODE_NOT_PRESENT warning path.
+    dependency_verified: dict[str, bool] = field(default_factory=dict)
     failure_text: str = ""
     failure_command: str = ""
     failure_exit_code: int | None = None
@@ -703,9 +708,23 @@ def build_candidate_blocks(
     warnings.extend(w3)
     aux["dependency_handoffs"] = deps
     for h in deps:
+        verified = spec.dependency_verified.get(h["task_id"])
+        if verified is False:
+            # Proven-absent required artifact: fail closed, never warn-and-run.
+            raise ContextCompileError(
+                "UNVERIFIED_DEPENDENCY_ARTIFACT",
+                f"dependency {h['task_id']} result is NOT present in the task input artifact."
+                " Provider will NOT be invoked.",
+            )
+        presence = (
+            "present in task input artifact: YES"
+            if verified
+            else "present in task input artifact: UNKNOWN (verify locally before relying on it)"
+        )
         full = (
             f"Dependency {h['task_id']} ({h['title']}) — {h['status']}\n"
             f"Checkpoint: {h['checkpoint_sha'] or '(no checkpoint)'}\n"
+            f"{presence}\n"
             f"Summary: {h['summary'] or '(no summary)'}"
         )
         compact = f"{h['task_id']} @ {h['checkpoint_sha'][:8] if h['checkpoint_sha'] else 'no-sha'}: {h['title']}"
