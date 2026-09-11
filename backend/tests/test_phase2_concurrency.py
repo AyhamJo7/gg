@@ -791,6 +791,20 @@ async def test_parallel_engine_dependency_order(tmp_db, tmp_project, config, reg
 @pytest.mark.asyncio
 async def test_parallel_engine_diamond(tmp_db, tmp_project, config, registry):
     """A -> B,C -> D. B and C should run in parallel."""
+    from orchestrator.providers.fake import WorkspaceWriterProvider
+
+    class _PerTaskWriter(WorkspaceWriterProvider):
+        """One distinct file per task worktree (derived from the worktree
+        path): parallel siblings must not falsa-conflict on a shared fake
+        marker file now that dependency inputs integrate real artifacts."""
+
+        async def execute(self, request, on_output):  # type: ignore[no-untyped-def]
+            self.filename = f"{request.workdir.name}.txt"
+            self.content = f"{request.workdir.name}\n"
+            return await super().execute(request, on_output)
+
+    registry.adapters["fast"] = _PerTaskWriter("fast")
+    registry.adapters["slow"] = _PerTaskWriter("slow")
     events = EventBus(tmp_db)
     tmp_db.insert("projects", {"id": "p1", "name": "test", "path": str(tmp_project), "created_at": utcnow()})
     tmp_db.insert(
