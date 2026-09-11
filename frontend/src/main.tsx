@@ -10,13 +10,17 @@ import { NewMissionPage } from "./pages/NewMissionPage";
 import { PriorityPage } from "./pages/PriorityPage";
 import { ProjectsPage } from "./pages/ProjectsPage";
 import { ProvidersPage } from "./pages/ProvidersPage";
+import { OverviewPage } from "./pages/OverviewPage";
+import { PageError } from "./components/PageError";
 import "./styles.css";
 
 const router = createHashRouter([
   {
     element: <AppShell />,
+    errorElement: <PageError />,
     children: [
-      { path: "/", element: <MissionControlPage /> },
+      { path: "/", element: <OverviewPage /> },
+      { path: "/missions", element: <MissionControlPage /> },
       { path: "/new", element: <NewMissionPage /> },
       { path: "/projects", element: <ProjectsPage /> },
       { path: "/lifecycle", element: <LifecyclePage /> },

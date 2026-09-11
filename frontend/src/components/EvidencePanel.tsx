@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { ArtifactEvidence } from "../lib/types";
+import { usePolling } from "../lib/hooks";
+import { operatorLabel } from "../lib/operator";
 
 function short(sha: string | null | undefined): string {
   return sha ? sha.slice(0, 8) : "—";
@@ -16,26 +16,11 @@ function StateChip({ state }: { state: string }) {
 }
 
 export function EvidencePanel({ projectId }: { projectId: string }) {
-  const [evidence, setEvidence] = useState<ArtifactEvidence | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    api.lifecycle
-      .evidence(projectId)
-      .then((d) => {
-        if (!cancelled) setEvidence(d);
-      })
-      .catch(() => {
-        if (!cancelled) setError("evidence unavailable");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [projectId]);
-
-  if (error) return <p className="muted">{error}</p>;
+  const { data: evidence, error, refresh } = usePolling(() => api.lifecycle.evidence(projectId), 5000, [projectId]);
+  if (error) return <div role="alert"><p>evidence unavailable</p><p className="muted">Previous evidence must not be treated as current.</p><button onClick={refresh}>Retry</button></div>;
   if (!evidence) return <p className="muted">Loading evidence…</p>;
+  // Draft products legitimately return a minimal no-repository response.
+  if (!evidence.candidate_sha) return <div className="card" data-testid="evidence-panel"><h2>No candidate yet</h2><p className="muted">Verification evidence appears after GG creates a repository and records a candidate. Nothing has been certified yet.</p></div>;
 
   const review = evidence.review as { state: string; phases?: Array<Record<string, unknown>> };
   const criteria = evidence.criteria as {
@@ -45,20 +30,27 @@ export function EvidencePanel({ projectId }: { projectId: string }) {
     actor_type: string; provider: string | null; run_id: string | null; result_sha: string;
   }>;
   const attempts = (evidence.phase_attempts ?? []) as Array<Record<string, unknown>>;
+  const failed = [review.state, (evidence.verification as {state: string}).state,
+    (evidence.fresh_checkout as {state: string}).state].some(s => ["FAILED", "STALE"].includes(s)) || criteria.failed > 0 || criteria.stale > 0;
 
   return (
     <div data-testid="evidence-panel" style={{ marginTop: 8 }}>
       <div className="card">
         <h4>
-          Delivery readiness: {evidence.delivery_ready ? "READY" : "NOT READY"}
-          <span className={`badge ${evidence.delivery_ready ? "green" : "red"}`} style={{ marginLeft: 6 }}>
-            {evidence.delivery_ready ? "READY" : "BLOCKED"}
+          {evidence.delivery_ready ? "Candidate meets delivery checks" : failed ? "Evidence needs attention" : "Delivery checks still pending"}
+          <span className={`badge ${evidence.delivery_ready ? "green" : failed ? "red" : "yellow"}`} style={{ marginLeft: 6 }}>
+            {evidence.delivery_ready ? "READY" : failed ? "BLOCKED" : "PENDING"}
           </span>
         </h4>
-        <p className="mono" style={{ fontSize: 12 }}>
-          Candidate {short(evidence.candidate_sha)} · plan rev {evidence.plan_revision}
-          {" · "}writers {evidence.writers_complete ? "complete" : "INCOMPLETE"}
-        </p>
+        <ol className="trust-steps">
+          <li>Authorship: {evidence.writers_complete ? "accounted for" : "not fully established"}</li>
+          <li>Independent review: {operatorLabel(review.state)}</li>
+          <li>Verification: {operatorLabel((evidence.verification as {state: string}).state)}</li>
+          <li>Acceptance: {criteria.passed} of {criteria.total} passed{criteria.waived > 0 ? ` · ${criteria.waived} waived (not passed)` : ""}</li>
+          <li>Fresh checkout: {operatorLabel((evidence.fresh_checkout as {state: string}).state)}</li>
+        </ol>
+        <p className="muted">These checks apply to the current candidate, not a confidence score. Missing checks are not failures.</p>
+        <details><summary>Why checks are pending or blocked</summary>
         {(evidence.blocking_reasons ?? []).length > 0 && (
           <ul style={{ fontSize: 13 }}>
             {(evidence.blocking_reasons ?? []).map((r, i) => (
@@ -66,7 +58,10 @@ export function EvidencePanel({ projectId }: { projectId: string }) {
             ))}
           </ul>
         )}
+        </details>
       </div>
+      <details className="card evidence-details"><summary>Exact evidence, writers & attempt history</summary>
+      <p className="mono">Candidate {evidence.candidate_sha || "Not recorded"} · plan revision {evidence.plan_revision}</p>
       <div className="card" style={{ marginTop: 8 }}>
         <h4>Writers</h4>
         {writers.length === 0 && <p className="muted">No attributed writes in range.</p>}
@@ -109,6 +104,7 @@ export function EvidencePanel({ projectId }: { projectId: string }) {
           ))}
         </div>
       )}
+      </details>
       <p className="muted" style={{ fontSize: 12 }}>
         States reflect the exact candidate SHA above — never a historical pass. Raw prompts and
         secrets are never displayed.

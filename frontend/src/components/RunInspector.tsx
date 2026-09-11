@@ -3,28 +3,13 @@ import { api } from "../lib/api";
 import type { RunDetail } from "../lib/types";
 import { EstimateValue, UsageValue } from "./UsageValue";
 import { Badge } from "./Badge";
+import { usePolling } from "../lib/hooks";
 
 export function RunInspector({ runId, onClose }: { runId: string; onClose: () => void }) {
-  const [detail, setDetail] = useState<RunDetail | null>(null);
+  const { data: detail, error } = usePolling<RunDetail>(() => api.runs().get(runId), 3000, [runId]);
   const [contextDetail, setContextDetail] = useState<Record<string, unknown> | null>(null);
   const [showContext, setShowContext] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .runs()
-      .get(runId)
-      .then((d) => {
-        if (!cancelled) setDetail(d);
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [runId]);
+  useEffect(() => { setContextDetail(null); setShowContext(false); }, [runId]);
 
   useEffect(() => {
     if (!showContext || contextDetail) return;
@@ -66,10 +51,12 @@ export function RunInspector({ runId, onClose }: { runId: string; onClose: () =>
     <div className="card" data-testid="run-inspector">
       <div className="row spread">
         <h3>
-          Run {run.id.slice(0, 8)} — {run.provider}
+          {run.provider} · {run.role}
         </h3>
         <button onClick={onClose}>Close</button>
       </div>
+      <p>{run.summary || "No result summary reported yet."}</p>
+      <details><summary>Invocation identity</summary><p className="mono">{run.id}</p></details>
       <div className="row" style={{ gap: 8 }}>
         <Badge value={run.run_status || run.provider_state} />
         <Badge value={run.stage || run.role} />

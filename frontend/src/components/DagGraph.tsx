@@ -53,19 +53,26 @@ export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: Dag
 
   return (
     <div className="dag-graph" style={{ overflowX: "auto", padding: "8px 0" }}>
+      <p className="muted">Read left to right. Tasks in the same column have no dependency on each other; provider capacity and file locks may still limit parallel execution.</p>
       <div style={{ display: "flex", gap: 24, alignItems: "flex-start" }}>
         {levels.map((level, li) => (
           <div key={li} style={{ display: "flex", flexDirection: "column", gap: 10, minWidth: 180 }}>
+            <h4 className="muted">{li === 0 ? "Independent work" : `Dependency stage ${li + 1}`}</h4>
             {level.map((tid) => {
               const t = taskMap[tid];
               if (!t) return null;
               const isActive = activeTaskId === tid;
               return (
-                <div
+                <button
+                  type="button"
+                  aria-label={`${t.title || t.role}: ${t.status}`}
+                  aria-pressed={isActive}
                   key={tid}
                   className={`card dag-node ${isActive ? "active" : ""}`}
                   style={{
                     padding: 10,
+                    textAlign: "left",
+                    maxWidth: 280,
                     cursor: onTaskClick ? "pointer" : "default",
                     borderColor: isActive ? "var(--accent)" : undefined,
                     boxShadow: isActive ? "0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent)" : undefined,
@@ -74,20 +81,12 @@ export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: Dag
                   data-testid={`dag-node-${tid}`}
                 >
                   <div className="row spread" style={{ marginBottom: 6 }}>
-                    <span className="mono" style={{ fontSize: 11 }}>{t.id}</span>
                     <Badge value={t.status} pulse={["RUNNING", "CLAIMED", "WAITING_FOR_PROVIDER"].includes(t.status)} />
                   </div>
                   <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 4 }}>{t.title || t.role}</div>
-                  {t.input_sha && (
-                    <div className="muted" style={{ fontSize: 11 }} title="Pinned input artifact">
-                      In: <span className="mono">{t.input_sha.slice(0, 7)}</span>
-                      {t.result_sha ? (
-                        <> Out: <span className="mono">{t.result_sha.slice(0, 7)}</span></>
-                      ) : (
-                        <span style={{ color: "var(--yellow)" }}> · artifact-pending</span>
-                      )}
-                    </div>
-                  )}
+                  <div className="muted">{(depsByTask[tid] || []).length ? `Depends on: ${depsByTask[tid].map(id => taskMap[id]?.title || id).join(", ")}` : "No upstream dependencies"}</div>
+                  {t.status === "STALE" && <p>Upstream work changed. Retry with current inputs.</p>}
+                  {t.input_sha && <p className="muted">Input pinned · {t.result_sha ? "result recorded" : "awaiting result"}</p>}
                   {t.assigned_provider && (
                     <div className="muted" style={{ fontSize: 11 }}>
                       Provider: <span className="mono">{t.assigned_provider}</span>
@@ -101,7 +100,7 @@ export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: Dag
                   {t.blocking_issue && (
                     <div style={{ fontSize: 11, color: "var(--red)", marginTop: 4 }}>{t.blocking_issue}</div>
                   )}
-                </div>
+                </button>
               );
             })}
           </div>
@@ -111,7 +110,7 @@ export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: Dag
         <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)" }}>
           {dependencies.map((d) => (
             <span key={`${d.from_task_id}-${d.to_task_id}`} className="mono" style={{ marginRight: 12 }}>
-              {d.from_task_id} → {d.to_task_id}
+              {taskMap[d.from_task_id]?.title || d.from_task_id} → {taskMap[d.to_task_id]?.title || d.to_task_id}
             </span>
           ))}
         </div>

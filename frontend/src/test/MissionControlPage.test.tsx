@@ -49,6 +49,11 @@ vi.mock("../lib/ws", () => ({
 }));
 
 describe("MissionControlPage parallel view", () => {
+  it("does not silently replace an unknown deep-linked mission", async () => {
+    render(<MemoryRouter initialEntries={["/missions?mission=missing"]}><MissionControlPage /></MemoryRouter>);
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("heading", { name: "Parallel Test" })).not.toBeInTheDocument();
+  });
   it("shows PARALLEL badge for parallel missions", async () => {
     render(<MemoryRouter><MissionControlPage /></MemoryRouter>);
     await waitFor(() => expect(screen.getByText("PARALLEL")).toBeInTheDocument(), { timeout: 3000 });

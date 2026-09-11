@@ -6,29 +6,44 @@ export function usePolling<T>(
   intervalMs: number | null,
   deps: unknown[] = [],
 ): { data: T | null; error: string | null; refresh: () => void } {
-  const [data, setData] = useState<T | null>(null);
+  const key = JSON.stringify(deps);
+  const [result, setResult] = useState<{ key: string; value: T } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fnRef = useRef(fn);
   fnRef.current = fn;
+  const generation = useRef(0);
+  const request = useRef(0);
 
   const refresh = useCallback(() => {
-    fnRef.current()
+    const epoch = generation.current;
+    const sequence = ++request.current;
+    return Promise.resolve().then(() => fnRef.current())
       .then((v) => {
-        setData(v);
+        if (epoch !== generation.current || sequence !== request.current) return;
+        setResult({ key, value: v });
         setError(null);
       })
-      .catch((e: Error) => setError(e.message));
-  }, []);
+      .catch((e: unknown) => {
+        if (epoch === generation.current && sequence === request.current)
+          setError(e instanceof Error ? e.message : String(e));
+      });
+  }, [key]);
 
   useEffect(() => {
-    refresh();
-    if (intervalMs === null) return;
-    const id = setInterval(refresh, intervalMs);
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intervalMs, refresh, ...deps]);
+    const epoch = ++generation.current;
+    setError(null);
+    let id: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+    const tick = () => {
+      void refresh().finally(() => {
+        if (!stopped && intervalMs !== null) id = setTimeout(tick, intervalMs);
+      });
+    };
+    tick();
+    return () => { stopped = true; generation.current = epoch + 1; if (id !== null) clearTimeout(id); };
+  }, [intervalMs, refresh]);
 
-  return { data, error, refresh };
+  return { data: result?.key === key ? result.value : null, error, refresh };
 }
 
 export function useElapsed(startIso: string | null, active: boolean): string {

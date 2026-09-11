@@ -44,6 +44,7 @@ export function PriorityPage() {
         </div>
         <div className="row">
           <input
+            aria-label="Profile name"
             placeholder="profile name"
             value={profileName}
             onChange={(e) => setProfileName(e.target.value)}

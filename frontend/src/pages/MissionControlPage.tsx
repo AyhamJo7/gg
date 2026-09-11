@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { useElapsed, usePolling } from "../lib/hooks";
 import { useMissionEvents } from "../lib/ws";
@@ -17,6 +17,7 @@ import { Terminal } from "../components/Terminal";
 import { WorkflowTimeline } from "../components/WorkflowTimeline";
 import { TERMINAL_TASK_STATUSES, type Mission } from "../lib/types";
 import { RunInspector } from "../components/RunInspector";
+import { operatorLabel } from "../lib/operator";
 
 function MissionHeader({ mission }: { mission: Mission }) {
   const active = !["COMPLETED", "FAILED", "CANCELLED", "PAUSED", "UNVERIFIED"].includes(mission.status);
@@ -25,11 +26,11 @@ function MissionHeader({ mission }: { mission: Mission }) {
     <div className="row spread">
       <div>
         <h1>{mission.title}</h1>
-        <div className="muted" style={{ fontSize: 12.5 }}>{mission.task.slice(0, 160)}</div>
+        <details><summary>Mission objective</summary><p className="muted">{mission.task}</p></details>
         <div className="row" style={{ marginTop: 4, gap: 8 }}>
           <Badge value={mission.status} pulse={active} />
           {mission.scheduling_mode === "PARALLEL_SAFE" && <Badge value="PARALLEL" />}
-          <span className="mono muted">{elapsed}</span>
+          <span className="mono muted">{active ? `Elapsed ${elapsed}` : mission.finished_at ? `Finished ${new Date(mission.finished_at).toLocaleString()}` : "Not running"}</span>
         </div>
       </div>
     </div>
@@ -37,13 +38,18 @@ function MissionHeader({ mission }: { mission: Mission }) {
 }
 
 export function MissionControlPage() {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [params, setParams] = useSearchParams();
+  const selectedId = params.get("mission");
+  const setSelectedId = (id: string) => { setParams({ mission: id }); setSelectedTaskId(null); setInspectedRunId(null); };
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [inspectedRunId, setInspectedRunId] = useState<string | null>(null);
-  const { data: missions, refresh: refreshMissions } = usePolling(() => api.missions.list(), 3000);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const { data: missions, error: loadError, refresh: refreshMissions } = usePolling(() => api.missions.list(), 3000);
   const { data: providers } = usePolling(() => api.providers.list(), 5000);
-  const mission = missions?.find((m) => m.id === selectedId) ?? missions?.[0] ?? null;
-  const { data: detail, refresh: refreshDetail } = usePolling(
+  const mission = selectedId ? missions?.find((m) => m.id === selectedId) ?? null : missions?.[0] ?? null;
+  useEffect(() => { setSelectedTaskId(null); setInspectedRunId(null); setActionError(null); }, [mission?.id]);
+  const { data: detail, error: detailError, refresh: refreshDetail } = usePolling(
     () => (mission ? api.missions.get(mission.id) : Promise.resolve(null)),
     2500,
     [mission?.id],
@@ -64,9 +70,11 @@ export function MissionControlPage() {
 
   const act = async (action: "pause" | "resume" | "cancel") => {
     if (!mission) return;
-    await api.missions.action(mission.id, action);
-    refreshMissions();
-    refreshDetail();
+    if (action === "cancel" && !window.confirm("Cancel this mission? Completed work and evidence are preserved.")) return;
+    setBusy(true); setActionError(null);
+    try { await api.missions.action(mission.id, action); refreshMissions(); refreshDetail(); }
+    catch (e) { setActionError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
   };
 
   const refreshAll = () => {
@@ -89,8 +97,11 @@ export function MissionControlPage() {
 
   return (
     <div className="stack">
+      {(loadError || detailError || actionError) && <div role="alert" className="notice error">{actionError || "Updates unavailable; displayed information may be stale."}<button onClick={refreshAll}>Refresh</button></div>}
+      {selectedId && missions && !mission && <p role="alert">This mission was not found. Select another mission; GG will not silently open a different one.</p>}
       <div className="row" style={{ gap: 12 }}>
         <select
+          aria-label="Select mission"
           value={mission?.id ?? ""}
           onChange={(e) => setSelectedId(e.target.value)}
           style={{ maxWidth: 320 }}
@@ -105,20 +116,22 @@ export function MissionControlPage() {
         {mission && !["COMPLETED", "FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status) && (
           <>
             {mission.status === "PAUSED" ? (
-              <button onClick={() => act("resume")}>▶ Resume</button>
+              <button disabled={busy} onClick={() => act("resume")}>▶ Resume</button>
             ) : (
-              <button onClick={() => act("pause")}>⏸ Pause</button>
+              <button disabled={busy} onClick={() => act("pause")}>⏸ Pause</button>
             )}
-            <button className="danger" onClick={() => act("cancel")}>✕ Cancel</button>
+            <button disabled={busy} className="danger" onClick={() => act("cancel")}>✕ Cancel</button>
           </>
         )}
         {mission && ["FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status) && (
           <button
             onClick={async () => {
-              const newM = await api.missions.retry(mission.id);
-              setSelectedId(newM.id);
-              refreshMissions();
+              setBusy(true); setActionError(null);
+              try { const newM = await api.missions.retry(mission.id); setSelectedId(newM.id); refreshMissions(); }
+              catch (e) { setActionError(e instanceof Error ? e.message : String(e)); }
+              finally { setBusy(false); }
             }}
+            disabled={busy}
           >
             🔄 Retry
           </button>
@@ -137,7 +150,7 @@ export function MissionControlPage() {
             </div>
           </div>
 
-          {mission.blocking_issue && (
+          {mission.blocking_issue && !openGate && (
             <div className="card" style={{ borderColor: "var(--orange)" }}>
               <h3>Blocking issue</h3>
               <pre className="muted" style={{ whiteSpace: "pre-wrap", margin: 0 }}>{mission.blocking_issue}</pre>
@@ -202,7 +215,7 @@ export function MissionControlPage() {
                   )}
                 </div>
               )}
-              <IntegrationPanel integration={integration} />
+              {isParallel && <IntegrationPanel integration={integration} />}
               {integration?.status === "MERGE_CONFLICT" && mission && (
                 <ConflictCard integration={integration} missionId={mission.id} onResumed={refreshAll} />
               )}
@@ -216,18 +229,18 @@ export function MissionControlPage() {
             </div>
           </div>
 
-          <div className="card">
-            <h3>Live provider output</h3>
+          <details className="card">
+            <summary>Live provider output & logs</summary>
             <Terminal lines={terminal} />
-          </div>
+          </details>
 
           {detail?.latest_handoff && (
-            <div className="card">
-              <h3>Latest handoff</h3>
+            <details className="card">
+              <summary>Latest handoff</summary>
               <pre className="muted" style={{ whiteSpace: "pre-wrap", fontSize: 12, maxHeight: 260, overflow: "auto" }}>
                 {detail.latest_handoff}
               </pre>
-            </div>
+            </details>
           )}
 
           {detail && detail.runs.length > 0 && (
@@ -250,7 +263,7 @@ export function MissionControlPage() {
                         </button>
                       </td>
                       <td>{r.role}</td>
-                      <td><Badge value={r.failure_class === "NONE" ? "COMPLETED" : r.failure_class} /></td>
+                      <td title={r.run_status || r.failure_class}>{operatorLabel(r.run_status || (r.failure_class === "NONE" ? "COMPLETED" : r.failure_class))}</td>
                       <td className="mono">{r.exit_code ?? "—"}</td>
                       <td className="muted">{new Date(r.started_at).toLocaleTimeString()}</td>
                     </tr>
@@ -259,7 +272,7 @@ export function MissionControlPage() {
               </table>
               {inspectedRunId && (
                 <div style={{ marginTop: 12 }}>
-                  <RunInspector runId={inspectedRunId} onClose={() => setInspectedRunId(null)} />
+                  <RunInspector key={inspectedRunId} runId={inspectedRunId} onClose={() => setInspectedRunId(null)} />
                 </div>
               )}
             </div>

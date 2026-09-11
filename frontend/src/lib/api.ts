@@ -167,6 +167,7 @@ export const api = {
     start: (id: string) => req<ProductProjectDetail>(`/api/product-projects/${id}/start`, { method: "POST" }),
     advance: (id: string) => req<Record<string, unknown>>(`/api/product-projects/${id}/advance`, { method: "POST" }),
     pause: (id: string) => req<{ status: string }>(`/api/product-projects/${id}/pause`, { method: "POST" }),
+    resume: (id: string) => req<{ status: string }>(`/api/product-projects/${id}/resume`, { method: "POST" }),
     cancel: (id: string) => req<{ status: string }>(`/api/product-projects/${id}/cancel`, { method: "POST" }),
     retryPhase: (id: string, phaseKey: string) =>
       req<{ ok: boolean }>(`/api/product-projects/${id}/phases/${phaseKey}/retry`, { method: "POST" }),
@@ -175,8 +176,8 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ resolution }),
       }),
-    acceptance: (id: string) =>
-      req<{ ok: boolean; sha?: string; findings?: string[] }>(`/api/product-projects/${id}/acceptance`, {
+    acceptance: (id: string, recheck = false) =>
+      req<{ ok: boolean; sha?: string; findings?: string[] }>(`/api/product-projects/${id}/acceptance${recheck ? "?recheck=true" : ""}`, {
         method: "POST",
       }),
     evidence: (id: string) => req<ArtifactEvidence>(`/api/product-projects/${id}/evidence`),

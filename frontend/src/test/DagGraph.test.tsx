@@ -28,4 +28,9 @@ describe("DagGraph", () => {
     render(<DagGraph tasks={[]} dependencies={[]} />);
     expect(screen.getByText("No tasks in this mission yet.")).toBeInTheDocument();
   });
+  it("exposes keyboard-native task controls and named dependencies", () => {
+    render(<DagGraph tasks={tasks} dependencies={[{ from_task_id: "a", to_task_id: "b", created_at: "" }]} onTaskClick={() => {}} />);
+    expect(screen.getByRole("button", { name: "Farewell: RUNNING" })).toHaveAttribute("type", "button");
+    expect(screen.getByText("Depends on: Greeting")).toBeInTheDocument();
+  });
 });

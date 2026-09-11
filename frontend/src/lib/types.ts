@@ -330,6 +330,7 @@ export interface ProductProjectSummary {
   id: string;
   name: string;
   state: string;
+  paused?: number;
   acceptance_state: string;
   plan_revision: number;
   target_repo_path: string;
@@ -463,6 +464,7 @@ export interface ProductProjectDetail {
   idea: string;
   constraints_text: string;
   state: string;
+  paused?: number;
   acceptance_state: string;
   auto_execute: number;
   require_plan_approval: number;
@@ -518,6 +520,7 @@ export interface RepairAttempt {
   id: string;
   attempt_number: number;
   provider: string;
+  provider_run_id?: string | null;
   base_sha: string;
   result_sha: string | null;
   outcome: string;

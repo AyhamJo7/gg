@@ -109,8 +109,15 @@ export function NewMissionPage() {
   };
 
   const submit = async () => {
-    setBusy(true);
     setError(null);
+    if (schedulingMode === "PARALLEL_SAFE" && dagMode === "manual") {
+      const validationError = validateDag(dagTasks, dagDeps);
+      if (validationError) {
+        setError(validationError);
+        return;
+      }
+    }
+    setBusy(true);
     try {
       const mission = await api.missions.create({
         project_id: projectId,
@@ -123,12 +130,6 @@ export function NewMissionPage() {
       });
 
       if (schedulingMode === "PARALLEL_SAFE" && dagMode === "manual") {
-        const validationError = validateDag(dagTasks, dagDeps);
-        if (validationError) {
-          setError(validationError);
-          setBusy(false);
-          return;
-        }
         const tasksPayload: DagTaskInput[] = dagTasks.map((t) => ({
           id: t.id,
           role: t.role,
@@ -142,7 +143,7 @@ export function NewMissionPage() {
       }
 
       await api.missions.action(mission.id, "start");
-      navigate("/");
+      navigate(`/missions?mission=${encodeURIComponent(mission.id)}`);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -156,25 +157,25 @@ export function NewMissionPage() {
       <p className="muted">One high-level engineering task. The orchestrator plans, executes, reviews, and verifies it across your AI subscriptions.</p>
       <div className="card stack" style={{ marginTop: 16 }}>
         <div className="field">
-          <label>Project</label>
+          <label>Repository</label>
           {projects && projects.length > 0 ? (
-            <select value={projectId} onChange={(e) => setProjectId(e.target.value)} data-testid="project-select">
-              <option value="">Select a project…</option>
+            <select aria-label="Repository" value={projectId} onChange={(e) => setProjectId(e.target.value)} data-testid="project-select">
+              <option value="">Select a repository…</option>
               {projects.map((p) => (
                 <option key={p.id} value={p.id}>{p.name} ({p.path})</option>
               ))}
             </select>
           ) : (
-            <p className="muted">No projects yet — add one on the Projects page first.</p>
+            <p className="muted">No repositories yet — add one on the Repositories page first.</p>
           )}
         </div>
         <div className="field">
           <label>Mission title</label>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Build invoice management SaaS" />
+          <input aria-label="Mission title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Build invoice management SaaS" />
         </div>
         <div className="field">
           <label>Task description</label>
-          <textarea
+          <textarea aria-label="Task description"
             rows={6}
             value={task}
             onChange={(e) => setTask(e.target.value)}
@@ -185,7 +186,7 @@ export function NewMissionPage() {
         <div className="grid-2">
           <div className="field">
             <label>Autonomy level</label>
-            <select value={autonomy} onChange={(e) => setAutonomy(e.target.value)}>
+            <select aria-label="Autonomy level" value={autonomy} onChange={(e) => setAutonomy(e.target.value)}>
               <option value="SAFE">SAFE — confirm before implementation</option>
               <option value="BALANCED">BALANCED — gates on real decisions</option>
               <option value="AUTONOMOUS">AUTONOMOUS — only hard gates</option>
@@ -193,7 +194,7 @@ export function NewMissionPage() {
           </div>
           <div className="field">
             <label>Execution profile</label>
-            <select value={profile} onChange={(e) => setProfile(e.target.value)}>
+            <select aria-label="Execution profile" value={profile} onChange={(e) => setProfile(e.target.value)}>
               <option value="balanced">Balanced</option>
               {Object.keys(profiles ?? {}).map((p) => (
                 <option key={p} value={p}>{p}</option>
@@ -203,7 +204,7 @@ export function NewMissionPage() {
         </div>
         <div className="field">
           <label>Scheduling mode</label>
-          <select
+          <select aria-label="Scheduling mode"
             value={schedulingMode}
             onChange={(e) => setSchedulingMode(e.target.value)}
             data-testid="scheduling-mode"
@@ -254,21 +255,21 @@ export function NewMissionPage() {
                   <div className="grid-2">
                     <div className="field" style={{ marginBottom: 8 }}>
                       <label>ID</label>
-                      <input value={t.id} onChange={(e) => updateTask(i, { id: e.target.value })} />
+                      <input aria-label={`Task ${i + 1} ID`} value={t.id} onChange={(e) => updateTask(i, { id: e.target.value })} />
                     </div>
                     <div className="field" style={{ marginBottom: 8 }}>
                       <label>Title</label>
-                      <input value={t.title} onChange={(e) => updateTask(i, { title: e.target.value })} />
+                      <input aria-label={`Task ${i + 1} title`} value={t.title} onChange={(e) => updateTask(i, { title: e.target.value })} />
                     </div>
                   </div>
                   <div className="field" style={{ marginBottom: 8 }}>
                     <label>Description</label>
-                    <input value={t.description} onChange={(e) => updateTask(i, { description: e.target.value })} />
+                    <input aria-label={`Task ${i + 1} description`} value={t.description} onChange={(e) => updateTask(i, { description: e.target.value })} />
                   </div>
                   <div className="grid-2">
                     <div className="field" style={{ marginBottom: 8 }}>
                       <label>Role</label>
-                      <select value={t.role} onChange={(e) => updateTask(i, { role: e.target.value })}>
+                      <select aria-label={`Task ${i + 1} role`} value={t.role} onChange={(e) => updateTask(i, { role: e.target.value })}>
                         <option value="implementation">Implementation</option>
                         <option value="testing">Testing</option>
                         <option value="review">Review</option>
@@ -277,17 +278,17 @@ export function NewMissionPage() {
                     </div>
                     <div className="field" style={{ marginBottom: 8 }}>
                       <label>Priority</label>
-                      <input type="number" value={t.priority} onChange={(e) => updateTask(i, { priority: Number(e.target.value) })} />
+                      <input aria-label={`Task ${i + 1} priority`} type="number" value={t.priority} onChange={(e) => updateTask(i, { priority: Number(e.target.value) })} />
                     </div>
                   </div>
                   <div className="grid-2">
                     <div className="field" style={{ marginBottom: 0 }}>
                       <label>Preferred providers (comma-separated)</label>
-                      <input value={t.preferred_providers} onChange={(e) => updateTask(i, { preferred_providers: e.target.value })} placeholder="agy, opencode" />
+                      <input aria-label={`Task ${i + 1} preferred providers`} value={t.preferred_providers} onChange={(e) => updateTask(i, { preferred_providers: e.target.value })} placeholder="agy, opencode" />
                     </div>
                     <div className="field" style={{ marginBottom: 0 }}>
                       <label>Workspace scope (comma-separated)</label>
-                      <input value={t.workspace_scope} onChange={(e) => updateTask(i, { workspace_scope: e.target.value })} placeholder="src/**, tests/**" />
+                      <input aria-label={`Task ${i + 1} workspace scope`} value={t.workspace_scope} onChange={(e) => updateTask(i, { workspace_scope: e.target.value })} placeholder="src/**, tests/**" />
                     </div>
                   </div>
                 </div>

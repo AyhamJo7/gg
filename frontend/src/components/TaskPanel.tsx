@@ -1,6 +1,7 @@
 import { Badge } from "./Badge";
 import { api } from "../lib/api";
 import type { TaskRecord } from "../lib/types";
+import { useState } from "react";
 
 export function TaskPanel({
   task,
@@ -11,17 +12,24 @@ export function TaskPanel({
   missionId: string;
   onRefresh: () => void;
 }) {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const isTerminal = ["COMPLETED", "FAILED", "CANCELLED", "UNVERIFIED"].includes(task.status);
   const isRunning = ["RUNNING", "CLAIMED", "WAITING_FOR_PROVIDER"].includes(task.status);
 
   const retry = async () => {
-    await api.missions.retryTask(missionId, task.id);
-    onRefresh();
+    setBusy(true); setError(null);
+    try { await api.missions.retryTask(missionId, task.id); onRefresh(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
   };
 
   const cancel = async () => {
-    await api.missions.cancelTask(missionId, task.id);
-    onRefresh();
+    if (!window.confirm("Cancel this task? Completed artifacts are preserved.")) return;
+    setBusy(true); setError(null);
+    try { await api.missions.cancelTask(missionId, task.id); onRefresh(); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
   };
 
   const scope = (() => {
@@ -46,22 +54,24 @@ export function TaskPanel({
         <div className="row" style={{ gap: 10 }}>
           <Badge value={task.status} pulse={isRunning} />
           <span style={{ fontWeight: 600 }}>{task.title || task.role}</span>
-          <span className="mono faint">{task.id}</span>
         </div>
         <div className="row">
           {!isTerminal && (
-            <button className="danger" style={{ padding: "3px 8px", fontSize: 11 }} onClick={cancel} disabled={task.status === "CANCELLED"}>
+            <button className="danger" style={{ padding: "3px 8px", fontSize: 11 }} onClick={cancel} disabled={busy}>
               Cancel
             </button>
           )}
           {(task.status === "FAILED" || task.status === "CANCELLED" || task.status === "STALE") && (
-            <button style={{ padding: "3px 8px", fontSize: 11 }} onClick={retry}>
+            <button disabled={busy} style={{ padding: "3px 8px", fontSize: 11 }} onClick={retry}>
               Retry
             </button>
           )}
         </div>
       </div>
       {task.description && <p className="muted" style={{ fontSize: 12, margin: "4px 0 8px" }}>{task.description}</p>}
+      {error && <p role="alert">{error}</p>}
+      {task.status === "STALE" && <p className="notice">A dependency changed. Retry creates a fresh attempt; old results stay in history.</p>}
+      <details><summary>Provider, scope & exact artifacts</summary><p className="mono">Task: {task.id}</p>
       <div className="row" style={{ gap: 16, flexWrap: "wrap" }}>
         {task.assigned_provider && (
           <span className="muted" style={{ fontSize: 11 }}>
@@ -99,6 +109,8 @@ export function TaskPanel({
           </span>
         )}
       </div>
+      <p className="mono">Input SHA: {task.input_sha || "Not recorded"}<br/>Result SHA: {task.result_sha || "Not recorded"}</p>
+      </details>
       {task.blocking_issue && (
         <div style={{ marginTop: 6, fontSize: 11, color: "var(--red)" }}>{task.blocking_issue}</div>
       )}

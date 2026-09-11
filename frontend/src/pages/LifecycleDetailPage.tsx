@@ -1,26 +1,36 @@
-import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { Badge } from "../components/Badge";
 import { EvidencePanel } from "../components/EvidencePanel";
 import { RepairCyclePanel } from "../components/RepairCyclePanel";
 import { api } from "../lib/api";
 import { usePolling } from "../lib/hooks";
 import type { ProductGateRow, ProductProjectDetail } from "../lib/types";
+import { ProductOverview } from "../components/ProductOverview";
+import { ProductActivity } from "../components/ProductActivity";
+import { ACTIVE_REPAIR_STATES, FINISHED_PRODUCT_STATES, missionHref, operatorLabel } from "../lib/operator";
 
-type Tab = "plan" | "roadmap" | "execution" | "gates" | "delivery";
+type Tab = "overview" | "plan" | "roadmap" | "execution" | "gates" | "delivery" | "activity";
+const TABS: Record<Tab, string> = { overview: "Overview", plan: "Plan", roadmap: "Roadmap", execution: "Missions", gates: "Human actions", delivery: "Delivery & evidence", activity: "Activity" };
 
 export function LifecycleDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const { data: project, refresh } = usePolling(() => api.lifecycle.get(id!), 3000, [id]);
+  const { data: project, error: loadError, refresh } = usePolling(() => api.lifecycle.get(id!), 3000, [id]);
   const { data: missions } = usePolling(() => api.missions.list(), 5000);
-  const [tab, setTab] = useState<Tab>("plan");
+  const { data: repairs } = usePolling(() => api.lifecycle.repairCycles(id!), 3000, [id]);
+  const [params, setParams] = useSearchParams();
+  const requestedTab = params.get("tab") ?? "overview";
+  const tab: Tab = Object.hasOwn(TABS, requestedTab) ? requestedTab as Tab : "overview";
+  const setTab = (next: Tab) => setParams({ tab: next });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [planEdit, setPlanEdit] = useState<string | null>(null);
   const [reviseReason, setReviseReason] = useState("");
   const [resolutions, setResolutions] = useState<Record<string, string>>({});
 
-  if (!project) return <div className="muted">Loading product project…</div>;
+  useEffect(() => { setPlanEdit(null); setReviseReason(""); setResolutions({}); setError(null); }, [id]);
+
+  if (!project) return loadError ? <div role="alert">Could not load this product. <button onClick={refresh}>Retry</button></div> : <div className="muted" role="status">Loading product project…</div>;
 
   const run = async (fn: () => Promise<unknown>) => {
     setError(null);
@@ -36,21 +46,24 @@ export function LifecycleDetailPage() {
   };
 
   const missionById = (mid: string | null) => missions?.find((m) => m.id === mid);
-  const openGates = project.gates.filter((g) => g.status === "open");
+  const openGates = FINISHED_PRODUCT_STATES.has(project.state) ? [] : project.gates.filter((g) => g.status === "open");
   const state = project.state;
+  const activeRepair = repairs?.cycles.find(c => ACTIVE_REPAIR_STATES.has(c.status));
+  const headline = FINISHED_PRODUCT_STATES.has(state) ? operatorLabel(state) : project.paused ? "Paused" : openGates.length ? "Needs your decision" : activeRepair
+    ? activeRepair.status === "WAITING_FOR_PROVIDER" ? "Repair waiting for provider" : "Repairing automatically"
+    : operatorLabel(state);
 
   return (
-    <div style={{ maxWidth: 980 }}>
+    <div className="operator-page">
       <Link to="/lifecycle" className="muted">← All product projects</Link>
       <div className="row" style={{ gap: 12, marginTop: 8, flexWrap: "wrap" }}>
         <h1 style={{ margin: 0 }}>{project.name}</h1>
-        <Badge value={state} />
-        {project.acceptance_state && <Badge value={project.acceptance_state} />}
+        <span className="badge">{headline}</span>
       </div>
-      {project.blocking_reason && <p style={{ color: "var(--red)" }}>{project.blocking_reason}</p>}
-      {error && <p style={{ color: "var(--red)" }}>{error}</p>}
+      {loadError && <p role="alert">Updates unavailable; displayed status may be stale. <button onClick={refresh}>Retry</button></p>}
+      {error && <p role="alert" style={{ color: "var(--red)" }}>{error}</p>}
       <div className="row" style={{ gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-        {(state === "DRAFT" || state === "PLAN_READY" || state === "BLOCKED") && (
+        {repairs && !activeRepair && (state === "DRAFT" || state === "PLAN_READY" || state === "BLOCKED") && (
           <button onClick={() => run(() => api.lifecycle.plan(project.id))} disabled={busy} data-testid="lifecycle-plan">
             Generate Plan
           </button>
@@ -62,29 +75,31 @@ export function LifecycleDetailPage() {
         )}
         {!["DELIVERED", "FAILED", "CANCELLED", "DRAFT", "PLAN_READY"].includes(state) && (
           <>
-            <button onClick={() => run(() => api.lifecycle.advance(project.id))} disabled={busy}>Advance Now</button>
-            <button onClick={() => run(() => api.lifecycle.pause(project.id))} disabled={busy}>Pause</button>
+            <button onClick={() => run(() => project.paused ? api.lifecycle.resume(project.id) : api.lifecycle.pause(project.id))} disabled={busy}>{project.paused ? "Resume project" : "Pause project"}</button>
           </>
         )}
         {!["DELIVERED", "FAILED", "CANCELLED"].includes(state) && (
-          <button className="danger" onClick={() => run(() => api.lifecycle.cancel(project.id))} disabled={busy}>
+          <button className="danger" onClick={() => { if (window.confirm("Cancel this project? Completed work and evidence are preserved.")) void run(() => api.lifecycle.cancel(project.id)); }} disabled={busy}>
             Cancel
           </button>
         )}
         {["FINAL_ACCEPTANCE", "BLOCKED", "WAITING_FOR_HUMAN"].includes(state) && (
-          <button onClick={() => run(() => api.lifecycle.acceptance(project.id))} disabled={busy} data-testid="lifecycle-accept">
-            Run Acceptance
+          <button onClick={() => run(() => api.lifecycle.acceptance(project.id, true))} disabled={busy || !!project.paused || !repairs || !!activeRepair} data-testid="lifecycle-accept">
+            Re-run acceptance checks
           </button>
         )}
       </div>
 
-      <div className="row" style={{ gap: 4, marginTop: 16 }}>
-        {(["plan", "roadmap", "execution", "gates", "delivery"] as Tab[]).map((t) => (
-          <button key={t} onClick={() => setTab(t)} className={tab === t ? "primary" : undefined} data-testid={`tab-${t}`}>
-            {t === "gates" && openGates.length > 0 ? `Gates (${openGates.length})` : t[0].toUpperCase() + t.slice(1)}
+      <nav className="section-tabs" aria-label="Product sections">
+        {(Object.keys(TABS) as Tab[]).map((t) => (
+          <button key={t} onClick={() => setTab(t)} aria-current={tab === t ? "page" : undefined} data-testid={`tab-${t}`}>
+            {TABS[t]}{t === "gates" && openGates.length > 0 ? ` (${openGates.length})` : ""}
           </button>
         ))}
-      </div>
+      </nav>
+
+      {tab === "overview" && <ProductOverview project={project} headline={headline} missions={missions ?? []} onAttention={() => setTab("gates")} run={run} />}
+      {tab === "activity" && <ProductActivity key={project.id} projectId={project.id} />}
 
       {tab === "plan" && <PlanTab project={project} planEdit={planEdit} setPlanEdit={setPlanEdit} reviseReason={reviseReason} setReviseReason={setReviseReason} run={run} />}
       {tab === "roadmap" && <RoadmapTab project={project} run={run} />}
@@ -108,7 +123,7 @@ export function LifecycleDetailPage() {
                           {" "}· {m.status} · phase {m.current_phase ?? "—"} · provider {m.current_provider ?? "—"}
                         </>
                       )}{" "}
-                      <Link to="/">open in Mission Control</Link>
+                      <Link to={missionHref(p.mission_id)}>open in Mission Control</Link>
                     </>
                   ) : (
                     "no mission yet"
@@ -208,8 +223,8 @@ function PlanTab({
           <button onClick={() => setPlanEdit(JSON.stringify(plan, null, 2))}>Edit JSON</button>
         ) : (
           <div style={{ display: "grid", gap: 8 }}>
-            <textarea rows={14} className="mono" value={planEdit} onChange={(e) => setPlanEdit(e.target.value)} data-testid="plan-json" />
-            <input placeholder="Reason for this revision (required)" value={reviseReason} onChange={(e) => setReviseReason(e.target.value)} data-testid="plan-reason" />
+            <textarea aria-label="Plan JSON" rows={14} className="mono" value={planEdit} onChange={(e) => setPlanEdit(e.target.value)} data-testid="plan-json" />
+            <input aria-label="Revision reason" placeholder="Reason for this revision (required)" value={reviseReason} onChange={(e) => setReviseReason(e.target.value)} data-testid="plan-reason" />
             <div className="row">
               <button
                 className="primary"
@@ -303,11 +318,12 @@ function GateView({
         <div><dt><strong>After resolve:</strong></dt><dd>{gate.after_resolve || "roadmap resumes"}</dd></div>
         {gate.resolution && <div><dt><strong>Resolution:</strong></dt><dd>{gate.resolution}</dd></div>}
       </dl>
-      {gate.status === "open" && (
+      {gate.status === "open" && !FINISHED_PRODUCT_STATES.has(project.state) && (
         <div className="row" style={{ gap: 8 }}>
           {!isSecret && (
             <input
               placeholder="Resolution note (required)"
+              aria-label={`Resolution for ${gate.title}`}
               value={resolution}
               onChange={(e) => setResolution(e.target.value)}
               style={{ flex: 1 }}
@@ -316,6 +332,7 @@ function GateView({
           )}
           <button
             className="primary"
+            disabled={!isSecret && !resolution.trim()}
             onClick={() => run(() => api.lifecycle.resolveGate(project.id, gate.id, isSecret ? "configured" : resolution))}
             data-testid="gate-resolve"
           >
@@ -357,8 +374,9 @@ function DeliveryTab({ project, run }: { project: ProductProjectDetail; run: (fn
         <EvidencePanel projectId={project.id} />
         <RepairCyclePanel projectId={project.id} refresh={run} />
         {pendingWaivers.length > 0 && (
-          <div className="card" style={{ marginTop: 8 }} data-testid="waiver-panel">
-            <h4>Failed criteria — authorize a waiver to proceed without them</h4>
+          <details className="card" style={{ marginTop: 8 }} data-testid="waiver-panel">
+            <summary>Advanced: authorize acceptance exceptions</summary>
+            <p>A waiver does not repair or pass a check. This action records an exception for every failed criterion listed below. Inspect repair and Human Gates first.</p>
             {pendingWaivers.map((c) => (
               <div key={c.criterion_id} style={{ fontSize: 13, marginBottom: 4 }}>
                 <span className="mono">{c.criterion_id}</span> — {c.status}
@@ -367,6 +385,7 @@ function DeliveryTab({ project, run }: { project: ProductProjectDetail; run: (fn
             ))}
             <div className="row" style={{ gap: 8, marginTop: 8 }}>
               <input
+                aria-label="Waiver reason"
                 placeholder="Waiver reason (required, recorded with plan revision)"
                 value={waiveReason}
                 onChange={(e) => setWaiveReason(e.target.value)}
@@ -389,7 +408,7 @@ function DeliveryTab({ project, run }: { project: ProductProjectDetail; run: (fn
                 Record waiver
               </button>
             </div>
-          </div>
+          </details>
         )}
         {(project.waivers ?? []).length > 0 && (
           <div className="card" style={{ marginTop: 8 }}>

@@ -1,11 +1,13 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { Badge } from "../components/Badge";
 import { api } from "../lib/api";
 import { usePolling } from "../lib/hooks";
 
 export function LifecyclePage() {
-  const { data: projects, refresh } = usePolling(() => api.lifecycle.list(), 4000);
+  const { data: projects, error: loadError, refresh } = usePolling(() => api.lifecycle.list(), 4000);
+  const [params] = useSearchParams();
+  const [creating, setCreating] = useState(params.has("create"));
   const [name, setName] = useState("");
   const [idea, setIdea] = useState("");
   const [constraints, setConstraints] = useState("");
@@ -39,23 +41,26 @@ export function LifecyclePage() {
   };
 
   return (
-    <div style={{ maxWidth: 860 }}>
-      <h1>Idea → Product</h1>
+    <div className="operator-page">
+      <div className="page-header"><h1>Products</h1><button className="primary" onClick={() => setCreating(!creating)}>{creating ? "Close creation form" : "Build a product"}</button></div>
       <p className="muted">
         Describe software you want. GG plans the whole product, executes the roadmap with its
         multi-provider engine, reviews and repairs, asks for human setup only when genuinely
         blocked, and delivers a reproducible Git commit.
       </p>
-      <div className="card" style={{ marginTop: 12 }}>
+      {loadError && <p role="alert">Products unavailable. <button onClick={refresh}>Retry</button></p>}
+      {(creating || projects?.length === 0) && <div className="card creation-form" style={{ marginTop: 12 }}>
         <h3>New Project</h3>
         <div style={{ display: "grid", gap: 8 }}>
           <input
+            aria-label="Project name"
             placeholder="Project name (e.g. Issue Tracker)"
             value={name}
             onChange={(e) => setName(e.target.value)}
             data-testid="lifecycle-name"
           />
           <textarea
+            aria-label="Product idea"
             placeholder="Describe the software you want: users, core journeys, must-have features…"
             value={idea}
             onChange={(e) => setIdea(e.target.value)}
@@ -63,6 +68,7 @@ export function LifecyclePage() {
             data-testid="lifecycle-idea"
           />
           <textarea
+            aria-label="Constraints"
             placeholder="Optional constraints (stack preferences, things to avoid, accounts you already have)…"
             value={constraints}
             onChange={(e) => setConstraints(e.target.value)}
@@ -70,6 +76,7 @@ export function LifecyclePage() {
             data-testid="lifecycle-constraints"
           />
           <input
+            aria-label="Target repository path"
             placeholder="Target repository path (optional — GG creates one otherwise)"
             value={targetPath}
             onChange={(e) => setTargetPath(e.target.value)}
@@ -86,7 +93,7 @@ export function LifecyclePage() {
           </div>
           {error && <p style={{ color: "var(--red)" }}>{error}</p>}
         </div>
-      </div>
+      </div>}
       <div style={{ marginTop: 16 }}>
         {projects?.map((p) => (
           <div className="list-row" key={p.id} data-testid="lifecycle-row">

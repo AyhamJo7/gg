@@ -79,4 +79,10 @@ describe("EvidencePanel", () => {
     render(<EvidencePanel projectId="prod-1" />);
     await waitFor(() => expect(screen.getByText("evidence unavailable")).toBeDefined());
   });
+  it("accepts the minimal draft response without inventing evidence", async () => {
+    mockEvidence.mockResolvedValue({ candidate_sha: null, delivery_ready: false, blocking_reasons: ["no target repo"] });
+    render(<EvidencePanel projectId="draft" />);
+    expect(await screen.findByRole("heading", { name: "No candidate yet" })).toBeInTheDocument();
+    expect(screen.queryByText("READY")).not.toBeInTheDocument();
+  });
 });
