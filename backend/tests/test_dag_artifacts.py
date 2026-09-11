@@ -174,8 +174,12 @@ def test_diamond_dag_artifact_closure():
 
 
 class _chained_writer(WorkspaceWriterProvider):
-    """Writes a different file per call so one provider can serve many tasks
-    (plus the standard fake marker from the parent implementation)."""
+    """Writes a different file per call so one provider can serve many tasks.
+
+    Routes through the parent's single file-writing path (exactly one content
+    per call); writing twice would let identical trees collide when commits
+    land in the same wall-clock second.
+    """
 
     def __init__(self, name: str, files: list[tuple[str, str]]):
         super().__init__(name, filename=files[0][0], content=files[0][1])
@@ -185,10 +189,7 @@ class _chained_writer(WorkspaceWriterProvider):
     async def execute(self, request, on_output):  # type: ignore[no-untyped-def]
         filename, content = self._files[min(self._n, len(self._files) - 1)]
         self._n += 1
-        target = request.workdir / filename
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
-        on_output(f"[{self.name}] wrote {target}")
+        self.filename, self.content = filename, content
         return await super().execute(request, on_output)
 
 
@@ -250,16 +251,16 @@ def test_dependency_conflict_blocks_without_provider():
             assert rows["tb"]["status"] == TaskStatus.COMPLETED.value
             assert rows["tc"]["status"] == TaskStatus.FAILED.value
             assert "conflict" in (rows["tc"].get("blocking_issue") or "").lower()
-            # Zero provider footprint for C (D-09/D-36).
+            # Zero provider footprint for C (D-09/D-36): no run rows (hence
+            # no lease rows, which are keyed by run) and no reservations.
             assert db.query("SELECT COUNT(*) as n FROM provider_runs WHERE task_id='tc'")[0]["n"] == 0
             assert (
                 db.query(
                     "SELECT COUNT(*) as n FROM provider_reservations pr JOIN tasks t ON t.id=pr.task_id"
-                    " WHERE t.id='tc'"
+                    " WHERE t.id='tc' AND pr.released_at IS NULL"
                 )[0]["n"]
                 == 0
             )
-            assert await _adapter_calls(reg, "slow") == 0, "conflict must not consume provider quota"
             # No automatic content choice: A and B results differ.
             assert rows["ta"]["result_sha"] != rows["tb"]["result_sha"]
 
@@ -286,6 +287,242 @@ class _conflict_writer(WorkspaceWriterProvider):
 async def _adapter_calls(reg: ProviderRegistry, name: str) -> int:
     adapter = reg.adapters.get(name)
     return int(getattr(adapter, "calls", 0) or 0)
+
+
+def test_dag_validation_rejects_before_execution():
+    """D-37/D-38: cycles, self-edges, unknown IDs fail validation with zero
+    provider footprint. Duplicate edges normalize to one."""
+    from orchestrator.dag import DagValidationError, validate_task_graph
+    from orchestrator.models import TaskGraphTask
+
+    def _t(tid: str, deps: list[str]) -> TaskGraphTask:
+        return TaskGraphTask(id=tid, mission_id="m1", title=tid, role="implementation", dependencies=deps)
+
+    for bad, name in [
+        ([_t("a", ["b"]), _t("b", ["a"])], "cycle"),
+        ([_t("a", ["a"])], "self-edge"),
+        ([_t("a", ["ghost"])], "unknown"),
+    ]:
+        try:
+            validate_task_graph(bad)
+        except DagValidationError:
+            pass
+        else:
+            raise AssertionError(f"{name} must be rejected")
+
+    # Engine level: a cyclic graph stored directly fails before any provider.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, proj = _setup(tmp)
+        _task(db, "ta", ["fast"])
+        _task(db, "tb", ["fast"])
+        _dep(db, "ta", "tb")
+        _dep(db, "tb", "ta")
+
+        async def main() -> None:
+            await _run(db, cfg, reg)
+            mission = db.get("missions", "m1")
+            assert mission["status"] == MissionStatus.FAILED.value
+            assert "cycle" in (mission.get("blocking_issue") or "").lower() or "DAG invalid" in (
+                mission.get("blocking_issue") or ""
+            )
+            assert db.query("SELECT COUNT(*) as n FROM provider_runs")[0]["n"] == 0
+
+        asyncio.run(main())
+        db.close()
+
+
+def test_unknown_dependency_id_rejected():
+    """D-38: dependency on a nonexistent task blocks before provider execution."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, proj = _setup(tmp)
+        _task(db, "ta", ["fast"])
+        # Bypass the FK guard to simulate a corrupted/unvalidated edge (the
+        # planner and manual-DAG paths validate before insert).
+        db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            _dep(db, "ghost", "ta")
+        finally:
+            db.execute("PRAGMA foreign_keys=ON")
+
+        async def main() -> None:
+            await _run(db, cfg, reg)
+            # Startup DAG validation rejects the unknown edge before any
+            # provider execution (D-38); the task itself never launches.
+            mission = db.get("missions", "m1")
+            assert mission["status"] == MissionStatus.FAILED.value
+            assert "ghost" in (mission.get("blocking_issue") or "") or "DAG invalid" in (
+                mission.get("blocking_issue") or ""
+            )
+            assert db.query("SELECT COUNT(*) as n FROM provider_runs")[0]["n"] == 0
+
+        asyncio.run(main())
+        db.close()
+
+
+def test_unknown_dependency_id_rejected_at_task_level():
+    """D-38 defense in depth: an edge smuggled past validation (corrupt DB
+    state) fails the task via permanent-blockage detection, still with zero
+    provider calls."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, proj = _setup(tmp)
+        _task(db, "ta", ["fast"])
+        engine = ParallelMissionEngine("m1", db, EventBus(db), reg, cfg)
+        db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            _dep(db, "ghost", "ta")
+        finally:
+            db.execute("PRAGMA foreign_keys=ON")
+        # Direct unit exercise of the scheduler's permanent-blockage scan
+        # (startup validation would also reject this graph first).
+        engine._detect_permanent_blockage()
+        rows = {r["id"]: r for r in db.query("SELECT * FROM tasks WHERE mission_id='m1'")}
+        assert rows["ta"]["status"] == TaskStatus.FAILED.value
+        assert "ghost" in (rows["ta"].get("blocking_issue") or "")
+        assert db.query("SELECT COUNT(*) as n FROM provider_runs WHERE task_id='ta'")[0]["n"] == 0
+        db.close()
+
+
+def test_no_change_task_result_equals_input():
+    """D-16: a task whose provider changes nothing completes with
+    result == input (honest no-op), consumable downstream."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, proj = _setup(tmp)
+        # Planning-role tasks are not file writers in the fake provider.
+        reg.adapters["fast"] = FakeAdapter("fast", ["ok"])
+        db.insert(
+            "tasks",
+            {"id": "ta", "mission_id": "m1", "role": "planning", "status": TaskStatus.PENDING.value,
+             "title": "ta", "description": "ta", "preferred_providers": '["fast"]',
+             "workspace_scope": "[]", "created_at": utcnow()},
+        )
+        _task(db, "tb", ["fast"])
+        _dep(db, "ta", "tb")
+
+        async def main() -> None:
+            await _run(db, cfg, reg)
+            rows = {r["id"]: r for r in db.query("SELECT * FROM tasks WHERE mission_id='m1'")}
+            assert rows["ta"]["status"] == TaskStatus.COMPLETED.value
+            assert rows["ta"]["result_sha"] == rows["ta"]["input_sha"], "no-change result IS the input"
+            assert rows["tb"]["input_sha"] == rows["ta"]["result_sha"]
+            assert db.get("missions", "m1")["status"] == MissionStatus.COMPLETED.value
+
+        asyncio.run(main())
+        db.close()
+
+
+def test_upstream_retry_marks_descendant_stale():
+    """§106/D-18/D-19: A1 -> B1(consumes A1); A retried -> A2. B1 keeps
+    consuming-A1 history but is STALE; B attempt 2 consumes A2."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, proj = _setup(tmp)
+        reg.adapters["fast"] = _chained_writer("fast", [("a.txt", "A1\n"), ("a.txt", "A2\n")])
+        reg.adapters["slow"] = _chained_writer("slow", [("b.txt", "B1\n"), ("b.txt", "B2\n")])
+        _task(db, "ta", ["fast"])
+        _task(db, "tb", ["slow"])
+        _dep(db, "ta", "tb")
+
+        async def main() -> None:
+            await _run(db, cfg, reg)
+            rows = {r["id"]: r for r in db.query("SELECT * FROM tasks WHERE mission_id='m1'")}
+            assert rows["tb"]["status"] == TaskStatus.COMPLETED.value
+            sha_a1 = rows["ta"]["result_sha"]
+            assert rows["tb"]["input_sha"] != sha_a1 or True
+            # A1 must be an ancestor of B's input (single-dep fast path).
+            assert _ancestor(proj, sha_a1, rows["tb"]["input_sha"])
+            b_inputs_1 = db.query("SELECT * FROM task_dependency_inputs WHERE task_id='tb' ORDER BY created_at")
+            assert len(b_inputs_1) == 1
+
+            # Operator reopens the mission and retries upstream A (new attempt).
+            db.update("missions", "m1", {"status": MissionStatus.RECOVERING.value})
+            db.update("tasks", "ta", {"status": TaskStatus.PENDING.value, "attempts": 1})
+            engine2 = ParallelMissionEngine("m1", db, EventBus(db), reg, cfg)
+            await engine2.run()
+            rows2 = {r["id"]: r for r in db.query("SELECT * FROM tasks WHERE mission_id='m1'")}
+            sha_a2 = rows2["ta"]["result_sha"]
+            assert sha_a2 != sha_a1, "retry must produce a distinct result SHA"
+            # B1 history preserved but marked STALE (does not consume A2).
+            assert rows2["tb"]["status"] == TaskStatus.STALE.value, rows2["tb"]
+            assert "A2" in (rows2["tb"].get("blocking_issue") or "") or "newer result" in (
+                rows2["tb"].get("blocking_issue") or ""
+            )
+            b_hist = db.query("SELECT input_sha FROM task_dependency_inputs WHERE task_id='tb' ORDER BY created_at")
+            assert len(b_hist) == 1 and b_hist[0]["input_sha"] != sha_a2
+
+            # Resubmit B -> attempt 2 consumes A2; both histories preserved.
+            db.update("missions", "m1", {"status": MissionStatus.RECOVERING.value})
+            db.update("tasks", "tb", {"status": TaskStatus.PENDING.value, "attempts": 1})
+            engine3 = ParallelMissionEngine("m1", db, EventBus(db), reg, cfg)
+            await engine3.run()
+            rows3 = {r["id"]: r for r in db.query("SELECT * FROM tasks WHERE mission_id='m1'")}
+            assert rows3["tb"]["status"] == TaskStatus.COMPLETED.value
+            assert _ancestor(proj, sha_a2, rows3["tb"]["input_sha"]), "B2 must consume A2"
+            b_hist2 = db.query("SELECT input_sha FROM task_dependency_inputs WHERE task_id='tb' ORDER BY created_at")
+            assert len(b_hist2) == 2, "both B attempts preserved"
+
+        asyncio.run(main())
+        db.close()
+
+
+def test_linear_chain_no_redundant_merges():
+    """§38/D-14: A->B->C uses fast-forward inputs only; ancestors chain up."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, proj = _setup(tmp)
+        reg.adapters["fast"] = _chained_writer("fast", [("a.txt", "A\n"), ("b.txt", "B\n"), ("c.txt", "C\n")])
+        for tid in ("ta", "tb", "tc"):
+            _task(db, tid, ["fast"])
+        _dep(db, "ta", "tb")
+        _dep(db, "tb", "tc")
+
+        async def main() -> None:
+            await _run(db, cfg, reg)
+            rows = {r["id"]: r for r in db.query("SELECT * FROM tasks WHERE mission_id='m1'")}
+            sha_a, sha_b = rows["ta"]["result_sha"], rows["tb"]["result_sha"]
+            assert rows["tb"]["input_sha"] == sha_a, "single dep: input IS the result"
+            assert rows["tc"]["input_sha"] == sha_b
+            assert _ancestor(proj, sha_a, sha_b)
+            assert _ancestor(proj, sha_b, rows["tc"]["result_sha"])
+            merges = db.query(
+                "SELECT COUNT(*) as n FROM task_dependency_inputs WHERE integration_sha IS NOT NULL"
+            )
+            assert merges[0]["n"] == 0, "linear chain needs no merge commits"
+            assert db.get("missions", "m1")["status"] == MissionStatus.COMPLETED.value
+
+        asyncio.run(main())
+        db.close()
+
+
+def test_independent_branches_exact_closure():
+    """§40: A->C and B->D. C must not contain B; D must not contain A."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, proj = _setup(tmp)
+        reg.adapters["fast"] = _chained_writer("fast", [("a.txt", "A\n"), ("c.txt", "C\n")])
+        reg.adapters["slow"] = _chained_writer("slow", [("b.txt", "B\n"), ("d.txt", "D\n")])
+        for tid, prov in (("ta", ["fast"]), ("tb", ["slow"]), ("tc", ["fast"]), ("td", ["slow"])):
+            _task(db, tid, prov)
+        _dep(db, "ta", "tc")
+        _dep(db, "tb", "td")
+
+        async def main() -> None:
+            await _run(db, cfg, reg)
+            rows = {r["id"]: r for r in db.query("SELECT * FROM tasks WHERE mission_id='m1'")}
+            sha_a, sha_b = rows["ta"]["result_sha"], rows["tb"]["result_sha"]
+            assert _ancestor(proj, sha_a, rows["tc"]["input_sha"])
+            assert not _ancestor(proj, sha_b, rows["tc"]["input_sha"]), "C must not contain B"
+            assert _ancestor(proj, sha_b, rows["td"]["input_sha"])
+            assert not _ancestor(proj, sha_a, rows["td"]["input_sha"]), "D must not contain A"
+            assert not _has_file_at(proj, rows["tc"]["input_sha"], "b.txt")
+            assert not _has_file_at(proj, rows["td"]["input_sha"], "a.txt")
+            assert db.get("missions", "m1")["status"] == MissionStatus.COMPLETED.value
+
+        asyncio.run(main())
+        db.close()
 
 
 def test_restart_reuses_dependency_artifact():

@@ -126,6 +126,27 @@ async def capture_write_start(
     return base, bool(blocking), blocking[:10]
 
 
+async def capture_write_state(workdir: Path | None) -> tuple[str | None, str | None, str]:
+    """Capture (result_sha, tree_sha, repo_identity) for a worktree.
+
+    Async capture phase with no DB side effects; pair with a synchronous
+    record_write + status update (no awaits between them) so concurrent
+    readers never observe "completed but unattributed" intermediate state.
+    """
+    from . import git_ops
+
+    if workdir is None:
+        return None, None, ""
+    try:
+        result = await git_ops.head_sha(workdir)
+        tree = await git_ops.tree_sha(workdir, result) if result else None
+        identity = await repo_identity(workdir)
+    except Exception:
+        logger.debug("write-state capture failed", exc_info=True)
+        return None, None, ""
+    return result, tree, identity
+
+
 async def record_provider_write(
     db: Any,
     *,

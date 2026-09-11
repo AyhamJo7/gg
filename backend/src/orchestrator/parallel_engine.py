@@ -348,6 +348,25 @@ class ParallelMissionEngine:
             )
             for dep in deps:
                 dep_task = self.db.get("tasks", dep["from_task_id"])
+                if dep_task is None or dep_task.get("mission_id") != self.mission_id:
+                    # Unknown/foreign dependency ID: fail closed before any
+                    # provider execution (D-38). Planners and the manual DAG
+                    # API validate up front; this guards corrupted state.
+                    self.db.update(
+                        "tasks",
+                        tid,
+                        {
+                            "status": TaskStatus.FAILED.value,
+                            "blocking_issue": f"unknown dependency {dep['from_task_id']}: no such task",
+                        },
+                    )
+                    self.events.publish(
+                        EventType.TASK_FAILED,
+                        mission_id=self.mission_id,
+                        task_id=tid,
+                        reason="unknown_dependency",
+                    )
+                    break
                 if dep_task and dep_task["status"] in (
                     TaskStatus.FAILED.value,
                     TaskStatus.CANCELLED.value,
@@ -564,7 +583,13 @@ class ParallelMissionEngine:
 
         # Final coverage (D-31/§78/§107): every required COMPLETED task result
         # must be represented through ancestry in the final candidate. DB
-        # status alone never suffices.
+        # status alone never suffices. With nothing to integrate, the
+        # candidate is the current HEAD itself.
+        if not merged_commit:
+            try:
+                merged_commit = await git_ops.head_sha(project_path)
+            except Exception:
+                merged_commit = None
         missing = await self._final_coverage_missing(project_path, merged_commit)
         if missing:
             self._set_mission_status(
@@ -1603,13 +1628,23 @@ class ParallelMissionEngine:
             return False
 
         # Create worktree from the pinned input SHA (never moving HEAD).
-        # Retry with a new input: drop the stale worktree/branch first.
+        # Stale worktree (previous attempt advanced the branch, or a new
+        # input was computed): detach the checkout but KEEP the old branch
+        # ref so prior attempt commits stay reachable for provenance, then
+        # create a fresh worktree+branch from the pinned input.
         try:
             branch_record = await task_worktree.create_task_worktree(
                 self.db, self.events, project_path, mission["id"], tid, base_commit=prepared.input_sha
             )
-            if branch_record.base_commit != prepared.input_sha:
-                await task_worktree.remove_task_worktree(self.db, self.events, project_path, tid)
+            _fresh_head: str | None = None
+            try:
+                _fresh_head = await git_ops.head_sha(Path(branch_record.worktree_path))
+            except Exception:
+                _fresh_head = None
+            if branch_record.base_commit != prepared.input_sha or _fresh_head != prepared.input_sha:
+                await task_worktree.remove_task_worktree(
+                    self.db, self.events, project_path, tid, keep_branch=True
+                )
                 branch_record = await task_worktree.create_task_worktree(
                     self.db, self.events, project_path, mission["id"], tid, base_commit=prepared.input_sha
                 )
@@ -1715,13 +1750,27 @@ class ParallelMissionEngine:
         missing: list[str] = []
         try:
             completed = self.db.query(
-                "SELECT id, result_sha, checkpoint_after FROM tasks WHERE mission_id=? AND status='COMPLETED'",
+                "SELECT id, result_sha, checkpoint_after, input_sha, provider_run_id FROM tasks"
+                " WHERE mission_id=? AND status='COMPLETED'",
                 (self.mission_id,),
             )
         except Exception:
             return ["task results unreadable"]
         for t in completed:
             tid = str(t.get("id"))
+            if not t.get("input_sha") and not t.get("provider_run_id"):
+                try:
+                    _linked = self.db.query(
+                        "SELECT id FROM write_provenance WHERE task_id=? LIMIT 1", (tid,)
+                    )
+                except Exception:
+                    _linked = []
+                if not _linked:
+                    # Pre-artifact legacy row (no input, no run, no write
+                    # linkage): cannot prove inclusion, but must not rewrite
+                    # history — readability preserved, enforcement applies to
+                    # tracked attempts going forward.
+                    continue
             result = t.get("result_sha") or t.get("checkpoint_after")
             if not result:
                 missing.append(f"{tid}@missing-result")
@@ -2106,6 +2155,27 @@ class ParallelMissionEngine:
                 return
 
             _previous_result = task.get("result_sha")
+            _final_result = checkpoint_sha or _planned_input
+            # Capture async state first; then publish row + status with NO
+            # awaits between them, so concurrent downstream readers never
+            # observe "COMPLETED but unattributed" intermediate state.
+            from .provenance import ACTOR_PROVIDER as _ACTOR_PROV
+            from .provenance import capture_write_state, record_write
+
+            _cap_result, _cap_tree, _cap_ident = await capture_write_state(Path(worktree_path))
+            if _cap_result != _final_result:
+                logger.debug(
+                    "task %s HEAD moved during checkpoint (%s -> %s)", task_id, _final_result, _cap_result
+                )
+            try:
+                record_write(
+                    self.db, run_id=run_id, mission_id=self.mission_id, task_id=task_id,
+                    product_project_id=_product_id, phase_id=_phase_id, actor_type=_ACTOR_PROV,
+                    actor_detail="", provider=provider_name, role=role.value, base_sha=commit_before,
+                    result_sha=_final_result, tree_sha=_cap_tree, repo_key_value=_cap_ident,
+                )
+            except Exception:
+                logger.debug("task write row insert failed for %s", task_id, exc_info=True)
             self.db.update(
                 "tasks",
                 task_id,
@@ -2117,28 +2187,13 @@ class ParallelMissionEngine:
                     "checkpoint_after": checkpoint_sha,
                     # Immutable per attempt: explicit checkpoint, else the
                     # unchanged input (no-change runs are honest no-ops).
-                    "result_sha": checkpoint_sha or _planned_input,
+                    "result_sha": _final_result,
                 },
-            )
-            # Bind this task run to its checkpoint SHA (P-02).
-            from .provenance import record_provider_write as _record_task_write
-
-            await _record_task_write(
-                self.db,
-                workdir=Path(worktree_path),
-                run_id=run_id,
-                mission_id=self.mission_id,
-                task_id=task_id,
-                product_project_id=_product_id,
-                phase_id=_phase_id,
-                provider=provider_name,
-                role=role.value,
-                base_sha=commit_before,
             )
             # Upstream retry invalidates completed descendants (D-18/§59):
             # a new result that obsoletes a previously recorded one marks
             # completed direct dependents STALE unless they already contain it.
-            _new_result = checkpoint_sha or _planned_input
+            _new_result = _final_result
             if _previous_result and _new_result and _previous_result != _new_result:
                 await self._mark_descendants_stale(task_id, _new_result)
             self.events.publish(

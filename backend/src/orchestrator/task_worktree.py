@@ -131,10 +131,14 @@ async def remove_task_worktree(
     events: EventBus,
     project_path: Path,
     task_id: str,
+    keep_branch: bool = False,
 ) -> None:
     """Remove a task worktree and clean up the branch.
 
     Only removes artifacts proven to belong to GG (namespaced branches).
+    With keep_branch=True the worktree checkout is removed but the branch
+    ref is preserved, so prior attempt commits stay reachable for
+    provenance (retry with a new input must never orphan history).
     """
     row = db.query("SELECT * FROM task_branches WHERE task_id=? AND removed_at IS NULL", (task_id,))
     if not row:
@@ -152,6 +156,12 @@ async def remove_task_worktree(
         await git_ops._git(project_path, "worktree", "remove", "-f", str(wt_path), check=False)
     except git_ops.GitError as exc:
         logger.warning("worktree remove failed for %s: %s", wt_path, exc)
+
+    if keep_branch:
+        db.update("task_branches", record["id"], {"removed_at": utcnow().isoformat()})
+        events.publish(EventType.WORKTREE_REMOVED, task_id=task_id, branch=branch)
+        logger.info("removed worktree %s for task %s (branch %s kept)", wt_path, task_id, branch)
+        return
 
     # Delete branch from main repo
     try:
