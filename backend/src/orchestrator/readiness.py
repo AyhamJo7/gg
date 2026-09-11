@@ -148,7 +148,7 @@ def _task_has_resource_conflict(db: Database, task_row: dict[str, Any], ready_ta
 
 
 def detect_permanent_blockage(db: Database, mission_id: str) -> list[str]:
-    """Return task IDs that are permanently blocked due to failed/cancelled dependencies."""
+    """Return task IDs permanently blocked by failed/cancelled/unverified dependencies."""
     rows = _task_rows(db, mission_id)
     status_map: dict[str, str] = {r["id"]: r["status"] for r in rows}
     permanently_blocked: list[str] = []
@@ -166,7 +166,11 @@ def detect_permanent_blockage(db: Database, mission_id: str) -> list[str]:
         deps = _deps_for(db, tid)
         for dep in deps:
             dep_status = status_map.get(dep, TaskStatus.PENDING.value)
-            if dep_status in (TaskStatus.FAILED.value, TaskStatus.CANCELLED.value):
+            if dep_status in (
+                TaskStatus.FAILED.value,
+                TaskStatus.CANCELLED.value,
+                TaskStatus.UNVERIFIED.value,
+            ):
                 permanently_blocked.append(tid)
                 break
     return permanently_blocked

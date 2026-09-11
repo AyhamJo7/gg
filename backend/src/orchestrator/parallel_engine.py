@@ -370,13 +370,17 @@ class ParallelMissionEngine:
                 if dep_task and dep_task["status"] in (
                     TaskStatus.FAILED.value,
                     TaskStatus.CANCELLED.value,
+                    TaskStatus.UNVERIFIED.value,
                 ):
                     self.db.update(
                         "tasks",
                         tid,
                         {
                             "status": TaskStatus.FAILED.value,
-                            "blocking_issue": f"permanently blocked: dependency {dep['from_task_id']} failed",
+                            "blocking_issue": (
+                                f"permanently blocked: dependency {dep['from_task_id']} "
+                                f"{dep_task['status'].lower()}"
+                            ),
                         },
                     )
                     self.events.publish(

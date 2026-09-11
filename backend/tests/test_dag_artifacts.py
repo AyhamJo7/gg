@@ -1022,3 +1022,142 @@ def test_restart_reuses_dependency_artifact():
 
         asyncio.run(main())
         db.close()
+
+
+def _blockage_setup(tmp: Path):
+    """Minimal mission DB: caller inserts tasks/edges, no providers run."""
+    db, cfg, reg, proj = _setup(tmp)
+    return db, cfg, reg, proj
+
+
+def test_unverified_dependency_permanently_blocks():
+    """F-DEP-01: A=UNVERIFIED, B PENDING depending on A -> B FAILED with an
+    actionable reason, zero provider side effects, mission can terminate."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, _proj = _blockage_setup(tmp)
+        _task(db, "ta", ["fast"])
+        _task(db, "tb", ["fast"])
+        _dep(db, "ta", "tb")
+        db.update("tasks", "ta", {"status": TaskStatus.UNVERIFIED.value})
+        engine = ParallelMissionEngine("m1", db, EventBus(db), reg, cfg)
+        engine._detect_permanent_blockage()
+        tb = db.get("tasks", "tb")
+        assert tb["status"] == TaskStatus.FAILED.value, tb
+        assert "ta" in (tb.get("blocking_issue") or "")
+        assert "unverified" in (tb.get("blocking_issue") or "").lower()
+        assert db.query("SELECT COUNT(*) as n FROM provider_runs")[0]["n"] == 0
+        assert (
+            db.query(
+                "SELECT COUNT(*) as n FROM provider_reservations pr JOIN tasks t ON t.id=pr.task_id"
+                " WHERE t.mission_id='m1' AND pr.released_at IS NULL"
+            )[0]["n"]
+            == 0
+        )
+        assert db.query("SELECT COUNT(*) as n FROM invocation_leases")[0]["n"] == 0
+        assert db.query("SELECT COUNT(*) as n FROM task_branches")[0]["n"] == 0
+        db.close()
+
+
+def test_permanent_blockage_status_matrix():
+    """F-DEP-01/S10: FAILED/CANCELLED/UNVERIFIED block; COMPLETED stays
+    eligible; STALE keeps existing semantics (not auto-failed here)."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, _proj = _blockage_setup(tmp)
+        _task(db, "t-fail", ["fast"])
+        _task(db, "t-cancel", ["fast"])
+        _task(db, "t-unver", ["fast"])
+        _task(db, "t-ok", ["fast"])
+        _task(db, "t-stale", ["fast"])
+        _task(db, "d-fail", ["fast"])
+        _task(db, "d-cancel", ["fast"])
+        _task(db, "d-unver", ["fast"])
+        _task(db, "d-ok", ["fast"])
+        _task(db, "d-stale", ["fast"])
+        _dep(db, "t-fail", "d-fail")
+        _dep(db, "t-cancel", "d-cancel")
+        _dep(db, "t-unver", "d-unver")
+        _dep(db, "t-ok", "d-ok")
+        _dep(db, "t-stale", "d-stale")
+        db.update("tasks", "t-fail", {"status": TaskStatus.FAILED.value})
+        db.update("tasks", "t-cancel", {"status": TaskStatus.CANCELLED.value})
+        db.update("tasks", "t-unver", {"status": TaskStatus.UNVERIFIED.value})
+        db.update("tasks", "t-ok", {"status": TaskStatus.COMPLETED.value, "result_sha": "a" * 40})
+        db.update("tasks", "t-stale", {"status": TaskStatus.STALE.value})
+        engine = ParallelMissionEngine("m1", db, EventBus(db), reg, cfg)
+        engine._detect_permanent_blockage()
+        rows = {r["id"]: r for r in db.query("SELECT * FROM tasks WHERE mission_id='m1'")}
+        assert rows["d-fail"]["status"] == TaskStatus.FAILED.value
+        assert rows["d-cancel"]["status"] == TaskStatus.FAILED.value
+        assert rows["d-unver"]["status"] == TaskStatus.FAILED.value
+        assert "unverified" in (rows["d-unver"].get("blocking_issue") or "").lower()
+        assert rows["d-ok"]["status"] == TaskStatus.PENDING.value, "completed dep stays eligible"
+        assert rows["d-stale"]["status"] == TaskStatus.PENDING.value, "STALE semantics unchanged"
+        assert db.query("SELECT COUNT(*) as n FROM provider_runs")[0]["n"] == 0
+        db.close()
+
+
+def test_unverified_blockage_multiple_dependencies():
+    """F-DEP-01/S7: B depends on A=COMPLETED + X=UNVERIFIED -> B still blocked."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, _proj = _blockage_setup(tmp)
+        _task(db, "ta", ["fast"])
+        _task(db, "tx", ["fast"])
+        _task(db, "tb", ["fast"])
+        _dep(db, "ta", "tb")
+        _dep(db, "tx", "tb")
+        db.update("tasks", "ta", {"status": TaskStatus.COMPLETED.value, "result_sha": "b" * 40})
+        db.update("tasks", "tx", {"status": TaskStatus.UNVERIFIED.value})
+        engine = ParallelMissionEngine("m1", db, EventBus(db), reg, cfg)
+        engine._detect_permanent_blockage()
+        tb = db.get("tasks", "tb")
+        assert tb["status"] == TaskStatus.FAILED.value, tb
+        assert "tx" in (tb.get("blocking_issue") or ""), tb.get("blocking_issue")
+        assert db.query("SELECT COUNT(*) as n FROM provider_runs")[0]["n"] == 0
+        db.close()
+
+
+def test_transitive_unverified_blockage():
+    """F-DEP-01/S6: A UNVERIFIED -> B blocked -> C blocked; mission terminates."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, _proj = _blockage_setup(tmp)
+        _task(db, "ta", ["fast"])
+        _task(db, "tb", ["fast"])
+        _task(db, "tc", ["fast"])
+        _dep(db, "ta", "tb")
+        _dep(db, "tb", "tc")
+        db.update("tasks", "ta", {"status": TaskStatus.UNVERIFIED.value})
+        engine = ParallelMissionEngine("m1", db, EventBus(db), reg, cfg)
+        engine._detect_permanent_blockage()
+        assert db.get("tasks", "tb")["status"] == TaskStatus.FAILED.value
+        engine._detect_permanent_blockage()
+        tc = db.get("tasks", "tc")
+        assert tc["status"] == TaskStatus.FAILED.value, tc
+        assert "tb" in (tc.get("blocking_issue") or "")
+        db.close()
+
+
+def test_unverified_blockage_survives_restart():
+    """F-DEP-01/S12: persisted UNVERIFIED + PENDING re-triggers blockage on a
+    fresh engine (recovery), mission reaches FAILED, never spins."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        db, cfg, reg, _proj = _blockage_setup(tmp)
+        _task(db, "ta", ["fast"])
+        _task(db, "tb", ["fast"])
+        _dep(db, "ta", "tb")
+        db.update("tasks", "ta", {"status": TaskStatus.UNVERIFIED.value})
+
+        async def main() -> None:
+            engine = ParallelMissionEngine("m1", db, EventBus(db), reg, cfg)
+            await engine.run()
+            assert db.get("tasks", "tb")["status"] == TaskStatus.FAILED.value
+            mission = db.get("missions", "m1")
+            assert mission["status"] == MissionStatus.FAILED.value, mission
+            assert db.query("SELECT COUNT(*) as n FROM provider_runs")[0]["n"] == 0
+
+        asyncio.run(main())
+        db.close()
