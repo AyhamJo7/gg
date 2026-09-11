@@ -119,8 +119,10 @@ async def test_scenario_b_checkpoint_exhaustion_aborts_mission(tmp_path):
     ws.mkdir()
     (ws / "README.md").write_text("# test\n")
     await git_ops.init_repo(ws)
-    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "fixture"], cwd=ws, check=True, capture_output=True)
+    await asyncio.to_thread(subprocess.run, ["git", "add", "-A"], cwd=ws, check=True, capture_output=True)
+    await asyncio.to_thread(
+        subprocess.run, ["git", "commit", "-m", "fixture"], cwd=ws, check=True, capture_output=True
+    )
 
     adapters = _full_fake_adapters()
     orch = make_orchestrator(tmp_path, adapters)
