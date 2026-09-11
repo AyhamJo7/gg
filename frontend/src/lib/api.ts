@@ -41,6 +41,7 @@ import type {
   ProductProjectSummary,
   Project,
   ProviderHealth,
+  RepairCycle,
   RunDetail,
   TaskLogsResponse,
   UsageAnalytics,
@@ -179,6 +180,10 @@ export const api = {
         method: "POST",
       }),
     evidence: (id: string) => req<ArtifactEvidence>(`/api/product-projects/${id}/evidence`),
+    repairCycles: (id: string) =>
+      req<{ cycles: RepairCycle[]; stats: Record<string, unknown> }>(`/api/product-projects/${id}/repair-cycles`),
+    cancelRepairCycle: (id: string, cycleId: string) =>
+      req<RepairCycle>(`/api/product-projects/${id}/repair-cycles/${cycleId}/cancel`, { method: "POST" }),
     waive: (id: string, target_kind: string, target_id: string, reason: string) =>
       req<{ ok: boolean }>(`/api/product-projects/${id}/waivers`, {
         method: "POST",

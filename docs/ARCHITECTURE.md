@@ -4,9 +4,11 @@ Date: 2026-09-10. Source baseline: `6ebcc7d` on `main`.
 Status: **assessment and proposed design; no product implementation in this pass**.
 Implemented since: Increment 1 (durable invocation boundary), Increment 2
 (deterministic role-specific context compiler, `compiled-v2` /
-`context-policy-v2`), and Increment 3 (exact-SHA evidence, immutable attempt
-lineage, complete writer provenance) — see [ARCHITECTURE.md](../ARCHITECTURE.md)
-for current behavior. The proposal below remains the design reference.
+`context-policy-v2`), Increment 3 (exact-SHA evidence, immutable attempt
+lineage, complete writer provenance), and Increment 4 (bounded autonomous
+repair: persistent classified cycles, budgeted attempts, independent review,
+exact recheck — see [ARCHITECTURE.md](../ARCHITECTURE.md)
+for current behavior). The proposal below remains the design reference.
 
 This report uses current source, nine SQL migrations, the default local database,
 its associated provider logs, one precisely matched Codex session, local CLI help,

@@ -39,6 +39,17 @@ orchestration:
   max_provider_wait_seconds: 7200
   scheduler_tick_seconds: 2
 
+# Bounded autonomous repair (Increment 4): GG repairs only well-scoped
+# implementation defects with deterministic evidence, inside hard budgets,
+# with mandatory independent review + exact recheck. Everything else stops
+# with a persisted reason and an operator-visible gate.
+repair:
+  autonomous_enabled: true
+  # Hard per-cycle attempt limit (clamped to 1-3).
+  max_attempts: 2
+  max_per_phase: 4
+  max_per_project: 8
+
 scheduler:
   max_parallel_tasks: 3
   max_parallel_per_provider:

@@ -1881,6 +1881,15 @@ RULES:
                     findings.extend(await self._evidence_gate_findings(project_id, plan, repo, sha))
         if findings:
             blocked_state = AcceptanceState.EXTERNALLY_BLOCKED.value if open_gates else AcceptanceState.UNVERIFIED.value
+            if sha:
+                # Bounded autonomous repair triage (Increment 4): classify the
+                # blocked acceptance and persist at most one repair cycle.
+                # Never changes this verdict; never launches providers here.
+                try:
+                    self._supersede_stale_repairs(project_id, sha)
+                    self._maybe_open_repair_cycle(project_id, plan, repo, sha)
+                except Exception:
+                    logger.debug("autonomous repair triage failed for %s", project_id, exc_info=True)
             self.db.update(
                 "product_projects",
                 project_id,
@@ -2324,6 +2333,171 @@ RULES:
                     {"state": ProductStatus.FINAL_ACCEPTANCE.value, "updated_at": utcnow()},
                 )
             return await self._run_acceptance_locked(project_id, recheck=recheck)
+
+    # -- bounded autonomous repair (Increment 4) -----------------------------
+    def list_repair_cycles(self, project_id: str) -> list[dict[str, Any]]:
+        """Operator-visible repair cycles with per-cycle attempt history."""
+        from .repair import RepairCoordinator
+
+        coord = RepairCoordinator(self.db, self.config)
+        cycles = coord.list_cycles(project_id)
+        for cycle in cycles:
+            cycle["attempts"] = coord.attempts(str(cycle["id"]))
+        return cycles
+
+    def get_repair_cycle(self, cycle_id: str) -> dict[str, Any]:
+        from .repair import RepairCoordinator
+
+        coord = RepairCoordinator(self.db, self.config)
+        cycle = coord.get_cycle(cycle_id)
+        if not cycle:
+            raise KeyError(f"repair cycle {cycle_id} not found")
+        cycle["attempts"] = coord.attempts(cycle_id)
+        return cycle
+
+    def cancel_repair_cycle(self, cycle_id: str) -> dict[str, Any]:
+        """Operator cancellation: stops all future attempts (R-36)."""
+        from .repair import RepairCoordinator
+
+        return RepairCoordinator(self.db, self.config).cancel_cycle(cycle_id)
+
+    def repair_stats(self, project_id: str) -> dict[str, Any]:
+        from .repair import RepairCoordinator
+
+        return RepairCoordinator(self.db, self.config).repair_stats(project_id)
+
+    def _repair_enabled(self) -> bool:
+        return bool(self.config.get("repair.autonomous_enabled", True))
+
+    def _supersede_stale_repairs(self, project_id: str, sha: str) -> list[str]:
+        from .repair import RepairCoordinator
+
+        try:
+            return RepairCoordinator(self.db, self.config).supersede_on_candidate_change(project_id, sha)
+        except Exception:
+            logger.debug("repair supersede check failed for %s", project_id, exc_info=True)
+            return []
+
+    def _maybe_open_repair_cycle(
+        self, project_id: str, plan: ProductPlan, repo: Path | None, sha: str
+    ) -> dict[str, Any] | None:
+        """Triage a blocked acceptance into at most one autonomous repair cycle.
+
+        Never raises and never changes the acceptance verdict: it only
+        persists classification + cycle rows so the operator (or an explicit
+        repair runner) can see why automation will or will not act. Only
+        IMPLEMENTATION_DEFECT cycles are executable; every other class
+        terminalizes immediately with a stop reason and optional gate hint.
+        """
+        from .repair import (
+            RepairCoordinator,
+            RepairTriggerType,
+            classify_criterion_failure,
+            classify_verification_failure,
+        )
+
+        if not self._repair_enabled():
+            return None
+        coord = RepairCoordinator(self.db, self.config)
+        # Prefer the freshest failed criterion attempt at this exact SHA:
+        # it is immutable evidence (R-01) with an exact trigger SHA (R-02).
+        crit = self.db.query(
+            "SELECT * FROM criterion_attempts WHERE project_id=? AND checked_sha=? AND result='FAILED'"
+            " ORDER BY created_at DESC LIMIT 1",
+            (project_id, sha.lower()),
+        )
+        if crit:
+            row = crit[0]
+            req_text, crit_text = "", ""
+            for req in plan.requirements:
+                if req.id == row.get("requirement_id"):
+                    req_text = f"{req.title}\n{req.description}"
+                    for criterion in req.acceptance:
+                        if criterion.id == row.get("criterion_id"):
+                            crit_text = f"{criterion.description}\n{criterion.verify}"
+            classification = classify_criterion_failure(
+                command=str(row.get("command") or ""),
+                exit_code=row.get("exit_code"),
+                output_tail=str(row.get("output_tail") or ""),
+                requirement_text=req_text,
+                criterion_text=crit_text,
+            )
+            created = coord.create_cycle(
+                project_id=project_id,
+                trigger_type=RepairTriggerType.CRITERION_FAILED.value,
+                trigger_evidence_id=str(row["id"]),
+                trigger_sha=sha,
+                repo_key=str(row.get("repo_key") or ""),
+                target_requirement_id=row.get("requirement_id"),
+                target_criterion_id=row.get("criterion_id"),
+                classification=classification.value,
+            )
+            cycle = created.get("cycle")
+            if cycle and not created.get("deduplicated") and not created.get("reason"):
+                return coord.classify_cycle(str(cycle["id"]), classification.value)
+            return cycle
+        ver = self.db.query(
+            "SELECT * FROM verification_attempts WHERE product_project_id=? AND sha=? AND status='failed'"
+            " ORDER BY finished_at DESC LIMIT 1",
+            (project_id, sha.lower()),
+        )
+        if ver:
+            row = ver[0]
+            classification = classify_verification_failure(
+                command=str((row.get("commands_json") or "")[:300]),
+                exit_code=row.get("exit_code"),
+                output_tail=str(row.get("summary") or ""),
+            )
+            created = coord.create_cycle(
+                project_id=project_id,
+                trigger_type=RepairTriggerType.VERIFICATION_FAILED.value,
+                trigger_evidence_id=str(row["id"]),
+                trigger_sha=sha,
+                repo_key=str(row.get("repo_key") or ""),
+                classification=classification.value,
+            )
+            cycle = created.get("cycle")
+            if cycle and not created.get("deduplicated") and not created.get("reason"):
+                return coord.classify_cycle(str(cycle["id"]), classification.value)
+            return cycle
+        return None
+
+    def open_review_finding_repair(
+        self,
+        project_id: str,
+        *,
+        finding_id: str,
+        mission_id: str,
+        trigger_sha: str,
+        severity: str,
+        category: str,
+        description: str,
+        recommended_fix: str = "",
+        repo_key: str = "",
+        phase_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Open a REVIEW_FINDING repair cycle from immutable finding evidence."""
+        from .repair import RepairCoordinator, RepairTriggerType, classify_review_finding
+
+        coord = RepairCoordinator(self.db, self.config)
+        classification = classify_review_finding(
+            severity=severity, category=category, description=description, recommended_fix=recommended_fix
+        )
+        created = coord.create_cycle(
+            project_id=project_id,
+            trigger_type=RepairTriggerType.REVIEW_FINDING.value,
+            trigger_evidence_id=finding_id,
+            trigger_sha=trigger_sha,
+            repo_key=repo_key,
+            phase_id=phase_id,
+            target_finding_id=finding_id,
+            classification=classification.value,
+        )
+        cycle = created.get("cycle")
+        if cycle and not created.get("deduplicated") and not created.get("reason"):
+            classified = coord.classify_cycle(str(cycle["id"]), classification.value)
+            return {"cycle": classified, "deduplicated": False}
+        return created
 
     # -- recovery ----------------------------------------------------------
     async def recover(self) -> None:

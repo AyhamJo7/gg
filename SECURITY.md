@@ -255,6 +255,12 @@ operations, and workspace escape.
 - `workspace_scope` is a scheduling lock, not a filesystem sandbox: a task
   declares which paths it will touch so conflicting tasks serialize, but the
   provider process itself is not confined to those paths.
+- Bounded autonomous repair cannot weaken its own acceptance contract: the
+  repair agent never changes criterion commands, requirement text, waivers, or
+  security policy — tampering with protected files is rejected even when review
+  passes, and repeated failure terminalizes instead of escalating. Repair
+  failure fingerprints store normalized excerpts only, never raw secret-bearing
+  logs.
 - `backend/src/orchestrator/verify.py`'s FINAL_VALIDATION/acceptance
   toolchain check now runs through the same `bwrap` sandbox as
   criterion/gate-validation commands (see above) — it is no longer a

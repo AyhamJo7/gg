@@ -53,6 +53,12 @@ editor, never in plan text or resolution notes. Waivers are explicit exceptions,
 not proof that a requirement passed. Fresh-checkout verification currently repeats
 the detected toolchain, **not every requirement-specific criterion**.
 
+Blocked acceptance is triaged into bounded autonomous repair: only well-scoped
+implementation defects with deterministic evidence are repaired automatically
+(default 2 attempts per cycle), with mandatory independent review and exact
+recheck. Environment, credential, ambiguous, contradictory, conflict, and unknown
+failures stop with a persisted reason and an operator-visible gate instead.
+
 ## Providers and safety
 
 Configure providers in [config/orchestrator.yaml](config/orchestrator.yaml).

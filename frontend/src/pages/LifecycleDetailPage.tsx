@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Badge } from "../components/Badge";
 import { EvidencePanel } from "../components/EvidencePanel";
+import { RepairCyclePanel } from "../components/RepairCyclePanel";
 import { api } from "../lib/api";
 import { usePolling } from "../lib/hooks";
 import type { ProductGateRow, ProductProjectDetail } from "../lib/types";
@@ -354,6 +355,7 @@ function DeliveryTab({ project, run }: { project: ProductProjectDetail; run: (fn
           </p>
         </div>
         <EvidencePanel projectId={project.id} />
+        <RepairCyclePanel projectId={project.id} refresh={run} />
         {pendingWaivers.length > 0 && (
           <div className="card" style={{ marginTop: 8 }} data-testid="waiver-panel">
             <h4>Failed criteria — authorize a waiver to proceed without them</h4>

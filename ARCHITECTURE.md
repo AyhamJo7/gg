@@ -99,6 +99,22 @@ toolchain results, and a fresh clone's toolchain. Fresh-checkout criterion repla
 durable acceptance attempts, and post-check SHA binding need strengthening; see
 the audit for evidence and proposals.
 
+Bounded autonomous repair (Increment 4, `repair.py`, migration 0015): a blocked
+acceptance is triaged into at most one persistent `repair_cycles` row per
+trigger, classified deterministically (implementation defect vs environment,
+external prerequisite, ambiguous/contradictory contract, provider failure,
+dependency conflict, unknown — no classification LLM). Only implementation
+defects execute repair providers, within hard budgets (default 2 attempts per
+cycle, 4 per phase, 8 per project), as immutable `repair_attempts` rows with
+exact base/result SHAs. Every code-changing result requires an independent
+reviewer outside the writer set, an explicit recheck attempt against the exact
+repaired SHA, and affected regressions; repeated signatures, oscillation, and
+no-change attempts stop boundedly. Non-repairable classes terminalize with a
+stop reason and optional Human Gate; contract files are tamper-guarded and
+waivers stay operator-only. A repaired candidate returns to canonical
+acceptance — repair success never delivers directly. All stages are
+restart-resumable without duplicating completed provider work.
+
 ## Prompts, metrics, and security
 
 All provider prompts go through the deterministic role-specific context

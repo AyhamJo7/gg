@@ -11,7 +11,8 @@ Current source overrides historical reports.
 - Keep orchestration policy out of adapters. Distinguish repository projects,
   product lifecycles, missions, tasks, and runs.
 - Check all execution paths when changing shared behavior: product planning,
-  sequential phases, parallel planning, tasks, and integration review/repair.
+  sequential phases, parallel planning, tasks, integration review/repair,
+  and autonomous repair cycles.
 - Preserve process ownership, cancellation, capacity, workspace exclusion,
   checkpoint safety, and restart behavior. CLI success is not acceptance.
 - Preserve reviewer provenance. Repair claims and omitted findings are not
@@ -46,7 +47,12 @@ blocks provider execution with no silent legacy fallback; `legacy`/`shadow`
 via `context.mode` for comparison) — change role policies there, not in ad hoc
 string builders. Do not claim verification for a SHA different from the
 candidate being delivered. After any code-writing repair, independent review
-of the new candidate is required. Never attribute pre-existing workspace
+of the new candidate is required. Autonomous product repair lives in
+`repair.py` (migration 0015): deterministic classification before coding,
+one active cycle per project, hard attempt budgets, exact base/result SHAs,
+independent reviewer outside the writer set, exact-SHA recheck, bounded stop
+on repetition/oscillation/no-change, restart resume without duplicating
+completed stages. Never attribute pre-existing workspace
 changes to the current provider run. Writer membership follows actual
 committed contribution, never invocation role. Evidence is scoped by
 repository identity + SHA; keyless history cannot certify new artifacts.

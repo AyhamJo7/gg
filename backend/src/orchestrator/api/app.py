@@ -521,6 +521,36 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         except (ProductValidationError, ValueError) as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    @app.get("/api/product-projects/{project_id}/repair-cycles")
+    def list_repair_cycles(project_id: str) -> dict[str, Any]:
+        """Operator-visible autonomous repair cycles with attempt history."""
+        if not orchestrator.db.get("product_projects", project_id):
+            raise HTTPException(404, "product project not found")
+        return {
+            "cycles": [_jsonable(c) for c in orchestrator.coordinator.list_repair_cycles(project_id)],
+            "stats": orchestrator.coordinator.repair_stats(project_id),
+        }
+
+    @app.get("/api/product-projects/{project_id}/repair-cycles/{cycle_id}")
+    def get_repair_cycle(project_id: str, cycle_id: str) -> dict[str, Any]:
+        try:
+            cycle = orchestrator.coordinator.get_repair_cycle(cycle_id)
+        except KeyError:
+            raise HTTPException(404, "repair cycle not found") from None
+        if cycle.get("project_id") != project_id:
+            raise HTTPException(404, "repair cycle not found")
+        return _jsonable(cycle)
+
+    @app.post("/api/product-projects/{project_id}/repair-cycles/{cycle_id}/cancel")
+    async def cancel_repair_cycle(project_id: str, cycle_id: str) -> dict[str, Any]:
+        try:
+            cycle = orchestrator.coordinator.get_repair_cycle(cycle_id)
+        except KeyError:
+            raise HTTPException(404, "repair cycle not found") from None
+        if cycle.get("project_id") != project_id:
+            raise HTTPException(404, "repair cycle not found")
+        return _jsonable(orchestrator.coordinator.cancel_repair_cycle(cycle_id))
+
     # ---------------- DAG / parallel task endpoints ----------------
     @app.get("/api/missions/{mission_id}/dag")
     def get_mission_dag(mission_id: str) -> dict[str, Any]:

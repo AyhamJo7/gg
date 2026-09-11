@@ -513,3 +513,37 @@ export interface ArtifactEvidence {
   delivery_sha?: string | null;
   phase_attempts?: Array<Record<string, unknown>>;
 }
+
+export interface RepairAttempt {
+  id: string;
+  attempt_number: number;
+  provider: string;
+  base_sha: string;
+  result_sha: string | null;
+  outcome: string;
+  review_reviewer: string | null;
+  review_outcome: string | null;
+  recheck_attempt_id: string | null;
+  recheck_outcome: string | null;
+  failure_signature: string | null;
+}
+
+export interface RepairCycle {
+  id: string;
+  project_id: string;
+  trigger_type: string;
+  trigger_evidence_id: string;
+  trigger_sha: string;
+  target_requirement_id: string | null;
+  target_criterion_id: string | null;
+  target_finding_id: string | null;
+  classification: string;
+  status: string;
+  max_attempts: number;
+  attempts_used: number;
+  stop_reason: string | null;
+  gate_hint: string | null;
+  created_at: string;
+  completed_at: string | null;
+  attempts?: RepairAttempt[];
+}
