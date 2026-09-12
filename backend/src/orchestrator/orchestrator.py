@@ -401,51 +401,40 @@ class Orchestrator:
         return self.db.get("missions", new_mission["id"]) or new_mission
 
     def _inherit_retry_findings(self, parent_mission_id: str, retry_mission_id: str) -> int:
-        """Seed retry with unresolved ancestor findings (DOG-02).
+        """Seed retry with unresolved ancestor findings (DOG-02, AGY-F1).
 
-        Copies open/repair_attempted rows (deduped by fingerprint across the
-        full retry chain) as new open/repair_attempted rows in the retry with
-        explicit inherited_from_* lineage. Historical rows are never mutated;
-        resolved ancestors are never reopened; chains do not multiply because
-        fingerprints already present locally are skipped.
+        Uses the shared nearest-ancestor helper, so copy-time semantics equal
+        query-time visibility: for each fingerprint the nearest ancestor
+        holding any row is authoritative; only nearest states of
+        open/repair_attempted are copied. A nearer RESOLVED/wontfix ancestor
+        suppresses older OPEN rows (no resurrection). Historical rows are
+        never mutated; chains do not multiply because fingerprints already
+        present locally are skipped. parent_mission_id anchors the chain for
+        callers that have not yet persisted retry_of_mission_id.
         """
-        from .review import inherited_open_findings
+        from .review import inherited_open_findings, nearest_ancestor_finding_states
 
-        # Full ancestor union (not just the immediate parent) so multi-hop
-        # chains survive without multiplying: nearest occurrence wins.
-        ancestors: list[str] = []
-        seen_m: set[str] = {retry_mission_id}
-        cur: str | None = parent_mission_id
-        for _ in range(20):
-            if not cur or cur in seen_m:
-                break
-            ancestors.append(cur)
-            seen_m.add(cur)
+        try:
+            retry_row = self.db.get("missions", retry_mission_id)
+        except Exception:
+            retry_row = None
+        if not retry_row or not retry_row.get("retry_of_mission_id"):
             try:
-                row = self.db.get("missions", cur)
+                self.db.update("missions", retry_mission_id, {"retry_of_mission_id": parent_mission_id})
             except Exception:
-                logger.debug("retry chain lookup failed for %s", cur, exc_info=True)
-                break
-            cur = str(row.get("retry_of_mission_id") or "") if row else ""
-            if not cur:
-                break
-        # Collect nearest-first, deduped by fingerprint.
+                logger.debug("retry lineage link failed for %s", retry_mission_id, exc_info=True)
+        # Nearest-first authoritative states (same helper as query-time).
+        try:
+            states = nearest_ancestor_finding_states(self.db, retry_mission_id)
+        except Exception:
+            logger.debug("retry ancestor states failed for %s", retry_mission_id, exc_info=True)
+            return 0
         wanted: dict[str, dict[str, Any]] = {}
-        for anc in ancestors:
-            try:
-                rows = self.db.query(
-                    "SELECT * FROM review_findings WHERE mission_id=? AND status IN ('open','repair_attempted')"
-                    " ORDER BY created_at ASC",
-                    (anc,),
-                )
-            except Exception:
-                logger.debug("ancestor findings lookup failed for %s", anc, exc_info=True)
+        for fp, info in states.items():
+            row = info.get("row") or {}
+            if str(row.get("status") or "") not in ("open", "repair_attempted"):
                 continue
-            for r in rows:
-                fp = str(r.get("fingerprint") or "")
-                if not fp or fp in wanted:
-                    continue
-                wanted[fp] = dict(r)
+            wanted[fp] = dict(row)
         if not wanted:
             return 0
         import uuid as _uuid

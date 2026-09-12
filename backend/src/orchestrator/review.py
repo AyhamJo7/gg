@@ -127,43 +127,82 @@ def _local_fingerprints(db: Any, mission_id: str) -> set[str]:
     return {str(r.get("fingerprint") or "") for r in rows if r.get("fingerprint")}
 
 
-def inherited_open_findings(db: Any, mission_id: str | None) -> list[dict[str, Any]]:
-    """Unresolved ancestor findings not yet shadowed locally (DOG-02).
+def _current_state_row(group: list[dict[str, Any]]) -> dict[str, Any]:
+    """Deterministic current state among same-fingerprint rows in one mission.
 
-    Returns ancestor rows with status open/repair_attempted whose fingerprint
-    has no local row in any status (open/repair_attempted/resolved). A local
-    resolved row therefore hides an inherited open (explicit verified fix
-    closes it in the retry view); a local open hides the inherited duplicate
-    (rediscovery coheres to one lineage). Resolved ancestors are never
-    inherited. Each row carries inherited_from_mission_id for display.
+    Open wins, then repair_attempted, else the latest terminal row. Rows are
+    explicitly ordered (created_at, rowid), never arbitrary SQLite order, so
+    legacy duplicate rows resolve the same way on every read. Unresolved
+    states stay visible (fail-closed direction); terminal states
+    (resolved/wontfix/...) shadow older ancestors.
+    """
+    ordered = sorted(group, key=lambda r: (str(r.get("created_at") or ""), str(r.get("id") or "")))
+    for want in ("open", "repair_attempted"):
+        cands = [r for r in ordered if str(r.get("status") or "") == want]
+        if cands:
+            return dict(cands[-1])
+    return dict(ordered[-1])
+
+
+def nearest_ancestor_finding_states(db: Any, mission_id: str | None, limit: int = 20) -> dict[str, dict[str, Any]]:
+    """Nearest-first fingerprint state across the retry chain (AGY-F1).
+
+    Single source of truth shared by query-time visibility
+    (inherited_open_findings) and copy-time seeding
+    (orchestrator._inherit_retry_findings) so both observe identical
+    semantics. For each fingerprint, the nearest ancestor holding any local
+    row is authoritative: its current state shadows all older ancestors.
+    Returns {fingerprint: {"ancestor": mission_id, "row": row_dict}} in
+    nearest-first encounter order. Historical rows are never mutated.
     """
     if not mission_id:
-        return []
-    ancestors = retry_ancestors(db, mission_id)
-    if not ancestors:
-        return []
-    local_fps = _local_fingerprints(db, mission_id)
-    out: list[dict[str, Any]] = []
-    seen_fp: set[str] = set()
+        return {}
+    ancestors = retry_ancestors(db, mission_id, limit=limit)
+    states: dict[str, dict[str, Any]] = {}
     for anc in ancestors:
         try:
-            rows = db.query(
-                "SELECT * FROM review_findings WHERE mission_id=? AND status IN ('open','repair_attempted')"
-                " ORDER BY created_at ASC",
-                (anc,),
-            )
+            rows = db.query("SELECT * FROM review_findings WHERE mission_id=?", (anc,))
         except Exception:
             logger.debug("ancestor findings lookup failed for %s", anc, exc_info=True)
             continue
+        by_fp: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             fp = str(r.get("fingerprint") or "")
-            if not fp or fp in local_fps or fp in seen_fp:
+            if fp:
+                by_fp.setdefault(fp, []).append(dict(r))
+        for fp, group in by_fp.items():
+            if fp in states:
                 continue
-            seen_fp.add(fp)
-            d = dict(r)
-            d["inherited_from_mission_id"] = anc
-            d["inherited"] = True
-            out.append(d)
+            states[fp] = {"ancestor": anc, "row": _current_state_row(group)}
+    return states
+
+
+def inherited_open_findings(db: Any, mission_id: str | None) -> list[dict[str, Any]]:
+    """Unresolved ancestor findings not yet shadowed locally (DOG-02, AGY-F1).
+
+    Returns ancestor rows with status open/repair_attempted whose fingerprint
+    has no local row in any status (open/repair_attempted/resolved/wontfix)
+    AND whose nearest ancestor state is itself unresolved. A nearer
+    RESOLVED/wontfix ancestor therefore suppresses an older OPEN ancestor
+    (no resurrection); a local row of any status shadows all ancestors.
+    Each row carries inherited_from_mission_id for display.
+    """
+    if not mission_id:
+        return []
+    if not retry_ancestors(db, mission_id):
+        return []
+    local_fps = _local_fingerprints(db, mission_id)
+    out: list[dict[str, Any]] = []
+    for fp, info in nearest_ancestor_finding_states(db, mission_id).items():
+        if fp in local_fps:
+            continue
+        row = info["row"]
+        if str(row.get("status") or "") not in ("open", "repair_attempted"):
+            continue
+        d = dict(row)
+        d["inherited_from_mission_id"] = info["ancestor"]
+        d["inherited"] = True
+        out.append(d)
     return out
 
 
