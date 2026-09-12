@@ -250,6 +250,256 @@ def test_dog02_inherited_blocker_still_blocks(tmp_path: Path) -> None:
     assert any(r["id"] == "f1" for r in blockers)
 
 
+# -- AGY-F1 multi-generation nearest-ancestor shadowing ------------------------
+
+
+def _make_inherit_orch(db: Database):
+    from orchestrator.orchestrator import Orchestrator
+
+    return Orchestrator(db, __import__("conftest").make_config(), {})
+
+
+def _resolve_local(db: Database, mid: str, fp: str) -> None:
+    db.execute("UPDATE review_findings SET status='repair_attempted' WHERE mission_id=?", (mid,))
+    import json as _json
+
+    persist_findings(
+        db, mid, "REVIEW_FINDINGS_JSON: []\nVERIFIED_FIXED_JSON: " + _json.dumps([{"fingerprint": fp, "evidence": "e"}])
+    )
+
+
+def test_agyf1_resolved_nearer_ancestor_suppresses_older_open(tmp_path: Path) -> None:
+    """Case A: M1 OPEN, M2 RESOLVED, M3 inherits nothing."""
+    db = Database(tmp_path / "f1a.db")
+    _seed_mission(db, "m1")
+    fp = _add_finding(db, "m1", "f1", "MEDIUM", "open")
+    _seed_mission(db, "m2", retry_of="m1")
+    orch = _make_inherit_orch(db)
+    assert orch._inherit_retry_findings("m1", "m2") == 1
+    _resolve_local(db, "m2", fp)
+    _seed_mission(db, "m3", retry_of="m2")
+    assert inherited_open_findings(db, "m3") == []
+    assert orch._inherit_retry_findings("m2", "m3") == 0
+    assert db.query("SELECT * FROM review_findings WHERE mission_id=?", ("m3",)) == []
+
+
+def test_agyf1_absent_middle_generation_inherits_grandparent(tmp_path: Path) -> None:
+    """Case B: M1 OPEN, M2 no record, M3 inherits M1."""
+    db = Database(tmp_path / "f1b.db")
+    _seed_mission(db, "m1")
+    _add_finding(db, "m1", "f1", "MEDIUM", "open")
+    _seed_mission(db, "m2", retry_of="m1")
+    _seed_mission(db, "m3", retry_of="m2")
+    inh = inherited_open_findings(db, "m3")
+    assert len(inh) == 1 and inh[0]["id"] == "f1"
+    assert _make_inherit_orch(db)._inherit_retry_findings("m2", "m3") == 1
+
+
+def test_agyf1_repair_attempted_middle_stays_unresolved(tmp_path: Path) -> None:
+    """Case C: M1 OPEN, M2 REPAIR_ATTEMPTED, M3 inherits unresolved."""
+    db = Database(tmp_path / "f1c.db")
+    _seed_mission(db, "m1")
+    _add_finding(db, "m1", "f1", "MEDIUM", "open")
+    _seed_mission(db, "m2", retry_of="m1")
+    orch = _make_inherit_orch(db)
+    orch._inherit_retry_findings("m1", "m2")
+    db.execute("UPDATE review_findings SET status='repair_attempted' WHERE mission_id=?", ("m2",))
+    _seed_mission(db, "m3", retry_of="m2")
+    inh = inherited_open_findings(db, "m3")
+    assert len(inh) == 1 and inh[0]["status"] == "repair_attempted"
+    assert orch._inherit_retry_findings("m2", "m3") == 1
+    copied = db.query("SELECT * FROM review_findings WHERE mission_id=?", ("m3",))
+    assert len(copied) == 1 and copied[0]["status"] == "repair_attempted"
+
+
+def test_agyf1_rediscovery_after_resolve_wins_again(tmp_path: Path) -> None:
+    """Case D: M1 OPEN, M2 RESOLVED, M3 rediscovered OPEN, M4 inherits M3 OPEN."""
+    db = Database(tmp_path / "f1d.db")
+    _seed_mission(db, "m1")
+    fp = _add_finding(db, "m1", "f1", "MEDIUM", "open")
+    _seed_mission(db, "m2", retry_of="m1")
+    orch = _make_inherit_orch(db)
+    orch._inherit_retry_findings("m1", "m2")
+    _resolve_local(db, "m2", fp)
+    _seed_mission(db, "m3", retry_of="m2")
+    assert inherited_open_findings(db, "m3") == []
+    # Genuine rediscovery in M3 creates a fresh local OPEN row with the same
+    # fingerprint (same normalized defect content, new finding id).
+    src = db.get("review_findings", "f1")
+    db.insert(
+        "review_findings",
+        {
+            "id": "f3",
+            "mission_id": "m3",
+            "severity": src["severity"],
+            "category": src["category"],
+            "file": src["file"],
+            "description": src["description"],
+            "recommended_fix": src["recommended_fix"],
+            "status": "open",
+            "fingerprint": fp,
+            "created_at": "2026-09-12T00:00:00",
+        },
+    )
+    _seed_mission(db, "m4", retry_of="m3")
+    inh = inherited_open_findings(db, "m4")
+    assert len(inh) == 1 and inh[0]["status"] == "open"
+    assert orch._inherit_retry_findings("m3", "m4") == 1
+
+
+def test_agyf1_high_resolved_does_not_falsely_block(tmp_path: Path) -> None:
+    """Case E: M1 HIGH OPEN, M2 HIGH RESOLVED, M3 has no blocker."""
+    db = Database(tmp_path / "f1e.db")
+    _seed_mission(db, "m1")
+    fp = _add_finding(db, "m1", "f1", "HIGH", "open")
+    _seed_mission(db, "m2", retry_of="m1")
+    orch = _make_inherit_orch(db)
+    orch._inherit_retry_findings("m1", "m2")
+    _resolve_local(db, "m2", fp)
+    _seed_mission(db, "m3", retry_of="m2")
+    assert open_blockers(db, "m3") == []
+
+
+def test_agyf1_high_absent_middle_still_blocks(tmp_path: Path) -> None:
+    """Case F: M1 HIGH OPEN, M2 absent, M3 still blocked."""
+    db = Database(tmp_path / "f1f.db")
+    _seed_mission(db, "m1")
+    _add_finding(db, "m1", "f1", "HIGH", "open")
+    _seed_mission(db, "m2", retry_of="m1")
+    _seed_mission(db, "m3", retry_of="m2")
+    assert len(open_blockers(db, "m3")) == 1
+
+
+def test_agyf1_long_chain_does_not_multiply(tmp_path: Path) -> None:
+    """Case G: M1 OPEN through M4 retries stays exactly one row per mission."""
+    db = Database(tmp_path / "f1g.db")
+    _seed_mission(db, "m1")
+    _add_finding(db, "m1", "f1", "MEDIUM", "open")
+    orch = _make_inherit_orch(db)
+    prev = "m1"
+    for nxt in ("m2", "m3", "m4"):
+        _seed_mission(db, nxt, retry_of=prev)
+        assert orch._inherit_retry_findings(prev, nxt) == 1
+        assert len(db.query("SELECT * FROM review_findings WHERE mission_id=?", (nxt,))) == 1
+        prev = nxt
+
+
+def test_agyf1_retry_chain_cycle_terminates(tmp_path: Path) -> None:
+    """Corrupt retry_of cycle cannot hang or leak across chains."""
+    from orchestrator.review import inherited_open_findings, retry_ancestors
+
+    db = Database(tmp_path / "f1x.db")
+    _seed_mission(db, "m1", retry_of="m2")
+    _seed_mission(db, "m2", retry_of="m1")
+    _seed_mission(db, "other")
+    _add_finding(db, "other", "fo", "MEDIUM", "open")
+    assert retry_ancestors(db, "m1") in (["m2"], ["m2", "m1"])
+    assert inherited_open_findings(db, "m1") == []
+
+
+def test_agyf1_query_time_equals_copy_time(tmp_path: Path) -> None:
+    """Copy-time seeding agrees exactly with query-time visibility."""
+    db = Database(tmp_path / "f1q.db")
+    _seed_mission(db, "m1")
+    fp_open = _add_finding(db, "m1", "f-open", "MEDIUM", "open")
+    fp_gone = _add_finding(db, "m1", "f-gone", "MEDIUM", "open")
+    _seed_mission(db, "m2", retry_of="m1")
+    orch = _make_inherit_orch(db)
+    orch._inherit_retry_findings("m1", "m2")
+    _resolve_local(db, "m2", fp_gone)
+    _seed_mission(db, "m3", retry_of="m2")
+    visible = {(r["fingerprint"], r["status"]) for r in inherited_open_findings(db, "m3")}
+    # f-open's nearest state is m2's copy, left repair_attempted by the
+    # mark-before-verify step; f-gone's nearest state is resolved → suppressed.
+    assert visible == {(fp_open, "repair_attempted")}
+    assert orch._inherit_retry_findings("m2", "m3") == 1
+    copied = {
+        (r["fingerprint"], r["status"]) for r in db.query("SELECT * FROM review_findings WHERE mission_id=?", ("m3",))
+    }
+    assert copied == visible
+
+
+# -- AGY-F2 fallback review range ----------------------------------------------
+
+
+def _add_raw_run(
+    db: Database, mid: str, role: str, before: str | None, after: str | None, started: str, rid: str
+) -> None:
+    db.insert(
+        "provider_runs",
+        {
+            "id": rid,
+            "mission_id": mid,
+            "task_id": None,
+            "provider": "fake",
+            "role": role,
+            "stage": role,
+            "run_status": "DONE",
+            "failure_class": "NONE",
+            "provider_state": "COMPLETED",
+            "git_commit_before": before,
+            "git_commit_after": after,
+            "started_at": started,
+            "finished_at": started,
+            "summary": "ok",
+        },
+    )
+
+
+def test_agyf2_fallback_single_writer(tmp_path: Path) -> None:
+    db = Database(tmp_path / "f2a.db")
+    _seed_mission(db, "m1")
+    _add_raw_run(db, "m1", "implementation", "A", "B", "2026-09-12T00:00:01", "r1")
+    assert mission_review_range(db, "m1") == ("A", "B")
+
+
+def test_agyf2_fallback_multiple_writers_span_full_history(tmp_path: Path) -> None:
+    db = Database(tmp_path / "f2b.db")
+    _seed_mission(db, "m1")
+    _add_raw_run(db, "m1", "implementation", "A", "B", "2026-09-12T00:00:01", "r1")
+    _add_raw_run(db, "m1", "testing", "B", "C", "2026-09-12T00:00:02", "r2")
+    assert mission_review_range(db, "m1") == ("A", "C")
+
+
+def test_agyf2_fallback_no_change_later_writer(tmp_path: Path) -> None:
+    db = Database(tmp_path / "f2c.db")
+    _seed_mission(db, "m1")
+    _add_raw_run(db, "m1", "implementation", "A", "B", "2026-09-12T00:00:01", "r1")
+    _add_raw_run(db, "m1", "testing", "B", "B", "2026-09-12T00:00:02", "r2")
+    assert mission_review_range(db, "m1") == ("A", "B")
+
+
+def test_agyf2_fallback_review_run_does_not_shift_head(tmp_path: Path) -> None:
+    db = Database(tmp_path / "f2d.db")
+    _seed_mission(db, "m1")
+    _add_raw_run(db, "m1", "implementation", "A", "B", "2026-09-12T00:00:01", "r1")
+    _add_raw_run(db, "m1", "testing", "B", "C", "2026-09-12T00:00:02", "r2")
+    _add_raw_run(db, "m1", "review", "C", "C", "2026-09-12T00:00:03", "r3")
+    assert mission_review_range(db, "m1") == ("A", "C")
+
+
+def test_agyf2_fallback_missing_after_uses_before(tmp_path: Path) -> None:
+    db = Database(tmp_path / "f2e.db")
+    _seed_mission(db, "m1")
+    _add_raw_run(db, "m1", "implementation", "A", None, "2026-09-12T00:00:01", "r1")
+    assert mission_review_range(db, "m1") == ("A", "A")
+
+
+def test_agyf2_fallback_started_at_tie_is_deterministic(tmp_path: Path) -> None:
+    db = Database(tmp_path / "f2f.db")
+    _seed_mission(db, "m1")
+    _add_raw_run(db, "m1", "implementation", "A", "B", "2026-09-12T00:00:01", "r1")
+    _add_raw_run(db, "m1", "testing", "B", "C", "2026-09-12T00:00:01", "r2")
+    assert mission_review_range(db, "m1") == ("A", "C")
+    assert mission_review_range(db, "m1") == ("A", "C")
+
+
+def test_agyf2_fallback_empty_history_is_unknown(tmp_path: Path) -> None:
+    db = Database(tmp_path / "f2g.db")
+    _seed_mission(db, "m1")
+    assert mission_review_range(db, "m1") == (None, None)
+
+
 # -- DOG-03 -----------------------------------------------------------------
 
 
@@ -478,7 +728,9 @@ def test_rechnungsradar_replay_proves_all_five(tmp_path: Path) -> None:
         assert impl_out.prompt.count("Retry: e-invoicing market launch ready") == 1
         assert '{"schema_version": "1.0"' not in impl_out.prompt or "[truncated" in impl_out.prompt
         assert impl_out.used_estimated_tokens <= impl_out.budget_estimated_tokens
-        # Reviewer context uses exact range including B, Git-derived map.
+        # Reviewer prompt receives the exact range including B, Git-derived map.
+        # latest_candidate_shas is what the engine feeds into the review spec,
+        # so these are the SHAs the provider actually saw in its prompt.
         prompt_base, prompt_head = latest_candidate_shas(db, "m1")
         assert prompt_base == base and prompt_head == sha_b
         files = await git_ops.diff_names(repo, prompt_base or "", prompt_head or "")
@@ -500,12 +752,50 @@ def test_rechnungsradar_replay_proves_all_five(tmp_path: Path) -> None:
         assert base[:8] in rev_out.prompt and sha_b[:8] in rev_out.prompt
         assert "mod0.py" in rev_out.prompt
         assert rev_out.prompt.count("Retry: e-invoicing market launch ready") == 1
-        persisted = mission_review_range(db, "m1")
-        assert (prompt_base, prompt_head) == persisted
-        # Retry lineage: omission does not erase; explicit fix closes.
-        assert any(r["fingerprint"] == fp for r in inherited_open_findings(db, "m1")) or any(
-            r["fingerprint"] == fp for r in db.query("SELECT * FROM review_findings WHERE mission_id=?", ("m1",))
+        # Persisted review evidence must certify exactly that range: execute
+        # record_review_attempt and read the reviews table directly (no
+        # helper-to-helper comparison).
+        _add_run(db, "m1", "review", sha_b, sha_b, 3)
+        from orchestrator.provenance import record_review_attempt
+
+        rec = await record_review_attempt(db, object(), mission_id="m1", repo=repo)
+        assert rec is not None
+        stored = db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", ("m1",))[0]
+        assert stored["reviewed_base_sha"] == base, "ledger must certify from mission base"
+        assert stored["reviewed_head_sha"] == sha_b, "ledger must certify the final candidate"
+        assert stored["reviewed_base_sha"] == prompt_base
+        assert stored["reviewed_head_sha"] == prompt_head
+        # Retry lineage lifecycle inside the replay: omission preserves,
+        # explicit verification resolves, parent history is immutable.
+        local_before = db.query("SELECT * FROM review_findings WHERE mission_id=?", ("m1",))
+        assert any(r["fingerprint"] == fp and r["status"] == "open" for r in local_before)
+        persist_findings(db, "m1", "REVIEW_FINDINGS_JSON: []")
+        still_open = db.query("SELECT * FROM review_findings WHERE mission_id=? AND fingerprint=?", ("m1", fp))[0]
+        assert still_open["status"] == "open", "reviewer omission must not resolve inherited finding"
+        db.execute("UPDATE review_findings SET status='repair_attempted' WHERE mission_id=?", ("m1",))
+        import json as _rj
+
+        persist_findings(
+            db,
+            "m1",
+            "REVIEW_FINDINGS_JSON: []\nVERIFIED_FIXED_JSON: "
+            + _rj.dumps([{"fingerprint": fp, "evidence": "checked at HEAD"}]),
         )
+        resolved = db.query("SELECT * FROM review_findings WHERE mission_id=? AND fingerprint=?", ("m1", fp))[0]
+        assert resolved["status"] == "resolved"
+        parent_row = db.get("review_findings", "f-parent")
+        assert parent_row is not None and parent_row["status"] == "open", "parent history must stay immutable"
+        # Next retry must not resurrect the resolved finding (AGY-F1).
+        _seed_mission(db, "m2", title="Retry: e-invoicing market launch ready", task="t", retry_of="m1")
+        assert inherited_open_findings(db, "m2") == []
+        assert orch._inherit_retry_findings("m1", "m2") == 0
+        assert db.query("SELECT * FROM review_findings WHERE mission_id=?", ("m2",)) == []
+        # HIGH variant: unresolved HIGH still blocks the retry.
+        _seed_mission(db, "h0", title="h", task="t")
+        _add_finding(db, "h0", "fh", "HIGH", "open")
+        _seed_mission(db, "h1", title="h", task="t", retry_of="h0")
+        assert orch._inherit_retry_findings("h0", "h1") == 1
+        assert len(open_blockers(db, "h1")) == 1
         assert len(rev_out.blocks) > 0
 
     asyncio.run(go())
