@@ -658,20 +658,36 @@ def mission_review_range(db: Any, mission_id: str | None) -> tuple[str | None, s
     head = tips[0].get("result_sha") if tips else None
     if head:
         return (base or None), head
-    # Fallback for missions without write rows yet: latest writer run tip.
+    # Fallback for missions without write rows yet (historical compatibility
+    # only; write provenance is authoritative when available). AGY-F2: span
+    # the full writer history — earliest writer base .. latest writer tip —
+    # never just the latest run, which would drop earlier commits. Review
+    # runs are excluded so they cannot shift the candidate head. Deterministic
+    # secondary key (rowid) breaks started_at ties the same way every read.
     try:
-        cand = db.query(
-            "SELECT git_commit_before, git_commit_after FROM provider_runs WHERE mission_id=?"
+        first = db.query(
+            "SELECT git_commit_before FROM provider_runs WHERE mission_id=?"
             " AND failure_class='NONE' AND role IN ('implementation','task','testing','repair')"
-            " ORDER BY started_at DESC LIMIT 1",
+            " ORDER BY started_at ASC, rowid ASC LIMIT 1",
             (mission_id,),
         )
     except Exception:
         return base or None, None
-    if not cand:
+    try:
+        last = db.query(
+            "SELECT git_commit_before, git_commit_after FROM provider_runs WHERE mission_id=?"
+            " AND failure_class='NONE' AND role IN ('implementation','task','testing','repair')"
+            " ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (mission_id,),
+        )
+    except Exception:
         return base or None, None
-    _fb_head = cand[0].get("git_commit_after") or cand[0].get("git_commit_before")
-    _fb_base = base or cand[0].get("git_commit_before")
+    if not first and not last:
+        return base or None, None
+    _fb_base = base or (first[0].get("git_commit_before") if first else None)
+    _fb_head = None
+    if last:
+        _fb_head = last[0].get("git_commit_after") or last[0].get("git_commit_before")
     return (_fb_base or None), (_fb_head or None)
 
 
