@@ -183,32 +183,6 @@ async def diff_stat_range(root: Path, base: str, head: str, max_chars: int = 400
     return text.strip()
 
 
-async def diff_numstat_range(root: Path, base: str, head: str, limit: int = 200) -> list[dict[str, str]]:
-    """Per-file insertions/deletions for the reviewed range (bounded, empty on error)."""
-    if not base or not head or base == head:
-        return []
-    res = await _spawn_git(root, "diff", "--numstat", "-z", f"{base}", f"{head}")
-    if res.returncode != 0:
-        return []
-    raw = res.stdout.decode(errors="replace").split("\x00")
-    out: list[dict[str, str]] = []
-    i = 0
-    while i < len(raw):
-        part = (raw[i] or "").strip()
-        if not part:
-            i += 1
-            continue
-        bits = part.split()
-        if len(bits) >= 2 and i + 1 < len(raw):
-            out.append({"added": bits[0], "deleted": bits[1], "path": (raw[i + 1] or "").strip()})
-            i += 2
-        else:
-            i += 1
-        if len(out) >= limit:
-            break
-    return [r for r in out if r.get("path")]
-
-
 async def merge_tree_write(root: Path, ours: str, theirs: str) -> tuple[str | None, str]:
     """Pure in-memory two-way merge (no worktree, no index state).
 
