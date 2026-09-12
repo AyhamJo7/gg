@@ -164,6 +164,51 @@ async def diff_names(root: Path, base: str, head: str, limit: int = 100) -> list
     return [p for p in raw.split("\x00") if p.strip()][:limit]
 
 
+async def diff_stat_range(root: Path, base: str, head: str, max_chars: int = 4000) -> str:
+    """Bounded `git diff --stat` between two commits (deterministic, empty on error).
+
+    DOG-03 source of truth for reviewer context: file list comes from Git
+    for the exact reviewed range, never from findings or task declarations.
+    Handles renames/deletions/binary via --stat --summary; callers truncate
+    with an honest omission marker when bounded compaction is necessary.
+    """
+    if not base or not head or base == head:
+        return ""
+    res = await _spawn_git(root, "diff", "--stat=200,200", "--summary", f"{base}", f"{head}")
+    if res.returncode != 0:
+        return ""
+    text = res.text or ""
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + f"\n... [diffstat truncated at {max_chars} chars]"
+    return text.strip()
+
+
+async def diff_numstat_range(root: Path, base: str, head: str, limit: int = 200) -> list[dict[str, str]]:
+    """Per-file insertions/deletions for the reviewed range (bounded, empty on error)."""
+    if not base or not head or base == head:
+        return []
+    res = await _spawn_git(root, "diff", "--numstat", "-z", f"{base}", f"{head}")
+    if res.returncode != 0:
+        return []
+    raw = res.stdout.decode(errors="replace").split("\x00")
+    out: list[dict[str, str]] = []
+    i = 0
+    while i < len(raw):
+        part = (raw[i] or "").strip()
+        if not part:
+            i += 1
+            continue
+        bits = part.split()
+        if len(bits) >= 2 and i + 1 < len(raw):
+            out.append({"added": bits[0], "deleted": bits[1], "path": (raw[i + 1] or "").strip()})
+            i += 2
+        else:
+            i += 1
+        if len(out) >= limit:
+            break
+    return [r for r in out if r.get("path")]
+
+
 async def merge_tree_write(root: Path, ours: str, theirs: str) -> tuple[str | None, str]:
     """Pure in-memory two-way merge (no worktree, no index state).
 

@@ -12,6 +12,41 @@ from pathlib import Path
 from .models import Handoff, Mission, utcnow
 
 
+def truncate_coherent(text: str, max_chars: int = 2000) -> str:
+    """Bounded, structurally coherent truncation for stage summaries.
+
+    DOG-04: never emit an arbitrary character slice (e.g. [:200]) that cuts
+    structured content mid-JSON/code-fence. Prefer a newline/sentence
+    boundary; never leave an unclosed ``` fence; always mark truncation
+    explicitly with the omitted count and where the full text lives.
+    """
+    cleaned = (text or "").strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    cut = cleaned[:max_chars]
+    # Prefer a boundary in the trailing window so prose stays readable.
+    for sep in ("\n", ". ", "! ", "? ", "; "):
+        idx = cut.rfind(sep, max(0, max_chars - 500))
+        if idx > max_chars * 0.4:
+            cut = cut[: idx + len(sep)].rstrip()
+            break
+    else:
+        sp = cut.rfind(" ")
+        if sp > max_chars * 0.4:
+            cut = cut[:sp]
+    # Never hand downstream an unclosed fence as if it were complete.
+    if cut.count("```") % 2 == 1:
+        last = cut.rfind("```")
+        if last > 0:
+            cut = cut[:last].rstrip()
+        else:
+            cut = cut + "\n```"
+    omitted = len(cleaned) - len(cut)
+    if omitted <= 0:
+        return cut
+    return f"{cut}\n... [truncated {omitted} chars; full in task logs]"
+
+
 def render_handoff(
     mission: Mission,
     role: str,
@@ -46,9 +81,9 @@ def render_handoff(
 {next_action}
 
 ## Provider chain
-from: {from_provider or 'orchestrator'} → to: {to_provider or 'next selected provider'}
-providers used so far: {', '.join(mission.providers_used) or 'none'}
-providers failed: {', '.join(mission.providers_failed) or 'none'}
+from: {from_provider or "orchestrator"} → to: {to_provider or "next selected provider"}
+providers used so far: {", ".join(mission.providers_used) or "none"}
+providers failed: {", ".join(mission.providers_failed) or "none"}
 
 ## Workspace
 {workspace_summary}
@@ -63,7 +98,7 @@ providers failed: {', '.join(mission.providers_failed) or 'none'}
 {findings}
 
 ## Current Git commit
-{git_head or '(no commits yet)'}
+{git_head or "(no commits yet)"}
 
 ## Next exact action
 {next_action}

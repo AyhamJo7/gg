@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from typing import Any
 
 from .db import Database
 from .models import ReviewFinding, Severity, utcnow
+
+logger = logging.getLogger(__name__)
 
 MARKER = "REVIEW_FINDINGS_JSON:"
 
@@ -85,13 +88,92 @@ def finding_fingerprint(severity: str, category: str, file: str | None, descript
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:32]
 
 
+def retry_ancestors(db: Any, mission_id: str | None, limit: int = 20) -> list[str]:
+    """Retry lineage chain for a mission, nearest parent first (DOG-02).
+
+    Follows missions.retry_of_mission_id; cycle-safe and bounded. Empty
+    when the mission is not a retry. Historical rows are never mutated;
+    callers union ancestor open findings with local rows (deduped by
+    fingerprint) so a retry cannot forget unresolved history.
+    """
+    if not mission_id:
+        return []
+    chain: list[str] = []
+    seen = {mission_id}
+    current = mission_id
+    for _ in range(limit):
+        try:
+            row = db.get("missions", current)
+        except Exception:
+            logger.debug("retry chain lookup failed for %s", current, exc_info=True)
+            break
+        if not row:
+            break
+        parent = row.get("retry_of_mission_id")
+        if not parent or parent in seen:
+            break
+        chain.append(str(parent))
+        seen.add(str(parent))
+        current = str(parent)
+    return chain
+
+
+def _local_fingerprints(db: Any, mission_id: str) -> set[str]:
+    try:
+        rows = db.query("SELECT fingerprint FROM review_findings WHERE mission_id=?", (mission_id,))
+    except Exception:
+        logger.debug("local fingerprint lookup failed for %s", mission_id, exc_info=True)
+        return set()
+    return {str(r.get("fingerprint") or "") for r in rows if r.get("fingerprint")}
+
+
+def inherited_open_findings(db: Any, mission_id: str | None) -> list[dict[str, Any]]:
+    """Unresolved ancestor findings not yet shadowed locally (DOG-02).
+
+    Returns ancestor rows with status open/repair_attempted whose fingerprint
+    has no local row in any status (open/repair_attempted/resolved). A local
+    resolved row therefore hides an inherited open (explicit verified fix
+    closes it in the retry view); a local open hides the inherited duplicate
+    (rediscovery coheres to one lineage). Resolved ancestors are never
+    inherited. Each row carries inherited_from_mission_id for display.
+    """
+    if not mission_id:
+        return []
+    ancestors = retry_ancestors(db, mission_id)
+    if not ancestors:
+        return []
+    local_fps = _local_fingerprints(db, mission_id)
+    out: list[dict[str, Any]] = []
+    seen_fp: set[str] = set()
+    for anc in ancestors:
+        try:
+            rows = db.query(
+                "SELECT * FROM review_findings WHERE mission_id=? AND status IN ('open','repair_attempted')"
+                " ORDER BY created_at ASC",
+                (anc,),
+            )
+        except Exception:
+            logger.debug("ancestor findings lookup failed for %s", anc, exc_info=True)
+            continue
+        for r in rows:
+            fp = str(r.get("fingerprint") or "")
+            if not fp or fp in local_fps or fp in seen_fp:
+                continue
+            seen_fp.add(fp)
+            d = dict(r)
+            d["inherited_from_mission_id"] = anc
+            d["inherited"] = True
+            out.append(d)
+    return out
+
+
 def parse_verified_fixed(raw_output: str) -> list[dict[str, Any]]:
     """Parse the optional explicit resolution mapping from reviewer output."""
     for line in raw_output.splitlines():
         stripped = line.strip()
         if not stripped.startswith(VERIFIED_FIXED_MARKER):
             continue
-        payload = stripped[len(VERIFIED_FIXED_MARKER):].strip()
+        payload = stripped[len(VERIFIED_FIXED_MARKER) :].strip()
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
@@ -106,7 +188,7 @@ def parse_review_output(raw_output: str) -> tuple[bool, list[dict[str, Any]]]:
         stripped = line.strip()
         if not stripped.startswith(MARKER):
             continue
-        payload = stripped[len(MARKER):].strip()
+        payload = stripped[len(MARKER) :].strip()
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
@@ -143,7 +225,7 @@ def parse_findings(raw_output: str) -> list[dict[str, Any]]:
         stripped = line.strip()
         if not stripped.startswith(MARKER):
             continue
-        payload = stripped[len(MARKER):].strip()
+        payload = stripped[len(MARKER) :].strip()
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
@@ -192,6 +274,17 @@ def persist_findings(db: Database, mission_id: str, raw_output: str) -> tuple[bo
             if row:
                 findings.append(_finding_from_row(row))
             continue
+        # DOG-02 dedup: same fingerprint already open locally (including an
+        # inherited copy) coheres to one lineage instead of two copies.
+        existing_open = db.query(
+            "SELECT * FROM review_findings WHERE mission_id=? AND fingerprint=? AND status='open' LIMIT 1",
+            (mission_id, fingerprint),
+        )
+        if existing_open:
+            row = db.get("review_findings", existing_open[0]["id"])
+            if row:
+                findings.append(_finding_from_row(row))
+            continue
         finding = ReviewFinding(
             mission_id=mission_id,
             severity=severity,
@@ -218,24 +311,117 @@ def persist_findings(db: Database, mission_id: str, raw_output: str) -> tuple[bo
         )
     # Explicit resolution mapping: only findings the reviewer verified fixed
     # (with evidence) transition out of repair_attempted. Omission resolves
-    # nothing.
+    # nothing (DOG-02: omission never resolves inherited findings either).
     for item in parse_verified_fixed(raw_output):
         evidence = str(item.get("evidence", ""))[:2000]
         fid = str(item.get("finding_id", "") or "")
         fpr = str(item.get("fingerprint", "") or "")
         if fid:
+            try:
+                pre = db.query(
+                    "SELECT id FROM review_findings WHERE id=? AND mission_id=? AND status='repair_attempted' LIMIT 1",
+                    (fid, mission_id),
+                )
+            except Exception:
+                logger.debug("resolve lookup failed", exc_info=True)
+                pre = []
             db.execute(
                 "UPDATE review_findings SET status='resolved', verified_by=?, resolved_at=? "
                 "WHERE id=? AND mission_id=? AND status='repair_attempted'",
                 (evidence, utcnow().isoformat(), fid, mission_id),
             )
+            if not pre:
+                # fid may name an inherited ancestor row: record an explicit
+                # resolved marker locally without mutating history.
+                try:
+                    anc_rows = []
+                    for anc in retry_ancestors(db, mission_id):
+                        r = db.get("review_findings", fid)
+                        if r and str(r.get("mission_id") or "") == anc:
+                            anc_rows = [r]
+                            break
+                    if anc_rows:
+                        _resolve_inherited_copy(db, mission_id, anc_rows[0], evidence)
+                except Exception:
+                    logger.debug("inherited resolve by id failed", exc_info=True)
         elif fpr:
+            try:
+                pre = db.query(
+                    "SELECT id FROM review_findings WHERE fingerprint=? AND mission_id=?"
+                    " AND status='repair_attempted' LIMIT 1",
+                    (fpr, mission_id),
+                )
+            except Exception:
+                logger.debug("resolve lookup failed", exc_info=True)
+                pre = []
             db.execute(
                 "UPDATE review_findings SET status='resolved', verified_by=?, resolved_at=? "
                 "WHERE fingerprint=? AND mission_id=? AND status='repair_attempted'",
                 (evidence, utcnow().isoformat(), fpr, mission_id),
             )
+            if not pre:
+                try:
+                    for inh in inherited_open_findings(db, mission_id):
+                        if str(inh.get("fingerprint") or "") == fpr:
+                            _resolve_inherited_copy(db, mission_id, inh, evidence)
+                            break
+                except Exception:
+                    logger.debug("inherited resolve by fingerprint failed", exc_info=True)
     return parsed_ok, findings
+
+
+def _resolve_inherited_copy(db: Any, mission_id: str, ancestor_row: dict[str, Any], evidence: str) -> None:
+    """Record explicit verified-fix for an inherited finding (DOG-02).
+
+    The ancestor row is never mutated. A resolved marker with the same
+    fingerprint is inserted locally so the retry view considers it fixed
+    while history stays auditable via inherited_from_* + fingerprint.
+    No-op when a local row with that fingerprint already exists.
+    """
+    try:
+        fp = str(ancestor_row.get("fingerprint") or "")
+        if not fp:
+            return
+        existing = db.query(
+            "SELECT id FROM review_findings WHERE mission_id=? AND fingerprint=? LIMIT 1",
+            (mission_id, fp),
+        )
+        if existing:
+            return
+        import uuid as _uuid
+
+        now = utcnow().isoformat()
+        payload: dict[str, Any] = {
+            "id": f"f-{_uuid.uuid4().hex[:12]}",
+            "mission_id": mission_id,
+            "severity": str(ancestor_row.get("severity") or "MEDIUM"),
+            "category": str(ancestor_row.get("category") or "general"),
+            "file": ancestor_row.get("file"),
+            "description": str(ancestor_row.get("description") or ""),
+            "recommended_fix": str(ancestor_row.get("recommended_fix") or ""),
+            "status": "resolved",
+            "fingerprint": fp,
+            "verified_by": evidence,
+            "resolved_at": now,
+            "inherited_from_mission_id": str(
+                ancestor_row.get("inherited_from_mission_id") or ancestor_row.get("mission_id") or ""
+            ),
+            "inherited_from_finding_id": str(ancestor_row.get("id") or ""),
+            "created_at": now,
+        }
+        try:
+            db.insert("review_findings", payload)
+        except Exception:
+            # Pre-migration DBs lack inherited_* columns: preserve the
+            # resolution without lineage rather than losing it.
+            try:
+                payload.pop("inherited_from_mission_id", None)
+                payload.pop("inherited_from_finding_id", None)
+                db.insert("review_findings", payload)
+            except Exception:
+                return
+    except Exception:
+        return
 
 
 def _finding_from_row(row: dict[str, Any]) -> ReviewFinding:
@@ -253,10 +439,31 @@ def _finding_from_row(row: dict[str, Any]) -> ReviewFinding:
 
 
 def open_blockers(db: Database, mission_id: str) -> list[dict[str, Any]]:
-    return db.query(
+    """Open BLOCKER/HIGH findings including inherited retry lineage (DOG-02).
+
+    Existing mission completion policy is preserved; retry lineage obeys it:
+    an inherited BLOCKER/HIGH still blocks the retry until explicitly
+    verified fixed. MEDIUM and below inherit visibility without blocking,
+    exactly as local findings behave.
+    """
+    local = db.query(
         "SELECT * FROM review_findings WHERE mission_id=? AND status='open' AND severity IN ('BLOCKER','HIGH')",
         (mission_id,),
     )
+    try:
+        inherited = [r for r in inherited_open_findings(db, mission_id) if str(r.get("status") or "") == "open"]
+    except Exception:
+        inherited = []
+    inherited_blockers = [r for r in inherited if str(r.get("severity") or "").upper() in ("BLOCKER", "HIGH")]
+    # Dedup by fingerprint (local shadows inherited); history stays in rows.
+    seen = {str(r.get("fingerprint") or r.get("id")) for r in local if r.get("fingerprint") or r.get("id")}
+    out = list(local)
+    for r in inherited_blockers:
+        key = str(r.get("fingerprint") or r.get("id"))
+        if key and key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
 
 
 def mark_findings_repair_attempted(db: Database, mission_id: str) -> None:
@@ -272,11 +479,26 @@ def unverified_findings(db: Database, mission_id: str) -> list[dict[str, Any]]:
 
     These no longer block the mission loop (bounded cycles preserved) but
     MUST gate product-level acceptance for requirement/correctness content.
+    Includes inherited repair_attempted lineage so a retry cannot wash them.
     """
-    return db.query(
+    local = db.query(
         "SELECT * FROM review_findings WHERE mission_id=? AND status='repair_attempted'",
         (mission_id,),
     )
+    try:
+        inherited = [
+            r for r in inherited_open_findings(db, mission_id) if str(r.get("status") or "") == "repair_attempted"
+        ]
+    except Exception:
+        inherited = []
+    seen = {str(r.get("fingerprint") or r.get("id")) for r in local if r.get("fingerprint") or r.get("id")}
+    out = list(local)
+    for r in inherited:
+        key = str(r.get("fingerprint") or r.get("id"))
+        if key and key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
 
 
 def resolve_repaired_findings(db: Database, mission_id: str) -> None:
@@ -293,4 +515,3 @@ def resolve_repaired_findings(db: Database, mission_id: str) -> None:
 def resolve_open_findings(db: Database, mission_id: str) -> None:
     """Backward-compatible helper: marks open findings repair_attempted."""
     mark_findings_repair_attempted(db, mission_id)
-
