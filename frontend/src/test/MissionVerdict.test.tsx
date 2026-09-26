@@ -58,7 +58,7 @@ describe("mission verdict", () => {
   });
   it("never lets skipped tests read as a clean pass", () => {
     const v = missionVerdict({ status: "COMPLETED", trust: trust({ verification: { status: "passed", sha: "a", skipped_tests: 30, finished_at: null } }) });
-    expect(v).toMatchObject({ label: "Completed with caveats", needsAttention: true });
+    expect(v).toMatchObject({ label: "Completed with caveats", needsAttention: false });
     expect(v.caveats).toContain("30 tests skipped in verification");
     // Unreported skip counts are unknown, not a caveat and not zero.
     expect(missionVerdict({ status: "COMPLETED", trust: trust({ verification: { status: "passed", sha: "a", skipped_tests: null, finished_at: null } }) }).tone).toBe("clean");

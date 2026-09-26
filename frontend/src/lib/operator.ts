@@ -98,9 +98,10 @@ export function trustCaveats(trust: MissionTrust, status: string): { caveats: st
   }
   const skipped = trust.verification?.skipped_tests ?? null;
   if (skipped !== null && skipped > 0) {
-    // Exit code passed, but skipped tests are unverified behavior, not green.
+    // Skipped tests are unverified behavior, whatever the exit code said. Shown
+    // as a caveat but not attention on its own: repos with intentional,
+    // permanent skips would otherwise pin every mission to the attention list.
     caveats.push(`${skipped} test${skipped === 1 ? "" : "s"} skipped in verification`);
-    serious = true;
   }
   if (!trust.inherited_available) {
     caveats.push("retry history findings unavailable");

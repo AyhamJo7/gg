@@ -12,17 +12,28 @@ SHA = "a" * 40
 
 
 def test_counts_real_runner_summaries() -> None:
+    assert count_skipped("324 passed, 30 skipped in 5.31s") == 30
     assert count_skipped("========= 324 passed, 30 skipped in 5.31s =========") == 30
-    assert count_skipped(" Tests  100 passed | 4 skipped (104)") == 4
-    assert count_skipped("Tests:       2 skipped, 10 passed, 12 total") == 2
+    assert count_skipped("===== 1 failed, 3 passed, 2 skipped, 1 warning in 0.40s =====") == 2
     assert count_skipped("test result: ok. 12 passed; 0 failed; 3 ignored; 0 measured") == 3
+
+
+def test_vitest_and_jest_count_tests_not_files_or_suites() -> None:
+    """Architecture round 7 M1: real output, file/suite lines excluded."""
+    vitest = " Test Files  25 passed | 1 skipped (26)\n      Tests  137 passed | 2 skipped (139)"
+    assert count_skipped(vitest) == 2
+    jest = "Test Suites: 1 skipped, 3 passed, 4 of 4 total\nTests:       5 skipped, 10 passed, 15 total"
+    assert count_skipped(jest) == 5
+    colored = "\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m9 passed\x1b[39m\x1b[22m | \x1b[33m1 skipped\x1b[39m"
+    assert count_skipped(colored) == 1
 
 
 def test_unreported_is_none_not_zero() -> None:
     assert count_skipped("All checks passed!") is None
     assert count_skipped("") is None
-    # Prose outside a runner summary line is not counted.
-    assert count_skipped("note: 5 skipped steps in the README") is None
+    assert count_skipped("INFO sync: 12 skipped, 40 passed validation") is None
+    # Mocha is not claimed: its pending count is not read.
+    assert count_skipped("  10 passing (20ms)\n  2 pending") is None
 
 
 def test_report_summary_and_persistence(tmp_path: Path) -> None:
@@ -99,3 +110,12 @@ def test_row_survives_an_unstorable_skip_field(tmp_path: Path) -> None:
     assert row is not None
     assert row["status"] == "failed"
     assert row["skipped_tests"] is None
+
+
+def test_summary_parsing_is_fast_on_long_lines() -> None:
+    import time
+
+    hostile = "1 passed, " * 150 + "x"
+    started = time.perf_counter()
+    count_skipped("\n".join([hostile] * 10))
+    assert time.perf_counter() - started < 0.5

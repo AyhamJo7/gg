@@ -2018,10 +2018,14 @@ class ParallelMissionEngine:
             # A retried task carries its previous failed run's partial report
             # (never for review tasks: reviewer independence).
             _task_failover = ""
-            if int(task.get("attempts") or 0) > 0 and task.get("provider_run_id") and str(
-                task.get("role") or ""
-            ) != Role.REVIEW.value:
-                _task_failover = failover_note_from_run(self.db.get("provider_runs", str(task["provider_run_id"])))
+            if int(task.get("attempts") or 0) > 0 and str(task.get("role") or "") != Role.REVIEW.value:
+                # Newest run for the task: crash recovery never rewrites
+                # tasks.provider_run_id, so that column can point at an older run.
+                _last_runs = self.db.query(
+                    "SELECT * FROM provider_runs WHERE task_id=? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                    (task_id,),
+                )
+                _task_failover = failover_note_from_run(_last_runs[0] if _last_runs else None)
             _task_ctx_spec = ContextCompileSpec(
                 role=role_for_stage(STAGE_TASK, str(task.get("role", "implementation"))),
                 stage=STAGE_TASK,

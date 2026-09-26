@@ -53,13 +53,19 @@ def _is_environment_failure(tail: str) -> bool:
 
 # Test-runner summary lines that report skipped tests. Exit code stays the
 # oracle for pass/fail; this is accounting so "passed with N skipped" is never
-# recorded as indistinguishable from a clean pass.
-_SKIP_PATTERNS = (
-    re.compile(r"\b(\d+) skipped\b"),  # pytest, vitest, jest
-    re.compile(r"\b(\d+) ignored\b"),  # cargo test
-    re.compile(r"\b(\d+) pending\b"),  # mocha
+# recorded as indistinguishable from a clean pass. Patterns are anchored to
+# each runner's per-test summary line (not file/suite lines, not log prose).
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_SKIP_SUMMARIES = (
+    # pytest: "324 passed, 30 skipped in 5.31s" (optionally framed by ====).
+    re.compile(r"^=*\s*(?:\d+ [a-z]+(?:, )?)*?(\d+) skipped(?:, \d+ [a-z]+)* in [\d.]+s\b"),
+    # vitest: "Tests  137 passed | 2 skipped (139)" — not "Test Files".
+    re.compile(r"^Tests\s{2,}.*?\b(\d+) skipped\b"),
+    # jest: "Tests:       2 skipped, 10 passed, 12 total" — not "Test Suites:".
+    re.compile(r"^Tests:\s.*?\b(\d+) skipped\b"),
+    # cargo: "test result: ok. 12 passed; 0 failed; 3 ignored; ..."
+    re.compile(r"^test result:.*?\b(\d+) ignored\b"),
 )
-_RUNNER_SUMMARY_MARKERS = ("passed", "failed", "test result", "Tests", "passing")
 
 
 # Repo-controlled output: an implausible count is unknown, never stored.
@@ -69,12 +75,12 @@ SKIP_COUNT_MAX = 1_000_000
 def count_skipped(tail: str) -> int | None:
     """Skipped tests reported in a runner summary; None when not reported."""
     total: int | None = None
-    for line in tail.splitlines():
-        if not any(marker in line for marker in _RUNNER_SUMMARY_MARKERS):
-            continue
-        for pattern in _SKIP_PATTERNS:
-            for m in pattern.finditer(line):
+    for raw in tail.splitlines():
+        line = _ANSI.sub("", raw).strip()
+        for pattern in _SKIP_SUMMARIES:
+            if m := pattern.search(line):
                 total = (total or 0) + int(m.group(1))
+                break
     if total is not None and total > SKIP_COUNT_MAX:
         return None
     return total

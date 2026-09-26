@@ -137,3 +137,13 @@ are a documented gap.
 - [x] Build detection reviewed: GG reads root manifests by design;
       RechnungsRadar's root package.json has no `build` script, so the fix
       belongs in that repository, not an invented filter command in GG.
+
+### Review round 7 — security: OK TO MERGE; architecture: OK TO MERGE
+
+Fixed: implausible skip counts are unknown and never cost the verification row
+(insert retried without the field); skip counting anchored to per-test summary
+lines of pytest/vitest/jest/cargo (file/suite lines, log prose and mocha not
+counted); DAG task failover uses the task's newest run (crash recovery never
+rewrites `provider_run_id`); skipped tests are a visible caveat but do not by
+themselves put a mission in the attention list. Known limitation: reset hints
+in JSON notices whose type is neither error nor fail are not read.
