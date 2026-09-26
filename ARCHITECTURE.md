@@ -7,7 +7,7 @@ Runtime baseline: `649e67e` (Increments 1–4, including dependency correctness
 behavior.
 
 ```text
-React / HashRouter ── REST /api/* (+ /api/runs, /api/analytics/usage) and mission WebSocket
+React / HashRouter ── REST /api/* (+ /api/runs, /api/analytics/usage, relay, events/recent) and mission + global WebSockets
         │
 FastAPI api/app.py + shared local bearer token
         │
@@ -166,6 +166,18 @@ mission/finding/provider counts and adds `/api/analytics/usage` coverage,
 repeated-context ratio, compilation warnings; legacy vs compiled), plus
 `/api/runs` inspection with a read-only Context view (blocks, budget, omissions,
 warnings — never raw prompts); unknown telemetry is shown as unknown, never zero.
+
+Operator read models (`mission_summary.py`, `relay.py`; presentation only, no
+policy): mission list/detail carry `trust` — open vs repair-claimed findings by
+severity (including retry lineage; broken lineage is reported unavailable),
+latest review independence with writer-set evidence — so `COMPLETED` with
+caveats never renders as clean. List trust is computed only for terminal
+missions and memoized. `/api/missions/{id}/relay` returns the provider chain
+(runs with manifest metadata and evidence-labelled flags, bounded redacted
+handoff previews, reviews, finding lineage); `/handoffs/{hid}` serves one
+capped, redacted handoff. `/api/events/recent` seeds the UI activity feed,
+which then follows `/ws/events`. Every finding surface goes through one
+redacting allow-list serializer.
 
 ## Artifact evidence and writer provenance
 
