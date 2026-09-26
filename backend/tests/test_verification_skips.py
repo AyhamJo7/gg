@@ -73,3 +73,29 @@ def test_no_verification_is_none(tmp_path: Path) -> None:
     mission = {"id": "m", "project_id": "p", "title": "m", "task": "t", "created_at": "t", "updated_at": "t"}
     db.insert("missions", mission)
     assert mission_trust(db, mission)["verification"] is None
+
+
+def test_implausible_skip_count_is_unknown() -> None:
+    """Security round 7: a 20-digit count must not break persistence."""
+    assert count_skipped("99999999999999999999 skipped, 1 failed") is None
+
+
+def test_row_survives_an_unstorable_skip_field(tmp_path: Path) -> None:
+    db = Database(tmp_path / "v.db")
+    report = VerificationReport(results=[CommandResult("pytest", 1, False, 1.0, skipped=10**20)])
+    attempt = _persist_verification_attempt(
+        db,
+        mission_id="m",
+        product_project_id=None,
+        task_id=None,
+        sha=SHA,
+        repo_key="",
+        kind="toolchain",
+        report=report,
+        started_at="t",
+    )
+    assert attempt is not None
+    row = db.get("verification_attempts", attempt)
+    assert row is not None
+    assert row["status"] == "failed"
+    assert row["skipped_tests"] is None

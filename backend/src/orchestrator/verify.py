@@ -62,6 +62,10 @@ _SKIP_PATTERNS = (
 _RUNNER_SUMMARY_MARKERS = ("passed", "failed", "test result", "Tests", "passing")
 
 
+# Repo-controlled output: an implausible count is unknown, never stored.
+SKIP_COUNT_MAX = 1_000_000
+
+
 def count_skipped(tail: str) -> int | None:
     """Skipped tests reported in a runner summary; None when not reported."""
     total: int | None = None
@@ -71,6 +75,8 @@ def count_skipped(tail: str) -> int | None:
         for pattern in _SKIP_PATTERNS:
             for m in pattern.finditer(line):
                 total = (total or 0) + int(m.group(1))
+    if total is not None and total > SKIP_COUNT_MAX:
+        return None
     return total
 
 
@@ -132,29 +138,32 @@ def _persist_verification_attempt(
         return None
     attempt_id = f"ver-{_uuid.uuid4().hex[:12]}"
     failed = [r for r in report.results if not r.passed]
+    row = {
+        "id": attempt_id,
+        "mission_id": mission_id or None,
+        "product_project_id": product_project_id,
+        "task_id": task_id,
+        "sha": sha.lower(),
+        "repo_key": repo_key,
+        "kind": kind,
+        "commands_json": _json.dumps([r.command for r in report.results]),
+        "status": "passed" if report.all_passed else "failed",
+        "exit_code": failed[0].exit_code if failed else 0,
+        "started_at": started_at,
+        "finished_at": utcnow().isoformat(),
+        "summary": report.summary()[:2000],
+        "skipped_tests": report.skipped_total,
+    }
     try:
-        db.insert(
-            "verification_attempts",
-            {
-                "id": attempt_id,
-                "mission_id": mission_id or None,
-                "product_project_id": product_project_id,
-                "task_id": task_id,
-                "sha": sha.lower(),
-                "repo_key": repo_key,
-                "kind": kind,
-                "commands_json": _json.dumps([r.command for r in report.results]),
-                "status": "passed" if report.all_passed else "failed",
-                "exit_code": failed[0].exit_code if failed else 0,
-                "started_at": started_at,
-                "finished_at": utcnow().isoformat(),
-                "summary": report.summary()[:2000],
-                "skipped_tests": report.skipped_total,
-            },
-        )
+        db.insert("verification_attempts", row)
     except Exception:
-        logger.debug("verification attempt insert failed", exc_info=True)
-        return None
+        # Accounting must never cost the SHA-bound record itself.
+        logger.warning("verification attempt insert failed; retrying without skip count", exc_info=True)
+        try:
+            db.insert("verification_attempts", {**row, "skipped_tests": None})
+        except Exception:
+            logger.warning("verification attempt insert failed", exc_info=True)
+            return None
     return attempt_id
 
 
