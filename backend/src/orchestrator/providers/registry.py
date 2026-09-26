@@ -184,8 +184,20 @@ class ProviderRegistry:
             (ProviderState.AVAILABLE.value, cooldown_until, name),
         )
 
-    def record_failure(self, name: str, failure: FailureClass, runtime_s: float, error: str) -> ProviderState:
-        """Apply exponential cooldown. Returns the recorded state."""
+    def record_failure(
+        self,
+        name: str,
+        failure: FailureClass,
+        runtime_s: float,
+        error: str,
+        stated_reset_s: float | None = None,
+    ) -> ProviderState:
+        """Apply exponential cooldown. Returns the recorded state.
+
+        ``stated_reset_s`` is the provider's own "try again at/in" hint; for
+        rate/quota limits it raises the cooldown floor so a provider is not
+        re-selected before the time it announced (dogfood 2026-09-12).
+        """
         base = float(self._config.get("orchestration.cooldown_base_seconds", 60))
         mult = float(self._config.get("orchestration.cooldown_multiplier", 2.0))
         cap = float(self._config.get("orchestration.cooldown_max_seconds", 3600))
@@ -195,6 +207,8 @@ class ProviderRegistry:
         if failure == FailureClass.QUOTA_EXHAUSTED:
             # Daily or long-horizon quota limit: enforce minimum 4-hour floor (F-18)
             cooldown_s = max(cooldown_s, float(self._config.get("orchestration.quota_cooldown_seconds", 14400)))
+        if stated_reset_s and failure in (FailureClass.RATE_LIMIT, FailureClass.QUOTA_EXHAUSTED):
+            cooldown_s = max(cooldown_s, stated_reset_s)
         state_by_failure = {
             FailureClass.RATE_LIMIT: ProviderState.RATE_LIMITED,
             FailureClass.QUOTA_EXHAUSTED: ProviderState.RATE_LIMITED,

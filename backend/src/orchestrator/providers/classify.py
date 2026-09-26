@@ -7,6 +7,7 @@ Order matters: first match wins (most specific first).
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 
 from ..models import FailureClass, ProviderState
 
@@ -159,3 +160,44 @@ def classify_output(
     if exit_code is None:
         return FailureClass.CRASH
     return FailureClass.NONE
+
+
+# -- Provider-stated reset times ---------------------------------------------
+# Providers often print when a limit lifts ("try again at 6:37 AM", "try
+# again in 20 minutes"). The registry uses this only as a floor on its own
+# exponential cooldown, never to shorten it. Wall-clock times carry no zone:
+# they are read as the host's local time, since the CLI runs on this host.
+MAX_PROVIDER_RESET_S = 24 * 60 * 60
+_SECONDS_PER_UNIT = {"s": 1, "m": 60, "h": 3600}
+_RESET_AT = re.compile(r"try again at\s+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?", re.IGNORECASE)
+_RESET_IN = re.compile(
+    r"(?:try again|retry|resets?)\s+in\s+(\d+(?:\.\d+)?)\s*(s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?)\b",
+    re.IGNORECASE,
+)
+_RETRY_AFTER = re.compile(r"retry[- ]after[:=\s]+(\d+)\b", re.IGNORECASE)
+
+
+def parse_reset_after(text: str, now: datetime | None = None) -> float | None:
+    """Seconds until the provider says its limit resets, or None if unstated."""
+    if not text:
+        return None
+    local_now = (now or datetime.now(UTC)).astimezone()
+    seconds: float | None = None
+    if m := _RESET_AT.search(text):
+        hour, minute, meridiem = int(m.group(1)), int(m.group(2)), (m.group(3) or "").lower().replace(".", "")
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+        if hour < 24 and minute < 60:
+            target = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= local_now:
+                target += timedelta(days=1)
+            seconds = (target - local_now).total_seconds()
+    elif m := _RESET_IN.search(text):
+        seconds = float(m.group(1)) * _SECONDS_PER_UNIT[m.group(2)[0].lower()]
+    elif m := _RETRY_AFTER.search(text):
+        seconds = float(m.group(1))
+    if seconds is None or seconds <= 0:
+        return None
+    return min(seconds, MAX_PROVIDER_RESET_S)
