@@ -8,7 +8,8 @@ from pathlib import Path
 
 from conftest import make_orchestrator
 from orchestrator.context_compiler import ContextCompileSpec, build_candidate_blocks
-from orchestrator.engine import FAILOVER_EVIDENCE_CHARS, _failover_evidence
+from orchestrator.engine import _failover_evidence
+from orchestrator.failover import FAILOVER_EVIDENCE_CHARS
 from orchestrator.models import FailureClass, MissionStatus, ProviderState
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.providers.base import ExecutionResult
@@ -120,5 +121,94 @@ def test_failover_skipped_after_gate_refusal(tmp_path: Path, workspace: Path) ->
         )
         assert not any('"failover"' in row["blocks_json"] for row in manifests)
         await orch.shutdown()
+
+    asyncio.run(main())
+
+
+def test_note_from_persisted_run_is_restart_safe() -> None:
+    from orchestrator.failover import failover_note_from_run
+
+    failed = {
+        "provider": "codex",
+        "run_status": "FAILED",
+        "failure_class": "RATE_LIMIT",
+        "duration_ms": 407000,
+        "summary": f"build passes; {SECRET}",
+    }
+    note = failover_note_from_run(failed)
+    assert note.startswith("codex stopped with RATE_LIMIT after 407s")
+    assert SECRET not in note
+    assert failover_note_from_run({**failed, "run_status": "SUCCEEDED"}) == ""
+    assert failover_note_from_run({**failed, "duration_ms": None}).startswith("codex stopped with RATE_LIMIT.")
+    assert failover_note_from_run(None) == ""
+
+
+def test_parallel_task_retry_carries_failover_block(tmp_path: Path) -> None:
+    """Round-4 M3: DAG task retries also get the previous attempt's report."""
+    from orchestrator.config import Config
+    from orchestrator.db import Database
+    from orchestrator.events import EventBus
+    from orchestrator.models import SchedulingMode, TaskStatus, utcnow
+    from orchestrator.parallel_engine import ParallelMissionEngine
+    from orchestrator.providers.registry import ProviderRegistry
+    from test_context_fail_closed import _git_project
+
+    async def main() -> None:
+        db = Database(tmp_path / "p.db")
+        cfg = Config(
+            {
+                "scheduler": {"max_parallel_tasks": 1},
+                "priority": {"implementation": ["fast"], "planning": ["fast"], "review": ["fast"], "repair": ["fast"]},
+                "providers": {"fast": {"enabled": True, "timeout_minutes": 1}},
+                "orchestration": {
+                    "scheduler_tick_seconds": 0.05,
+                    "cooldown_base_seconds": 0.05,
+                    "cooldown_max_seconds": 0.1,
+                    "review_required": False,
+                    "max_repair_cycles": 1,
+                },
+                "git": {"max_auto_commit_file_mb": 5},
+            }
+        )
+        adapters = {"fast": FakeAdapter("fast", ["ratelimit", "ok"])}
+        reg = ProviderRegistry(db, adapters, cfg)
+        db.execute("INSERT OR REPLACE INTO providers(name, state, installed) VALUES ('fast', 'AVAILABLE', 1)")
+        proj = tmp_path / "project"
+        _git_project(proj)
+        db.insert("projects", {"id": "p1", "name": "t", "path": str(proj), "created_at": utcnow()})
+        db.insert(
+            "missions",
+            {
+                "id": "m1",
+                "project_id": "p1",
+                "title": "t",
+                "task": "t",
+                "status": "RECOVERING",
+                "scheduling_mode": SchedulingMode.PARALLEL_SAFE.value,
+                "created_at": utcnow(),
+                "updated_at": utcnow(),
+            },
+        )
+        db.insert(
+            "tasks",
+            {
+                "id": "ta",
+                "mission_id": "m1",
+                "role": "implementation",
+                "title": "A",
+                "description": "do a",
+                "status": TaskStatus.PENDING.value,
+                "workspace_scope": '["a/**"]',
+                "created_at": utcnow(),
+            },
+        )
+        await asyncio.wait_for(ParallelMissionEngine("m1", db, EventBus(db), reg, cfg).run(), timeout=60)
+        runs = db.query(
+            "SELECT r.failure_class, m.blocks_json FROM provider_runs r JOIN run_context_manifests m "
+            "ON m.run_id = r.id WHERE r.task_id='ta' ORDER BY r.started_at, r.rowid"
+        )
+        assert runs[0]["failure_class"] == "RATE_LIMIT"
+        assert '"failover"' not in runs[0]["blocks_json"]
+        assert '"failover"' in runs[1]["blocks_json"]
 
     asyncio.run(main())

@@ -19,6 +19,7 @@ host — there is no unsandboxed fallback.
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +51,29 @@ def _is_environment_failure(tail: str) -> bool:
     return any(marker in tail for marker in _ENVIRONMENT_FAILURE_MARKERS)
 
 
+# Test-runner summary lines that report skipped tests. Exit code stays the
+# oracle for pass/fail; this is accounting so "passed with N skipped" is never
+# recorded as indistinguishable from a clean pass.
+_SKIP_PATTERNS = (
+    re.compile(r"\b(\d+) skipped\b"),  # pytest, vitest, jest
+    re.compile(r"\b(\d+) ignored\b"),  # cargo test
+    re.compile(r"\b(\d+) pending\b"),  # mocha
+)
+_RUNNER_SUMMARY_MARKERS = ("passed", "failed", "test result", "Tests", "passing")
+
+
+def count_skipped(tail: str) -> int | None:
+    """Skipped tests reported in a runner summary; None when not reported."""
+    total: int | None = None
+    for line in tail.splitlines():
+        if not any(marker in line for marker in _RUNNER_SUMMARY_MARKERS):
+            continue
+        for pattern in _SKIP_PATTERNS:
+            for m in pattern.finditer(line):
+                total = (total or 0) + int(m.group(1))
+    return total
+
+
 @dataclass
 class CommandResult:
     command: str
@@ -58,6 +82,7 @@ class CommandResult:
     duration_s: float
     tail: str = ""
     likely_environment_issue: bool = False
+    skipped: int | None = None
 
 
 @dataclass
@@ -72,11 +97,17 @@ class VerificationReport:
     def attempted(self) -> bool:
         return bool(self.results)
 
+    @property
+    def skipped_total(self) -> int | None:
+        counts = [r.skipped for r in self.results if r.skipped is not None]
+        return sum(counts) if counts else None
+
     def summary(self) -> str:
         lines = []
         for r in self.results:
             mark = "PASS" if r.passed else "FAIL"
-            lines.append(f"[{mark}] {r.command} (exit={r.exit_code}, {r.duration_s:.1f}s)")
+            skipped = f", {r.skipped} skipped" if r.skipped else ""
+            lines.append(f"[{mark}] {r.command} (exit={r.exit_code}, {r.duration_s:.1f}s{skipped})")
         return "\n".join(lines)
 
 
@@ -118,6 +149,7 @@ def _persist_verification_attempt(
                 "started_at": started_at,
                 "finished_at": utcnow().isoformat(),
                 "summary": report.summary()[:2000],
+                "skipped_tests": report.skipped_total,
             },
         )
     except Exception:
@@ -192,6 +224,7 @@ async def run_verification(
                 duration_s=result.duration_s,
                 tail=tail,
                 likely_environment_issue=(not passed) and _is_environment_failure(tail),
+                skipped=count_skipped(tail),
             )
         )
         _ = db  # events are persisted by EventBus.publish; db kept for API symmetry
@@ -200,6 +233,7 @@ async def run_verification(
             mission_id,
             command=command,
             exit_code=result.exit_code,
+            skipped=report.results[-1].skipped,
         )
     _persist_verification_attempt(
         db,

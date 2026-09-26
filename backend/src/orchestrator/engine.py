@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import git_ops
 from .events import EventBus
+from .failover import format_failover_note
 from .handoff import persist_handoff, render_handoff
 from .locks import ResourceLocks
 from .models import (
@@ -87,25 +88,11 @@ ROLE_PROMPTS = {
 
 
 FAILURE_TEXT_CHARS = 4000
-FAILOVER_EVIDENCE_CHARS = 1500
 
 
 def _failover_evidence(provider: str, result: ExecutionResult) -> str:
-    """Bounded, redacted report of a failed attempt for the next provider.
-
-    Labelled partial and unverified: it is context to re-check, never a
-    verified result, and it never overrides the task or findings.
-    """
-    report = redact((result.summary or "").strip())
-    if not report:
-        return ""
-    if len(report) > FAILOVER_EVIDENCE_CHARS:
-        report = report[:FAILOVER_EVIDENCE_CHARS] + "…"
-    return (
-        f"{provider} stopped with {result.failure_class.value} after {result.duration_s:.0f}s. "
-        "Its last report is partial and unverified; re-check before relying on it:\n"
-        f"{report}"
-    )
+    """Bounded, redacted, unverified report of a failed attempt (see failover.py)."""
+    return format_failover_note(provider, result.failure_class.value, result.duration_s, result.summary or "")
 
 
 class MissionEngine:

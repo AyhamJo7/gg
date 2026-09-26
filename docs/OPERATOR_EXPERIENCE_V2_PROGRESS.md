@@ -122,3 +122,18 @@ quota floor; wall-clock resets are DST-localized. No open Critical/High/Medium
 findings remain on the branch. Accepted Low: weekly limits beyond the cap are
 retried at the cap interval (safe floor); parallel/repair-worker failover notes
 are a documented gap.
+
+## Follow-up after rounds 5–6
+
+- [x] Parallel DAG task retries carry the previous failed run's report
+      (rebuilt from the persisted run, restart-safe; never for review tasks).
+      Shared formatting in `failover.py`. Repair worker remains a documented
+      gap: no reliable retry→failed-run link without touching sealed
+      Increment 4 claim/attempt semantics.
+- [x] Skipped-test accounting (migration 0019): pytest/vitest/jest/cargo/mocha
+      summary skip counts recorded per verification attempt; exit code stays
+      the pass/fail oracle; COMPLETED with skipped tests renders "N tests
+      skipped in verification" as a caveat; unreported counts stay unknown.
+- [x] Build detection reviewed: GG reads root manifests by design;
+      RechnungsRadar's root package.json has no `build` script, so the fix
+      belongs in that repository, not an invented filter command in GG.

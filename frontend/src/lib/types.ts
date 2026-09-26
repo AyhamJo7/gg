@@ -55,6 +55,15 @@ export interface MissionTrust {
   inherited_available: boolean;
   review: ReviewSummary | null;
   review_count: number;
+  /** Latest SHA-bound verification; skipped_tests null = not reported. */
+  verification?: VerificationSummary | null;
+}
+
+export interface VerificationSummary {
+  status: string | null;
+  sha: string | null;
+  skipped_tests: number | null;
+  finished_at: string | null;
 }
 
 export interface RelayBlockRef {

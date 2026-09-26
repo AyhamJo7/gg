@@ -29,6 +29,7 @@ from orchestrator.review import open_blockers, unverified_findings
 
 TS = "2026-09-12T02:00:00+00:00"
 SECRET = "sk-ant-api03-" + "B" * 40
+BULK_QUERIES = 3
 
 
 def _mission(db: Database, mid: str, status: str = "COMPLETED", retry_of: str | None = None) -> dict[str, Any]:
@@ -251,15 +252,15 @@ def test_list_cache_skips_active_and_memoizes_terminal(db: Database) -> None:
     cache = TerminalTrustCache()
     first = cache.list_trust(counting, missions)  # type: ignore[arg-type]
     assert first["live"] is None
-    # Bulk path: one findings query + one reviews query for 20 missions.
-    assert counting.queries == 2
+    # Bulk path: findings, reviews and verifications — one query each for 20 missions.
+    assert counting.queries == BULK_QUERIES
     counting.queries = 0
     cache.list_trust(counting, missions)  # type: ignore[arg-type]
     assert counting.queries == 0
     # A row update changes the key and forces recomputation.
     missions[0] = {**missions[0], "updated_at": "later"}
     cache.list_trust(counting, missions)  # type: ignore[arg-type]
-    assert counting.queries == 2
+    assert counting.queries == BULK_QUERIES
 
 
 def test_api_exposes_trust_on_list_and_detail(tmp_path: Path) -> None:

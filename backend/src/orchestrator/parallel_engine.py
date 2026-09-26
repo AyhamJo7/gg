@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from . import git_ops, integration, task_locks, task_worktree
 from .dag import DagValidationError, namespace_dag_ids, validate_planner_payload
 from .events import EventBus
+from .failover import failover_note_from_run
 from .handoff import persist_handoff, render_handoff
 from .models import (
     EventType,
@@ -2014,6 +2015,13 @@ class ParallelMissionEngine:
                     _verified_map = await _verify_input_covers(self.db, _wt, _planned_input, _dep_list)
                 except Exception:
                     logger.debug("dependency presence proof failed for %s", task_id, exc_info=True)
+            # A retried task carries its previous failed run's partial report
+            # (never for review tasks: reviewer independence).
+            _task_failover = ""
+            if int(task.get("attempts") or 0) > 0 and task.get("provider_run_id") and str(
+                task.get("role") or ""
+            ) != Role.REVIEW.value:
+                _task_failover = failover_note_from_run(self.db.get("provider_runs", str(task["provider_run_id"])))
             _task_ctx_spec = ContextCompileSpec(
                 role=role_for_stage(STAGE_TASK, str(task.get("role", "implementation"))),
                 stage=STAGE_TASK,
@@ -2030,6 +2038,7 @@ class ParallelMissionEngine:
                 dependency_ids=_dep_list,
                 dependency_verified=_verified_map,
                 workspace_scope=list(_scope) if isinstance(_scope, list) else [],
+                failover_text=_task_failover,
             )
             prompt, _task_ctx = prepare_invocation_context(
                 legacy_prompt=prompt, spec=_task_ctx_spec, db=self.db, config=self.config

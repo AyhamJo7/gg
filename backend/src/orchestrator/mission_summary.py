@@ -170,6 +170,8 @@ def _blank() -> dict[str, Any]:
         "inherited_available": True,
         "review": None,
         "review_count": 0,
+        # Latest SHA-bound verification attempt; None when none was recorded.
+        "verification": None,
     }
 
 
@@ -223,6 +225,20 @@ def mission_trust_bulk(
         mid = str(r["mission_id"])
         out[mid]["review"] = review_summary(r)
         out[mid]["review_count"] = int(r.get("n") or 0)
+
+    verifications = db.query(
+        "SELECT mission_id, status, sha, skipped_tests, finished_at FROM (SELECT v.*, ROW_NUMBER() OVER "  # noqa: S608
+        "(PARTITION BY mission_id ORDER BY started_at DESC, rowid DESC) AS rn FROM verification_attempts v "
+        f"WHERE mission_id IN ({placeholders})) WHERE rn = 1",
+        tuple(ids),
+    )
+    for v in verifications:
+        out[str(v["mission_id"])]["verification"] = {
+            "status": v.get("status"),
+            "sha": v.get("sha"),
+            "skipped_tests": v.get("skipped_tests"),
+            "finished_at": v.get("finished_at"),
+        }
     return out
 
 

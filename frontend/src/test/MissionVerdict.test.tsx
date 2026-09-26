@@ -56,6 +56,13 @@ describe("mission verdict", () => {
       repair_claimed_findings: { BLOCKER: 0, HIGH: 1, MEDIUM: 0, LOW: 0 } }) });
     expect(v.caveats).toEqual(["1 open HIGH", "1 HIGH repair claimed, not verified"]);
   });
+  it("never lets skipped tests read as a clean pass", () => {
+    const v = missionVerdict({ status: "COMPLETED", trust: trust({ verification: { status: "passed", sha: "a", skipped_tests: 30, finished_at: null } }) });
+    expect(v).toMatchObject({ label: "Completed with caveats", needsAttention: true });
+    expect(v.caveats).toContain("30 tests skipped in verification");
+    // Unreported skip counts are unknown, not a caveat and not zero.
+    expect(missionVerdict({ status: "COMPLETED", trust: trust({ verification: { status: "passed", sha: "a", skipped_tests: null, finished_at: null } }) }).tone).toBe("clean");
+  });
   it("reports unreadable retry history", () => {
     expect(missionVerdict({ status: "COMPLETED", trust: trust({ inherited_available: false }) }).caveats).toContain("retry history findings unavailable");
   });

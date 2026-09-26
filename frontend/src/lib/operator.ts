@@ -96,6 +96,12 @@ export function trustCaveats(trust: MissionTrust, status: string): { caveats: st
     caveats.push(`${trust.unrecognized_severity} unresolved (unrecognized severity)`);
     serious = true;
   }
+  const skipped = trust.verification?.skipped_tests ?? null;
+  if (skipped !== null && skipped > 0) {
+    // Exit code passed, but skipped tests are unverified behavior, not green.
+    caveats.push(`${skipped} test${skipped === 1 ? "" : "s"} skipped in verification`);
+    serious = true;
+  }
   if (!trust.inherited_available) {
     caveats.push("retry history findings unavailable");
     serious = true;
