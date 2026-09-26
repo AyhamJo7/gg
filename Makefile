@@ -1,5 +1,5 @@
 # GG Orchestrator — AI Engineering Mission Control
-.PHONY: dev backend frontend token test test-backend test-frontend lint typecheck build install smoke
+.PHONY: dev backend frontend token test test-backend test-frontend e2e lint typecheck build install smoke
 
 BACKEND_DIR := backend
 FRONTEND_DIR := frontend
@@ -35,6 +35,10 @@ test-backend:
 
 test-frontend:
 	cd $(FRONTEND_DIR) && npm run test -- --run
+
+# Browser e2e of operator surfaces: isolated state, fake adapters only.
+e2e:
+	./scripts/ui-e2e.sh
 
 lint:
 	cd $(BACKEND_DIR) && $(UV) run ruff check src tests
