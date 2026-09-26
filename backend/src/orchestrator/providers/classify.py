@@ -6,6 +6,7 @@ Order matters: first match wins (most specific first).
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime, timedelta
 
@@ -202,9 +203,12 @@ def _wall_clock_seconds(hour: int, minute: int, meridiem: str, now: datetime) ->
             candidates.append((hour + HOURS_PER_HALF_DAY) % 24)
     best: float | None = None
     for h in candidates:
-        target = now.replace(hour=h, minute=minute, second=0, microsecond=0)
+        # Build the wall-clock target naively and localize it, so a reset on
+        # the other side of a DST change gets its own UTC offset.
+        naive = now.replace(tzinfo=None, hour=h, minute=minute, second=0, microsecond=0)
+        target = naive.astimezone()
         if target <= now:
-            target += timedelta(days=1)
+            target = (naive + timedelta(days=1)).astimezone()
         delta = (target - now).total_seconds()
         best = delta if best is None else min(best, delta)
     return best
@@ -224,13 +228,41 @@ def _line_reset_seconds(line: str, now: datetime) -> float | None:
     return None
 
 
+_ERROR_EVENT_MARKERS = ("error", "fail")
+
+
+def _cli_error_text(line: str) -> str | None:
+    """Text of a line the CLI (not the model) wrote, or None to skip it.
+
+    Structured stream events are trusted only through their error payload;
+    assistant/message/result events carry model-written text and are skipped.
+    Plain-text lines cannot be told apart and are read, bounded by the cap.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("{"):
+        return line
+    try:
+        event = json.loads(stripped)
+    except json.JSONDecodeError:
+        return line
+    if not isinstance(event, dict):
+        return None
+    if "error" in event:
+        return json.dumps(event["error"]) if not isinstance(event["error"], str) else event["error"]
+    kind = str(event.get("type") or event.get("event") or "").lower()
+    if any(marker in kind for marker in _ERROR_EVENT_MARKERS):
+        return stripped
+    return None
+
+
 def parse_reset_after(text: str, now: datetime | None = None, cap_s: float = MAX_PROVIDER_RESET_S) -> float | None:
     """Seconds until the provider's own limit message says it resets, or None."""
     if not text:
         return None
     local_now = (now or datetime.now(UTC)).astimezone()
-    for line in reversed(text.splitlines()):
-        if not _is_limit_line(line):
+    for raw_line in reversed(text.splitlines()):
+        line = _cli_error_text(raw_line)
+        if line is None or not _is_limit_line(line):
             continue
         seconds = _line_reset_seconds(line, local_now)
         if seconds is not None and seconds > 0:

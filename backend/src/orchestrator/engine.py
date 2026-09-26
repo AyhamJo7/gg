@@ -102,7 +102,6 @@ def _failover_evidence(provider: str, result: ExecutionResult) -> str:
     if len(report) > FAILOVER_EVIDENCE_CHARS:
         report = report[:FAILOVER_EVIDENCE_CHARS] + "…"
     return (
-        f"## Previous attempt (did not complete)\n"
         f"{provider} stopped with {result.failure_class.value} after {result.duration_s:.0f}s. "
         "Its last report is partial and unverified; re-check before relying on it:\n"
         f"{report}"
@@ -439,7 +438,11 @@ class MissionEngine:
             mission = self._mission()
             self.events.publish(EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value)
             handoff_content = self._make_handoff(role, last_provider, provider_name, ROLE_PROMPTS[role])
-            legacy_context = f"{extra_context}\n\n{failover_note}".strip() if failover_note else extra_context
+            legacy_context = (
+                f"{extra_context}\n\n## Previous attempt (did not complete)\n{failover_note}".strip()
+                if failover_note
+                else extra_context
+            )
             prompt = self._build_prompt(role, mission, handoff_content, legacy_context)
             # Role-specific context compiler (Increment 2, strict in compiled
             # mode): deterministic projection over requirements/acceptance/

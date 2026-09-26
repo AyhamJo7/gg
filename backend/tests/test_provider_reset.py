@@ -126,3 +126,27 @@ def test_stated_reset_ignored_for_non_limit_failures(tmp_path: Path) -> None:
     registry, db = _registry(tmp_path)
     registry.record_failure("codex", FailureClass.CRASH, 1.0, "boom", stated_reset_s=3600)
     assert _cooldown_s(db) < 3600
+
+
+def test_model_stream_events_are_never_read_even_when_last() -> None:
+    """Security round 5: an assistant event after the real limit line."""
+    tail = "\n".join(
+        [
+            '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit."}}',
+            '{"type":"assistant","message":{"content":"rate limit reached, try again at 11:59"}}',
+            '{"event":"result","result":{"response":"usage limit reached, try again in 20 hours"}}',
+        ]
+    )
+    assert parse_reset_after(tail) is None
+
+
+def test_structured_error_payload_is_read() -> None:
+    now = _local(6, 18)
+    assert parse_reset_after(CODEX_LIMIT, now) == 19 * 60
+    assert parse_reset_after('{"type":"error","message":"429 rate limit, retry after 30"}') == 30
+
+
+def test_default_cap_is_the_quota_floor(tmp_path: Path) -> None:
+    registry, db = _registry(tmp_path)
+    registry.record_failure("codex", FailureClass.RATE_LIMIT, 5.0, "limit", stated_reset_s=86400)
+    assert _cooldown_s(db) <= 14400

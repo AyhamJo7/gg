@@ -210,7 +210,14 @@ class ProviderRegistry:
         if stated_reset_s and failure in (FailureClass.RATE_LIMIT, FailureClass.QUOTA_EXHAUSTED):
             # Provider text is untrusted: bounded by config, and shown to the
             # operator as the reason for the longer cooldown.
-            stated_cap = float(self._config.get("orchestration.stated_reset_max_seconds", 86400))
+            # Default cap = the quota floor: plain-text output (which cannot be
+            # told apart from model prose) can bench a provider at most that long.
+            stated_cap = float(
+                self._config.get(
+                    "orchestration.stated_reset_max_seconds",
+                    self._config.get("orchestration.quota_cooldown_seconds", 14400),
+                )
+            )
             stated = min(stated_reset_s, stated_cap)
             if stated > cooldown_s:
                 cooldown_s = stated
