@@ -47,8 +47,9 @@ export default defineConfig(() => ({
       "/ws": {
         target: `ws://${BACKEND_HOST}`,
         ws: true,
-        // The backend's WS origin allowlist names the default dev origin.
-        ...(process.env.GG_BACKEND_HOST ? { headers: { origin: "http://127.0.0.1:5173" } } : {}),
+        // Only the isolated e2e run (GG_E2E=1) rewrites Origin to the default
+        // dev origin the backend allowlists; normal dev keeps the real Origin.
+        ...(process.env.GG_E2E === "1" ? { headers: { origin: "http://127.0.0.1:5173" } } : {}),
       },
     },
   },

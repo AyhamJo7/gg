@@ -30,7 +30,7 @@ setsid bash -c 'cd "$1/backend" && PYTHONPATH=src exec uv run python tests/helpe
 PIDS+=($!)
 wait_for "http://127.0.0.1:$BACKEND_PORT/api/health"
 
-GG_AUTH_TOKEN_FILE="$STATE_DIR/auth_token" GG_BACKEND_HOST="127.0.0.1:$BACKEND_PORT" GG_FRONTEND_PORT="$FRONTEND_PORT" \
+GG_E2E=1 GG_AUTH_TOKEN_FILE="$STATE_DIR/auth_token" GG_BACKEND_HOST="127.0.0.1:$BACKEND_PORT" GG_FRONTEND_PORT="$FRONTEND_PORT" \
   setsid bash -c 'cd "$1/frontend" && exec npx vite --logLevel warn' _ "$REPO_ROOT" &
 PIDS+=($!)
 wait_for "http://127.0.0.1:$FRONTEND_PORT/"
