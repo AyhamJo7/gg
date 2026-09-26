@@ -712,6 +712,17 @@ def build_candidate_blocks(
                 reason="existing decisions",
             )
         aux["plan_revision"] = rev if rev is not None else spec.plan_revision
+        if spec.failure_text:
+            # A failed-over planning attempt's partial report (dogfood
+            # 2026-09-12: the retry otherwise re-derives it from scratch).
+            add(
+                "failure",
+                BlockType.FAILURE_EVIDENCE,
+                Priority.PREFERRED,
+                f"Prior failure (bounded tail):\n{spec.failure_text[-1500:]}".strip(),
+                source_kind="evidence",
+                source_ref="failure-tail",
+            )
         contract = OUTPUT_CONTRACTS.get("planner", OUTPUT_CONTRACTS["implementer"])
         add(
             "output",

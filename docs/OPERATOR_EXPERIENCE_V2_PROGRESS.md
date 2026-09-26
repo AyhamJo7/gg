@@ -84,3 +84,14 @@ Fixed: linear token-tail strip (quadratic regex DoS), formatter churn reverted
 from unrelated modules, unread attention counted per mission so parallel-engine
 stops (status change only) still count, reconnect gap stated when the re-seed
 page cannot cover the outage.
+
+## Remaining dogfood "worth doing" items (§29 below the cut) — all closed
+
+- [x] Degraded-review card states the recorded reason (Tier 1).
+- [x] Repository missions on the Overview (Tier 1).
+- [x] Provider-stated reset time honored as a rate/quota cooldown floor
+      (`classify.parse_reset_after`, `registry.record_failure(stated_reset_s=)`).
+- [x] AGY terminal `result.usage` parsed (PARTIAL: thinking/output relation unstated).
+- [x] Failover carries the failed attempt's bounded, redacted, "partial and
+      unverified" report as FAILURE_EVIDENCE (planner policy included); the
+      retry prompt is no longer byte-identical. Backend 677 passed.

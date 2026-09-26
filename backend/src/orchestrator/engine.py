@@ -86,6 +86,29 @@ ROLE_PROMPTS = {
 }
 
 
+FAILURE_TEXT_CHARS = 4000
+FAILOVER_EVIDENCE_CHARS = 1500
+
+
+def _failover_evidence(provider: str, result: ExecutionResult) -> str:
+    """Bounded, redacted report of a failed attempt for the next provider.
+
+    Labelled partial and unverified: it is context to re-check, never a
+    verified result, and it never overrides the task or findings.
+    """
+    report = redact((result.summary or "").strip())
+    if not report:
+        return ""
+    if len(report) > FAILOVER_EVIDENCE_CHARS:
+        report = report[:FAILOVER_EVIDENCE_CHARS] + "…"
+    return (
+        f"## Previous attempt (did not complete)\n"
+        f"{provider} stopped with {result.failure_class.value} after {result.duration_s:.0f}s. "
+        "Its last report is partial and unverified; re-check before relying on it:\n"
+        f"{report}"
+    )
+
+
 class MissionEngine:
     def __init__(
         self,
@@ -358,6 +381,10 @@ class MissionEngine:
         last_run_id: str | None = None
         attempt = 0
         wait_started: float | None = None
+        # Dogfood 2026-09-12: a failover retry received a byte-identical prompt
+        # and re-derived ~7 min of the failed run's findings. Carry the failed
+        # attempt's own (partial, unverified) report forward as evidence.
+        failover_note = ""
 
         while attempt < max_attempts:
             if self._cancel.is_set() or self._pause.is_set():
@@ -412,7 +439,8 @@ class MissionEngine:
             mission = self._mission()
             self.events.publish(EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value)
             handoff_content = self._make_handoff(role, last_provider, provider_name, ROLE_PROMPTS[role])
-            prompt = self._build_prompt(role, mission, handoff_content, extra_context)
+            effective_context = f"{extra_context}\n\n{failover_note}".strip() if failover_note else extra_context
+            prompt = self._build_prompt(role, mission, handoff_content, effective_context)
             # Role-specific context compiler (Increment 2, strict in compiled
             # mode): deterministic projection over requirements/acceptance/
             # architecture/handoffs. Compiled-mode compilation failure records
@@ -482,7 +510,7 @@ class MissionEngine:
                     task_title=mission.title,
                     task_description=mission.task,
                     requirement_ids=_req_ids,
-                    failure_text=extra_context[:4000] if extra_context else "",
+                    failure_text=effective_context[-FAILURE_TEXT_CHARS:] if effective_context else "",
                     extra_context="",
                     workspace_scope=[],
                     attempt=attempt + 1,
@@ -752,6 +780,8 @@ class MissionEngine:
                         base_sha=commit_before,
                     )
             last_provider = provider_name
+            # A spawn-gate refusal is orchestrator-internal, not provider evidence.
+            failover_note = "" if result.gate_refused else _failover_evidence(provider_name, result)
             attempt += 1
 
         mission = self._mission()
