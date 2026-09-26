@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from .. import git_ops
 from ..config import Config
 from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
+from ..mission_summary import mission_trust, mission_trust_bulk
 from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
 from ..project_engine import ProductValidationError
@@ -231,7 +232,11 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             )
         else:
             rows = orchestrator.db.query("SELECT * FROM missions ORDER BY created_at DESC LIMIT 200")
-        return [_jsonable(r) for r in rows]
+        trust = mission_trust_bulk(orchestrator.db, rows)
+        out = [_jsonable(r) for r in rows]
+        for m in out:
+            m["trust"] = trust.get(str(m["id"]))
+        return out
 
     @app.post("/api/missions", status_code=201)
     async def create_mission(req: CreateMissionRequest) -> dict[str, Any]:
@@ -269,6 +274,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         latest_review = reviews[-1] if reviews else None
         mission["latest_review"] = latest_review
         mission["degraded_review"] = bool(latest_review and not latest_review["independent"])
+        mission["trust"] = mission_trust(orchestrator.db, mission)
         mission["runs"] = orchestrator.db.query(
             "SELECT id, provider, role, failure_class, provider_state, exit_code, started_at, finished_at, "
             "summary FROM provider_runs WHERE mission_id=? ORDER BY started_at",

@@ -17,7 +17,8 @@ import { Terminal } from "../components/Terminal";
 import { WorkflowTimeline } from "../components/WorkflowTimeline";
 import { TERMINAL_TASK_STATUSES, type Mission } from "../lib/types";
 import { RunInspector } from "../components/RunInspector";
-import { operatorLabel } from "../lib/operator";
+import { operatorLabel, TERMINAL_MISSION_STATES } from "../lib/operator";
+import { MissionVerdictBadge, ReviewTrustCard } from "../components/MissionVerdict";
 
 function MissionHeader({ mission }: { mission: Mission }) {
   const active = !["COMPLETED", "FAILED", "CANCELLED", "PAUSED", "UNVERIFIED"].includes(mission.status);
@@ -29,6 +30,7 @@ function MissionHeader({ mission }: { mission: Mission }) {
         <details><summary>Mission objective</summary><p className="muted">{mission.task}</p></details>
         <div className="row" style={{ marginTop: 4, gap: 8 }}>
           <Badge value={mission.status} pulse={active} />
+          {TERMINAL_MISSION_STATES.has(mission.status) && <MissionVerdictBadge mission={mission} />}
           {mission.scheduling_mode === "PARALLEL_SAFE" && <Badge value="PARALLEL" />}
           <span className="mono muted">{active ? `Elapsed ${elapsed}` : mission.finished_at ? `Finished ${new Date(mission.finished_at).toLocaleString()}` : "Not running"}</span>
         </div>
@@ -157,15 +159,14 @@ export function MissionControlPage() {
             </div>
           )}
 
-          {detail?.degraded_review && detail.latest_review && (
-            <div className="card" style={{ borderColor: "var(--orange)" }} data-testid="self-review-warning">
-              <div className="row">
-                <Badge value="SELF-REVIEW" />
-                <strong>DEGRADED REVIEW — independent reviewer unavailable</strong>
-              </div>
-              <p className="muted" style={{ margin: "6px 0 0" }}>
-                Reviewer <span className="mono">{detail.latest_review.review_provider}</span> also performed the
-                implementation. {detail.latest_review.degradation_reason}
+          {detail?.trust?.review ? (
+            <ReviewTrustCard review={detail.trust.review} />
+          ) : detail?.degraded_review && detail.latest_review && (
+            <div className="card attention-card" data-testid="review-trust-warning">
+              <strong>Review not certified as independent</strong>
+              <p className="muted">
+                Reviewer <span className="mono">{detail.latest_review.review_provider}</span>. Recorded reason:{" "}
+                {detail.latest_review.degradation_reason || "No reason was recorded."}
               </p>
             </div>
           )}

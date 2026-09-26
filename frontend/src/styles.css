@@ -265,3 +265,12 @@ tr:last-child td { border-bottom: none; }
   border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px;
   font-size: 12.5px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); z-index: 100;
 }
+
+/* mission verdict + trust */
+.verdict { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.verdict-caveats { font-size: 12px; }
+.attention-card { border-color: var(--orange); }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 8px 0; }
+.facts dt { color: var(--text-dim); }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
+.count { display: inline-block; min-width: 20px; padding: 0 6px; margin-left: 6px; border-radius: 999px; background: var(--orange); color: var(--bg); font-size: 11px; text-align: center; vertical-align: middle; }

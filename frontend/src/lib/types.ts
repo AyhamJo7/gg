@@ -27,6 +27,34 @@ export interface Mission {
   created_at: string;
   updated_at: string;
   finished_at: string | null;
+  retry_of_mission_id?: string | null;
+  /** Derived caveats; absent on older backends (render as unknown, not clean). */
+  trust?: MissionTrust | null;
+}
+
+export type SeverityCounts = Record<"BLOCKER" | "HIGH" | "MEDIUM" | "LOW", number>;
+
+export interface ReviewSummary {
+  id: string | null;
+  reviewer: string;
+  independent: boolean;
+  degradation_reason: string | null;
+  writer_set: string[];
+  reviewer_in_writer_set: boolean;
+  parsed: boolean | null;
+  reviewed_base_sha: string | null;
+  reviewed_head_sha: string | null;
+  created_at: string | null;
+}
+
+export interface MissionTrust {
+  unresolved_findings: SeverityCounts;
+  unresolved_other: number;
+  unverified_repairs: number;
+  inherited_unresolved: number;
+  inherited_available: boolean;
+  review: ReviewSummary | null;
+  review_count: number;
 }
 
 export interface ReviewRecord {
