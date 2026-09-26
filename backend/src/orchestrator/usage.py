@@ -325,8 +325,44 @@ def parse_codex_cumulative_snapshot(
 # No verified usage-bearing fixture exists. Always UNKNOWN.
 
 
-def parse_agy_usage(_stdout_lines: list[str]) -> UsageSummary:
-    return unknown_usage("agy:telemetry-not-captured")
+def parse_agy_usage(stdout_lines: list[str]) -> UsageSummary:
+    """AGY's terminal ``{"event": "result", "result": {"usage": {...}}}`` line.
+
+    Observed (dogfood 2026-09-12): ``total_tokens == input_tokens +
+    output_tokens`` and ``cache_read_tokens`` exceeds ``input_tokens``, so cache
+    reads are separate from input and are added to the normalized input like
+    Claude's. Whether ``thinking_tokens`` is inside ``output_tokens`` is not
+    stated, so the summary is PARTIAL rather than claiming a complete output.
+    """
+    events = _json_lines(stdout_lines)
+    finals = [e for e in events if e.get("event") == "result" and isinstance(e.get("result"), dict)]
+    if not finals:
+        return unknown_usage("agy:telemetry-not-captured")
+    raw_usage = finals[-1]["result"].get("usage")
+    if not isinstance(raw_usage, dict):
+        return unknown_usage("agy:result-without-usage")
+    inp = _nonneg(raw_usage.get("input_tokens"))
+    outp = _nonneg(raw_usage.get("output_tokens"))
+    cache_read = _nonneg(raw_usage.get("cache_read_tokens"))
+    thinking = _nonneg(raw_usage.get("thinking_tokens"))
+    total = _nonneg(raw_usage.get("total_tokens"))
+    normalized_input: int | None = None
+    if inp is not None or cache_read is not None:
+        normalized_input = (inp or 0) + (cache_read or 0)
+    return UsageSummary(
+        input_tokens_total=normalized_input,
+        output_tokens_total=outp,
+        cache_read_input_tokens=cache_read,
+        reasoning_output_tokens=thinking,
+        native_total_tokens=total,
+        source="PROVIDER_REPORTED",
+        completeness="PARTIAL",
+        input_basis="FINAL_INVOCATION",
+        output_basis="FINAL_INVOCATION",
+        evidence_kind="agy:result.usage",
+        observations_count=len(finals),
+        native_counts={"usage": {k: v for k, v in raw_usage.items() if isinstance(v, (int, float, str))}},
+    )
 
 
 def parse_usage_for_provider(provider: str, stdout_lines: list[str]) -> UsageSummary:
