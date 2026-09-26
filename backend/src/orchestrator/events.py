@@ -35,6 +35,31 @@ TRANSIENT_TYPES = frozenset({EventType.PROVIDER_OUTPUT})
 
 #: Bounded per-mission replay buffer for transient events (lines).
 TRANSIENT_REPLAY_LIMIT = 500
+# Scheduling bookkeeping that never needs an operator's eyes.
+ROUTINE_EVENT_TYPES = frozenset(
+    {
+        EventType.PROVIDER_RESERVED,
+        EventType.PROVIDER_RELEASED,
+        EventType.LOCK_ACQUIRED,
+        EventType.LOCK_RELEASED,
+        EventType.WORKTREE_CREATED,
+        EventType.WORKTREE_REMOVED,
+        EventType.TASK_READY,
+        EventType.TASK_CLAIMED,
+        EventType.DAG_VALIDATED,
+        EventType.PROVIDER_SELECTED,
+    }
+)
+# Feed summaries only need short text; bound each string payload value.
+RECENT_PAYLOAD_TEXT_CHARS = 500
+
+
+def _bound_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: (v[:RECENT_PAYLOAD_TEXT_CHARS] if isinstance(v, str) else v)
+        for k, v in payload.items()
+        if isinstance(v, str | int | float | bool) or v is None
+    }
 
 
 class EventBus:
@@ -88,6 +113,31 @@ class EventBus:
     def transient_replay(self, mission_id: str) -> list[Event]:
         """The bounded in-memory tail of transient events for a mission."""
         return list(self._transient.get(mission_id, ()))
+
+    def recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Newest meaningful durable events across all missions, with titles.
+
+        Routine scheduling bookkeeping is excluded server-side so it cannot
+        crowd operator-relevant events out of the window. Transient provider
+        output is never persisted, so it never appears.
+        """
+        quiet = sorted(t.value for t in ROUTINE_EVENT_TYPES)
+        rows = self._db.query(
+            "SELECT e.id, e.mission_id, e.type, e.created_at, e.payload, m.title AS mission_title "  # noqa: S608
+            "FROM events e LEFT JOIN missions m ON m.id = e.mission_id "
+            f"WHERE e.type NOT IN ({','.join('?' for _ in quiet)}) "
+            "ORDER BY e.created_at DESC, e.rowid DESC LIMIT ?",
+            (*quiet, limit),
+        )
+        for row in rows:
+            payload: Any = {}
+            if isinstance(row.get("payload"), str):
+                try:
+                    payload = json.loads(row["payload"])
+                except json.JSONDecodeError:
+                    payload = {}
+            row["payload"] = _bound_payload(payload) if isinstance(payload, dict) else {}
+        return rows
 
     def history(self, mission_id: str, limit: int = 500, include_types: set[str] | None = None) -> list[dict[str, Any]]:
         sql = "SELECT * FROM events WHERE mission_id = ?"

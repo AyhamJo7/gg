@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from . import git_ops, integration, task_locks, task_worktree
 from .dag import DagValidationError, namespace_dag_ids, validate_planner_payload
 from .events import EventBus
+from .failover import failover_note_from_run
 from .handoff import persist_handoff, render_handoff
 from .models import (
     EventType,
@@ -378,8 +379,7 @@ class ParallelMissionEngine:
                         {
                             "status": TaskStatus.FAILED.value,
                             "blocking_issue": (
-                                f"permanently blocked: dependency {dep['from_task_id']} "
-                                f"{dep_task['status'].lower()}"
+                                f"permanently blocked: dependency {dep['from_task_id']} {dep_task['status'].lower()}"
                             ),
                         },
                     )
@@ -692,13 +692,22 @@ class ParallelMissionEngine:
         return await git_ops.head_sha(project_path)
 
     def _prior_findings_context(self) -> str:
-        """List prior findings with stable IDs so the reviewer can re-flag or verify each one."""
+        """List prior findings with stable IDs so the reviewer can re-flag or verify each one.
+
+        DOG-02: includes inherited unresolved findings from the retry lineage.
+        """
         rows = self.db.query(
             "SELECT id, severity, status, file, description, fingerprint FROM review_findings "
             "WHERE mission_id=? AND status IN ('open','repair_attempted') ORDER BY created_at ASC",
             (self.mission_id,),
         )
-        if not rows:
+        try:
+            from .review import inherited_open_findings as _inh3p
+
+            _inh_rows = _inh3p(self.db, self.mission_id)
+        except Exception:
+            _inh_rows = []
+        if not rows and not _inh_rows:
             return ""
         lines = [
             "## Prior findings (re-flag if still present, or verify fixed with evidence)",
@@ -709,6 +718,12 @@ class ParallelMissionEngine:
             f"{r['file'] or ''}: {r['description'][:300]}"
             for r in rows
         )
+        for r in _inh_rows:
+            lines.append(
+                f"- id={r['id']} fp={r.get('fingerprint') or '-'} [{r['severity']}/{r['status']}] "
+                f"{r['file'] or ''}: {r['description'][:300]}"
+                f" (inherited from {r.get('inherited_from_mission_id') or 'prior mission'})"
+            )
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -852,7 +867,6 @@ class ParallelMissionEngine:
         try:
             from .context_compiler import (
                 ContextCompileSpec,
-                finding_files,
                 finding_ids_in_text,
                 latest_candidate_shas,
                 prepare_invocation_context,
@@ -865,9 +879,16 @@ class ParallelMissionEngine:
             _p_cand: str | None = None
             _p_findings: list[str] = []
             _p_files: list[str] = []
+            _p_summary: str = ""
             if _stage in ("review", "repair"):
                 _p_base, _p_cand = latest_candidate_shas(self.db, self.mission_id)
-                _p_files = finding_files(self.db, self.mission_id)
+                if _p_base and _p_cand:
+                    try:
+                        _p_files = await git_ops.diff_names(project_path, _p_base, _p_cand, limit=100)
+                        _p_summary = await git_ops.diff_stat_range(project_path, _p_base, _p_cand)
+                    except Exception:
+                        logger.debug("review git context failed for %s", self.mission_id, exc_info=True)
+                        _p_files, _p_summary = [], ""
                 if _stage == "repair":
                     _p_findings = finding_ids_in_text(extra_context)
             _spec_cc = ContextCompileSpec(
@@ -880,8 +901,9 @@ class ParallelMissionEngine:
                 base_sha=_p_base,
                 candidate_sha=_p_cand,
                 git_files_changed=_p_files,
+                git_diff_summary=_p_summary,
                 finding_ids=_p_findings,
-                task_objective=f"{_mission.get('title', '')}\n{_mission.get('task', '')}",
+                task_objective=str(_mission.get("task", "")),
                 task_title=str(_mission.get("title", "")),
                 task_description=str(_mission.get("task", "")),
                 requirement_ids=resolve_phase_requirements(self.db, _product_id, _phase_id),
@@ -1029,7 +1051,9 @@ class ParallelMissionEngine:
             "SELECT summary FROM tasks WHERE mission_id=? AND status='COMPLETED' ORDER BY finished_at ASC",
             (self.mission_id,),
         )
-        completed_work = [r["summary"][:200] for r in completed_rows if r.get("summary")]
+        from .handoff import truncate_coherent as _coherent2
+
+        completed_work = [_coherent2(str(r.get("summary") or ""), 2000) for r in completed_rows if r.get("summary")]
 
         project_path = self._require_project_path()
         workspace = await inspect_workspace(project_path, self.config.allowed_roots())
@@ -1242,7 +1266,7 @@ class ParallelMissionEngine:
                     project_phase_id=_phase_id,
                     mission_id=self.mission_id,
                     provider=provider_name,
-                    task_objective=f"{_mission_dag.get('title', '')}\n{_mission_dag.get('task', '')}",
+                    task_objective=str(_mission_dag.get("task", "")),
                     task_title=str(_mission_dag.get("title", "")),
                     task_description=str(_mission_dag.get("task", "")),
                     extra_context=prompt,
@@ -1379,8 +1403,9 @@ class ParallelMissionEngine:
             _plan_st = await git_ops.status(project_path)
             if not _plan_st.is_clean:
                 max_mb = int(self.config.get("git.max_auto_commit_file_mb", 5))
-                await git_ops.checkpoint(project_path, f"agent({provider_name}): planning checkpoint",
-                                         max_file_mb=max_mb)
+                await git_ops.checkpoint(
+                    project_path, f"agent({provider_name}): planning checkpoint", max_file_mb=max_mb
+                )
         except git_ops.GitCheckpointError:
             # Bookkeeping failure feeds the shared exhaustion counter so
             # dirty-gates and final accounting see one world state.
@@ -1568,36 +1593,52 @@ class ParallelMissionEngine:
 
             dag_base = mission.get("dag_base_sha") or await self._ensure_dag_base(project_path)
             prepared = await prepare_task_input(
-                self.db, project_path, self.mission_id, tid, dag_base,
+                self.db,
+                project_path,
+                self.mission_id,
+                tid,
+                dag_base,
                 attempt_number=int(task.get("attempts") or 0),
             )
         except DependencyInputError as exc:
             if exc.code == "CONFLICT":
                 self.db.update(
-                    "tasks", tid,
-                    {"status": TaskStatus.FAILED.value,
-                     "blocking_issue": f"dependency integration conflict: {exc}"[:1000],
-                     "finished_at": utcnow().isoformat()},
+                    "tasks",
+                    tid,
+                    {
+                        "status": TaskStatus.FAILED.value,
+                        "blocking_issue": f"dependency integration conflict: {exc}"[:1000],
+                        "finished_at": utcnow().isoformat(),
+                    },
                 )
                 self.events.publish(
-                    EventType.MERGE_CONFLICT, mission_id=self.mission_id, task_id=tid,
-                    reason="dependency_input_conflict", detail=str(exc)[:500],
+                    EventType.MERGE_CONFLICT,
+                    mission_id=self.mission_id,
+                    task_id=tid,
+                    reason="dependency_input_conflict",
+                    detail=str(exc)[:500],
                 )
             else:
                 self.db.update(
-                    "tasks", tid,
-                    {"status": TaskStatus.FAILED.value,
-                     "blocking_issue": f"dependency artifact unavailable ({exc.code}): {exc}"[:1000],
-                     "finished_at": utcnow().isoformat()},
+                    "tasks",
+                    tid,
+                    {
+                        "status": TaskStatus.FAILED.value,
+                        "blocking_issue": f"dependency artifact unavailable ({exc.code}): {exc}"[:1000],
+                        "finished_at": utcnow().isoformat(),
+                    },
                 )
             return False
         except Exception as exc:
             logger.debug("dependency preparation failed for %s", tid, exc_info=True)
             self.db.update(
-                "tasks", tid,
-                {"status": TaskStatus.FAILED.value,
-                 "blocking_issue": f"dependency preparation failed: {exc}"[:1000],
-                 "finished_at": utcnow().isoformat()},
+                "tasks",
+                tid,
+                {
+                    "status": TaskStatus.FAILED.value,
+                    "blocking_issue": f"dependency preparation failed: {exc}"[:1000],
+                    "finished_at": utcnow().isoformat(),
+                },
             )
             return False
         self.db.update("tasks", tid, {"input_sha": prepared.input_sha})
@@ -1643,16 +1684,12 @@ class ParallelMissionEngine:
             _fresh_head: str | None = None
             try:
                 _fresh_head = (
-                    await git_ops.head_sha(Path(branch_record.worktree_path))
-                    if branch_record.worktree_path
-                    else None
+                    await git_ops.head_sha(Path(branch_record.worktree_path)) if branch_record.worktree_path else None
                 )
             except Exception:
                 _fresh_head = None
             if branch_record.base_commit != prepared.input_sha or _fresh_head != prepared.input_sha:
-                await task_worktree.remove_task_worktree(
-                    self.db, self.events, project_path, tid, keep_branch=True
-                )
+                await task_worktree.remove_task_worktree(self.db, self.events, project_path, tid, keep_branch=True)
                 branch_record = await task_worktree.create_task_worktree(
                     self.db, self.events, project_path, mission["id"], tid, base_commit=prepared.input_sha
                 )
@@ -1669,7 +1706,8 @@ class ParallelMissionEngine:
             release_provider_reservation(self.db, self.events, tid)
             task_locks.release_locks_for_task(self.db, self.events, tid)
             self.db.update(
-                "tasks", tid,
+                "tasks",
+                tid,
                 {"status": TaskStatus.FAILED.value, "blocking_issue": "worktree path missing"},
             )
             return False
@@ -1774,9 +1812,7 @@ class ParallelMissionEngine:
             tid = str(t.get("id"))
             if not t.get("input_sha") and not t.get("provider_run_id"):
                 try:
-                    _linked = self.db.query(
-                        "SELECT id FROM write_provenance WHERE task_id=? LIMIT 1", (tid,)
-                    )
+                    _linked = self.db.query("SELECT id FROM write_provenance WHERE task_id=? LIMIT 1", (tid,))
                 except Exception:
                     _linked = []
                 if not _linked:
@@ -1805,9 +1841,7 @@ class ParallelMissionEngine:
         resubmits them (task retry) into new attempts against current results.
         """
         try:
-            dependents = self.db.query(
-                "SELECT to_task_id FROM task_dependencies WHERE from_task_id=?", (task_id,)
-            )
+            dependents = self.db.query("SELECT to_task_id FROM task_dependencies WHERE from_task_id=?", (task_id,))
         except Exception:
             return
         for dep in dependents:
@@ -1828,14 +1862,20 @@ class ParallelMissionEngine:
             if contains:
                 continue
             self.db.update(
-                "tasks", tid,
-                {"status": TaskStatus.STALE.value,
-                 "blocking_issue": f"upstream {task_id} produced a newer result {(new_result_sha or '')[:8]}"
-                 " not contained in this attempt's input; resubmit for a new attempt"[:500],
-                 "finished_at": utcnow().isoformat()},
+                "tasks",
+                tid,
+                {
+                    "status": TaskStatus.STALE.value,
+                    "blocking_issue": f"upstream {task_id} produced a newer result {(new_result_sha or '')[:8]}"
+                    " not contained in this attempt's input; resubmit for a new attempt"[:500],
+                    "finished_at": utcnow().isoformat(),
+                },
             )
             self.events.publish(
-                EventType.TASK_FAILED, mission_id=self.mission_id, task_id=tid, reason="upstream_retry_stale",
+                EventType.TASK_FAILED,
+                mission_id=self.mission_id,
+                task_id=tid,
+                reason="upstream_retry_stale",
             )
 
     async def _task_runner(self, task_id: str, provider_name: str, worktree_path: str) -> None:
@@ -1911,9 +1951,7 @@ class ParallelMissionEngine:
             from .provenance import capture_write_start as _capture_task_start
 
             _, _task_dirty, _task_paths = await _capture_task_start(_wt)
-            _task_ckpt_failures = int(
-                (self.db.get("missions", self.mission_id) or {}).get("checkpoint_failures") or 0
-            )
+            _task_ckpt_failures = int((self.db.get("missions", self.mission_id) or {}).get("checkpoint_failures") or 0)
             if _task_dirty and _task_ckpt_failures == 0:
                 _agree_problem = (
                     f"task worktree has unattributed changes before provider run "
@@ -1977,6 +2015,18 @@ class ParallelMissionEngine:
                     _verified_map = await _verify_input_covers(self.db, _wt, _planned_input, _dep_list)
                 except Exception:
                     logger.debug("dependency presence proof failed for %s", task_id, exc_info=True)
+            # A retried task carries its previous failed run's partial report
+            # (never for review tasks: reviewer independence).
+            _task_failover = ""
+            if int(task.get("attempts") or 0) > 0 and str(task.get("role") or "") != Role.REVIEW.value:
+                # Newest run for the task: crash recovery never rewrites
+                # tasks.provider_run_id, so that column can point at an older run.
+                _last_runs = self.db.query(
+                    "SELECT * FROM provider_runs WHERE mission_id=? AND task_id=? "
+                    "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                    (self.mission_id, task_id),
+                )
+                _task_failover = failover_note_from_run(_last_runs[0] if _last_runs else None)
             _task_ctx_spec = ContextCompileSpec(
                 role=role_for_stage(STAGE_TASK, str(task.get("role", "implementation"))),
                 stage=STAGE_TASK,
@@ -1986,13 +2036,14 @@ class ParallelMissionEngine:
                 task_id=task_id,
                 provider=provider_name,
                 base_sha=_planned_input or task.get("checkpoint_before") or None,
-                task_objective=f"{task.get('title', '')}\n{task.get('description', '')}",
+                task_objective=str(task.get("description", "")),
                 task_title=str(task.get("title", "")),
                 task_description=str(task.get("description", "")),
                 requirement_ids=resolve_phase_requirements(self.db, _product_id, _phase_id),
                 dependency_ids=_dep_list,
                 dependency_verified=_verified_map,
                 workspace_scope=list(_scope) if isinstance(_scope, list) else [],
+                failover_text=_task_failover,
             )
             prompt, _task_ctx = prepare_invocation_context(
                 legacy_prompt=prompt, spec=_task_ctx_spec, db=self.db, config=self.config
@@ -2113,14 +2164,19 @@ class ParallelMissionEngine:
                 release_provider_reservation(self.db, self.events, task_id, run_id)
                 task_locks.release_locks_for_task(self.db, self.events, task_id)
                 self.db.update(
-                    "tasks", task_id,
-                    {"status": TaskStatus.FAILED.value,
-                     "blocking_issue": f"provider rewrote task history (input {_planned_input[:8]}"
-                     f" not ancestor of result {(commit_after or '')[:8]}); output rejected"[:1000],
-                     "finished_at": utcnow().isoformat()},
+                    "tasks",
+                    task_id,
+                    {
+                        "status": TaskStatus.FAILED.value,
+                        "blocking_issue": f"provider rewrote task history (input {_planned_input[:8]}"
+                        f" not ancestor of result {(commit_after or '')[:8]}); output rejected"[:1000],
+                        "finished_at": utcnow().isoformat(),
+                    },
                 )
                 self.events.publish(
-                    EventType.TASK_FAILED, mission_id=self.mission_id, task_id=task_id,
+                    EventType.TASK_FAILED,
+                    mission_id=self.mission_id,
+                    task_id=task_id,
                     reason="history_rewrite_rejected",
                 )
                 return
@@ -2178,15 +2234,23 @@ class ParallelMissionEngine:
 
             _cap_result, _cap_tree, _cap_ident = await capture_write_state(Path(worktree_path))
             if _cap_result != _final_result:
-                logger.debug(
-                    "task %s HEAD moved during checkpoint (%s -> %s)", task_id, _final_result, _cap_result
-                )
+                logger.debug("task %s HEAD moved during checkpoint (%s -> %s)", task_id, _final_result, _cap_result)
             try:
                 record_write(
-                    self.db, run_id=run_id, mission_id=self.mission_id, task_id=task_id,
-                    product_project_id=_product_id, phase_id=_phase_id, actor_type=_ACTOR_PROV,
-                    actor_detail="", provider=provider_name, role=role.value, base_sha=commit_before,
-                    result_sha=_final_result, tree_sha=_cap_tree, repo_key_value=_cap_ident,
+                    self.db,
+                    run_id=run_id,
+                    mission_id=self.mission_id,
+                    task_id=task_id,
+                    product_project_id=_product_id,
+                    phase_id=_phase_id,
+                    actor_type=_ACTOR_PROV,
+                    actor_detail="",
+                    provider=provider_name,
+                    role=role.value,
+                    base_sha=commit_before,
+                    result_sha=_final_result,
+                    tree_sha=_cap_tree,
+                    repo_key_value=_cap_ident,
                 )
             except Exception:
                 logger.debug("task write row insert failed for %s", task_id, exc_info=True)

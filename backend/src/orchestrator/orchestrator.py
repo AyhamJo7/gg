@@ -393,8 +393,102 @@ class Orchestrator:
         )
         # Track lineage
         self.db.update("missions", new_mission["id"], {"retry_of_mission_id": mission_id})
+        try:
+            self._inherit_retry_findings(mission_id, new_mission["id"])
+        except Exception:
+            logger.debug("retry finding inheritance failed for %s", mission_id, exc_info=True)
         self.start_mission(new_mission["id"])
         return self.db.get("missions", new_mission["id"]) or new_mission
+
+    def _inherit_retry_findings(self, parent_mission_id: str, retry_mission_id: str) -> int:
+        """Seed retry with unresolved ancestor findings (DOG-02, AGY-F1).
+
+        Uses the shared nearest-ancestor helper, so copy-time semantics equal
+        query-time visibility: for each fingerprint the nearest ancestor
+        holding any row is authoritative; only nearest states of
+        open/repair_attempted are copied. A nearer RESOLVED/wontfix ancestor
+        suppresses older OPEN rows (no resurrection). Historical rows are
+        never mutated; chains do not multiply because fingerprints already
+        present locally are skipped. parent_mission_id anchors the chain for
+        callers that have not yet persisted retry_of_mission_id.
+        """
+        from .review import inherited_open_findings, nearest_ancestor_finding_states
+
+        try:
+            retry_row = self.db.get("missions", retry_mission_id)
+        except Exception:
+            retry_row = None
+        if not retry_row or not retry_row.get("retry_of_mission_id"):
+            try:
+                self.db.update("missions", retry_mission_id, {"retry_of_mission_id": parent_mission_id})
+            except Exception:
+                logger.debug("retry lineage link failed for %s", retry_mission_id, exc_info=True)
+        # Nearest-first authoritative states (same helper as query-time).
+        try:
+            states = nearest_ancestor_finding_states(self.db, retry_mission_id)
+        except Exception:
+            logger.debug("retry ancestor states failed for %s", retry_mission_id, exc_info=True)
+            return 0
+        wanted: dict[str, dict[str, Any]] = {}
+        for fp, info in states.items():
+            row = info.get("row") or {}
+            if str(row.get("status") or "") not in ("open", "repair_attempted"):
+                continue
+            wanted[fp] = dict(row)
+        if not wanted:
+            return 0
+        import uuid as _uuid
+
+        from .models import utcnow as _utcnow
+
+        copied = 0
+        for fp, src in wanted.items():
+            try:
+                exists = self.db.query(
+                    "SELECT id FROM review_findings WHERE mission_id=? AND fingerprint=? LIMIT 1",
+                    (retry_mission_id, fp),
+                )
+                if exists:
+                    continue
+                now = _utcnow().isoformat()
+                payload: dict[str, Any] = {
+                    "id": f"f-{_uuid.uuid4().hex[:12]}",
+                    "mission_id": retry_mission_id,
+                    "severity": str(src.get("severity") or "MEDIUM"),
+                    "category": str(src.get("category") or "general"),
+                    "file": src.get("file"),
+                    "description": str(src.get("description") or ""),
+                    "recommended_fix": str(src.get("recommended_fix") or ""),
+                    "status": str(src.get("status") or "open"),
+                    "fingerprint": fp,
+                    "created_at": now,
+                    "inherited_from_mission_id": str(src.get("mission_id") or parent_mission_id),
+                    "inherited_from_finding_id": str(src.get("id") or ""),
+                }
+                # Preserve origin lineage when present.
+                for k in ("origin_review_id", "origin_sha", "verified_by"):
+                    try:
+                        if src.get(k) is not None:
+                            payload[k] = src.get(k)
+                    except Exception:
+                        logger.debug("origin preserve failed for %s", k, exc_info=True)
+                try:
+                    self.db.insert("review_findings", payload)
+                except Exception:
+                    # Pre-migration DBs: retry still inherits without lineage.
+                    for k in ("inherited_from_mission_id", "inherited_from_finding_id"):
+                        payload.pop(k, None)
+                    self.db.insert("review_findings", payload)
+                copied += 1
+            except Exception:
+                logger.debug("retry finding copy failed for %s", fp, exc_info=True)
+                continue
+        # Ensure query-time fallback also sees them (no-op when copies exist).
+        try:
+            _ = inherited_open_findings(self.db, retry_mission_id)
+        except Exception:
+            logger.debug("inherited lookup after copy failed", exc_info=True)
+        return copied
 
     def resolve_gate(self, gate_id: str, resolution: str) -> None:
         gate = self.db.get("human_gates", gate_id)

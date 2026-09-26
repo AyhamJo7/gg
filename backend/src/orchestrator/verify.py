@@ -19,6 +19,7 @@ host — there is no unsandboxed fallback.
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +51,41 @@ def _is_environment_failure(tail: str) -> bool:
     return any(marker in tail for marker in _ENVIRONMENT_FAILURE_MARKERS)
 
 
+# Test-runner summary lines that report skipped tests. Exit code stays the
+# oracle for pass/fail; this is accounting so "passed with N skipped" is never
+# recorded as indistinguishable from a clean pass. Patterns are anchored to
+# each runner's per-test summary line (not file/suite lines, not log prose).
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_SKIP_SUMMARIES = (
+    # pytest: "324 passed, 30 skipped in 5.31s" (optionally framed by ====).
+    re.compile(r"^=*\s*(?:\d+ [a-z]+(?:, )?)*?(\d+) skipped(?:, \d+ [a-z]+)* in [\d.]+s\b"),
+    # vitest: "Tests  137 passed | 2 skipped (139)" — not "Test Files".
+    re.compile(r"^Tests\s{2,}.*?\b(\d+) skipped\b"),
+    # jest: "Tests:       2 skipped, 10 passed, 12 total" — not "Test Suites:".
+    re.compile(r"^Tests:\s.*?\b(\d+) skipped\b"),
+    # cargo: "test result: ok. 12 passed; 0 failed; 3 ignored; ..."
+    re.compile(r"^test result:.*?\b(\d+) ignored\b"),
+)
+
+
+# Repo-controlled output: an implausible count is unknown, never stored.
+SKIP_COUNT_MAX = 1_000_000
+
+
+def count_skipped(tail: str) -> int | None:
+    """Skipped tests reported in a runner summary; None when not reported."""
+    total: int | None = None
+    for raw in tail.splitlines():
+        line = _ANSI.sub("", raw).strip()
+        for pattern in _SKIP_SUMMARIES:
+            if m := pattern.search(line):
+                total = (total or 0) + int(m.group(1))
+                break
+    if total is not None and total > SKIP_COUNT_MAX:
+        return None
+    return total
+
+
 @dataclass
 class CommandResult:
     command: str
@@ -58,6 +94,7 @@ class CommandResult:
     duration_s: float
     tail: str = ""
     likely_environment_issue: bool = False
+    skipped: int | None = None
 
 
 @dataclass
@@ -72,11 +109,17 @@ class VerificationReport:
     def attempted(self) -> bool:
         return bool(self.results)
 
+    @property
+    def skipped_total(self) -> int | None:
+        counts = [r.skipped for r in self.results if r.skipped is not None]
+        return sum(counts) if counts else None
+
     def summary(self) -> str:
         lines = []
         for r in self.results:
             mark = "PASS" if r.passed else "FAIL"
-            lines.append(f"[{mark}] {r.command} (exit={r.exit_code}, {r.duration_s:.1f}s)")
+            skipped = f", {r.skipped} skipped" if r.skipped else ""
+            lines.append(f"[{mark}] {r.command} (exit={r.exit_code}, {r.duration_s:.1f}s{skipped})")
         return "\n".join(lines)
 
 
@@ -101,28 +144,32 @@ def _persist_verification_attempt(
         return None
     attempt_id = f"ver-{_uuid.uuid4().hex[:12]}"
     failed = [r for r in report.results if not r.passed]
+    row = {
+        "id": attempt_id,
+        "mission_id": mission_id or None,
+        "product_project_id": product_project_id,
+        "task_id": task_id,
+        "sha": sha.lower(),
+        "repo_key": repo_key,
+        "kind": kind,
+        "commands_json": _json.dumps([r.command for r in report.results]),
+        "status": "passed" if report.all_passed else "failed",
+        "exit_code": failed[0].exit_code if failed else 0,
+        "started_at": started_at,
+        "finished_at": utcnow().isoformat(),
+        "summary": report.summary()[:2000],
+        "skipped_tests": report.skipped_total,
+    }
     try:
-        db.insert(
-            "verification_attempts",
-            {
-                "id": attempt_id,
-                "mission_id": mission_id or None,
-                "product_project_id": product_project_id,
-                "task_id": task_id,
-                "sha": sha.lower(),
-                "repo_key": repo_key,
-                "kind": kind,
-                "commands_json": _json.dumps([r.command for r in report.results]),
-                "status": "passed" if report.all_passed else "failed",
-                "exit_code": failed[0].exit_code if failed else 0,
-                "started_at": started_at,
-                "finished_at": utcnow().isoformat(),
-                "summary": report.summary()[:2000],
-            },
-        )
+        db.insert("verification_attempts", row)
     except Exception:
-        logger.debug("verification attempt insert failed", exc_info=True)
-        return None
+        # Accounting must never cost the SHA-bound record itself.
+        logger.warning("verification attempt insert failed; retrying without skip count", exc_info=True)
+        try:
+            db.insert("verification_attempts", {k: v for k, v in row.items() if k != "skipped_tests"})
+        except Exception:
+            logger.warning("verification attempt insert failed", exc_info=True)
+            return None
     return attempt_id
 
 
@@ -192,6 +239,7 @@ async def run_verification(
                 duration_s=result.duration_s,
                 tail=tail,
                 likely_environment_issue=(not passed) and _is_environment_failure(tail),
+                skipped=count_skipped(tail),
             )
         )
         _ = db  # events are persisted by EventBus.publish; db kept for API symmetry
@@ -200,6 +248,7 @@ async def run_verification(
             mission_id,
             command=command,
             exit_code=result.exit_code,
+            skipped=report.results[-1].skipped,
         )
     _persist_verification_attempt(
         db,

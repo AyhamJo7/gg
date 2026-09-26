@@ -7,7 +7,7 @@ Runtime baseline: `649e67e` (Increments 1–4, including dependency correctness
 behavior.
 
 ```text
-React / HashRouter ── REST /api/* (+ /api/runs, /api/analytics/usage) and mission WebSocket
+React / HashRouter ── REST /api/* (+ /api/runs, /api/analytics/usage, relay, events/recent) and mission + global WebSockets
         │
 FastAPI api/app.py + shared local bearer token
         │
@@ -59,13 +59,13 @@ Missions own tasks, runs, handoffs, findings, reviews, and mission gates.
 DAG edges, reservations, locks, branches, and integrations support parallel work.
 `provider_profiles` exists in the schema but is not used by routing.
 
-`db.py` uses one SQLite connection, WAL, foreign keys and a thread lock. Sixteen
+`db.py` uses one SQLite connection, WAL, foreign keys and a thread lock. Nineteen
 numbered migrations are applied at startup (0010: run attribution/stage/status/
 model columns, `run_context_manifests`, `run_usage`, `invocation_leases`,
 `orchestration_operations`; 0011: compiler manifest columns — budget/used/
 remaining estimates, repeated-context ratio, warnings, plan revision;
 0012–0013: artifact evidence/provenance and repository scope; 0014: dependency
-artifacts; 0015: repair cycles/attempts; 0016: product pause). Individual database
+artifacts; 0015: repair cycles/attempts; 0016: product pause; 0017: retry finding lineage; 0018: events recency index; 0019: verification skipped-test counts). Individual database
 calls usually commit separately; multi-step lifecycle mutations are not all atomic
 transactions. Run one backend owner per state directory; multi-process scheduling
 is unsupported. Historical runs keep NULL/UNKNOWN telemetry; never zero-filled.
@@ -166,6 +166,18 @@ mission/finding/provider counts and adds `/api/analytics/usage` coverage,
 repeated-context ratio, compilation warnings; legacy vs compiled), plus
 `/api/runs` inspection with a read-only Context view (blocks, budget, omissions,
 warnings — never raw prompts); unknown telemetry is shown as unknown, never zero.
+
+Operator read models (`mission_summary.py`, `relay.py`; presentation only, no
+policy): mission list/detail carry `trust` — open vs repair-claimed findings by
+severity (including retry lineage; broken lineage is reported unavailable),
+latest review independence with writer-set evidence — so `COMPLETED` with
+caveats never renders as clean. List trust is computed only for terminal
+missions and memoized. `/api/missions/{id}/relay` returns the provider chain
+(runs with manifest metadata and evidence-labelled flags, bounded redacted
+handoff previews, reviews, finding lineage); `/handoffs/{hid}` serves one
+capped, redacted handoff. `/api/events/recent` seeds the UI activity feed,
+which then follows `/ws/events`. Every finding surface goes through one
+redacting allow-list serializer.
 
 ## Artifact evidence and writer provenance
 

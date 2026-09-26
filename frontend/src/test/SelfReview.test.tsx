@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { Badge } from "../components/Badge";
-import { statusColor } from "../components/Badge";
+import { statusColor } from "../lib/status";
 
 describe("self-review disclosure", () => {
   it("SELF-REVIEW badge renders with warning color", () => {

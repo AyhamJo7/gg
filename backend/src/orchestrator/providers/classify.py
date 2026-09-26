@@ -6,7 +6,9 @@ Order matters: first match wins (most specific first).
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import UTC, datetime, timedelta
 
 from ..models import FailureClass, ProviderState
 
@@ -159,3 +161,118 @@ def classify_output(
     if exit_code is None:
         return FailureClass.CRASH
     return FailureClass.NONE
+
+
+# -- Provider-stated reset times ---------------------------------------------
+# Providers often print when a limit lifts ("try again at 6:37 AM", "try
+# again in 3 days 4 hours"). The registry uses this only as a floor on its own
+# exponential cooldown (never to shorten it) and caps it by config. Only lines
+# that themselves carry a limit signal are read, and the LAST such line wins:
+# model-streamed prose earlier in the tail must not set the provider's
+# cooldown. Wall-clock times carry no zone and are read as the host's local
+# time (the CLI runs on this host); a 12-hour time without AM/PM takes the
+# sooner of its two readings.
+MAX_PROVIDER_RESET_S = 24 * 60 * 60
+# Bounded combined stdout+stderr tail kept on ExecutionResult.raw_tail.
+RAW_TAIL_CHARS = 4000
+HOURS_PER_HALF_DAY = 12
+_SECONDS_PER_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+_RESET_AT = re.compile(r"try again at\s+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?", re.IGNORECASE)
+_DURATION_PART = r"(\d+(?:\.\d+)?)\s*(s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)\b"
+_RESET_IN = re.compile(
+    rf"(?:try again|retry|resets?)\s+in\s+((?:{_DURATION_PART}[\s,]*(?:and\s+)?)+)",
+    re.IGNORECASE,
+)
+_DURATION_ITEM = re.compile(_DURATION_PART, re.IGNORECASE)
+_RETRY_AFTER = re.compile(r"retry[- ]after[:=\s]+(\d+)\b", re.IGNORECASE)
+
+
+def _is_limit_line(line: str) -> bool:
+    return bool(_RATE_LIMIT_PATTERNS.search(line) or _QUOTA_PATTERNS.search(line))
+
+
+def _wall_clock_seconds(hour: int, minute: int, meridiem: str, now: datetime) -> float | None:
+    if minute >= 60:
+        return None
+    candidates: list[int] = []
+    if meridiem:
+        if hour > HOURS_PER_HALF_DAY or hour == 0:
+            return None
+        candidates = [hour % HOURS_PER_HALF_DAY + (HOURS_PER_HALF_DAY if meridiem == "pm" else 0)]
+    elif hour < 24:
+        candidates = [hour]
+        if 0 < hour <= HOURS_PER_HALF_DAY:
+            candidates.append((hour + HOURS_PER_HALF_DAY) % 24)
+    best: float | None = None
+    for h in candidates:
+        # Build the wall-clock target naively and localize it, so a reset on
+        # the other side of a DST change gets its own UTC offset.
+        naive = now.replace(tzinfo=None, hour=h, minute=minute, second=0, microsecond=0)
+        target = naive.astimezone()
+        if target <= now:
+            target = (naive + timedelta(days=1)).astimezone()
+        delta = (target - now).total_seconds()
+        best = delta if best is None else min(best, delta)
+    return best
+
+
+def _line_reset_seconds(line: str, now: datetime) -> float | None:
+    if m := _RESET_AT.search(line):
+        meridiem = (m.group(3) or "").lower().replace(".", "")
+        return _wall_clock_seconds(int(m.group(1)), int(m.group(2)), meridiem, now)
+    if m := _RESET_IN.search(line):
+        return sum(
+            float(part.group(1)) * _SECONDS_PER_UNIT[part.group(2)[0].lower()]
+            for part in _DURATION_ITEM.finditer(m.group(1))
+        )
+    if m := _RETRY_AFTER.search(line):
+        return float(m.group(1))
+    return None
+
+
+_ERROR_EVENT_MARKERS = ("error", "fail")
+
+
+def _cli_error_text(line: str) -> str | None:
+    """Text of a line the CLI (not the model) wrote, or None to skip it.
+
+    Structured stream events are trusted only through their error payload;
+    assistant/message/result events carry model-written text and are skipped.
+    Plain-text lines cannot be told apart and are read, bounded by the cap.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("{"):
+        return line
+    try:
+        event = json.loads(stripped)
+    except json.JSONDecodeError:
+        # A broken event is not the CLI's own plain-text error line.
+        return None
+    if not isinstance(event, dict):
+        return None
+    if "error" in event:
+        return json.dumps(event["error"]) if not isinstance(event["error"], str) else event["error"]
+    kind = str(event.get("type") or event.get("event") or "").lower()
+    if any(marker in kind for marker in _ERROR_EVENT_MARKERS):
+        return stripped
+    return None
+
+
+def parse_reset_after(text: str, now: datetime | None = None, cap_s: float = MAX_PROVIDER_RESET_S) -> float | None:
+    """Seconds until the provider's own limit message says it resets, or None."""
+    if not text:
+        return None
+    local_now = (now or datetime.now(UTC)).astimezone()
+    lines = text.splitlines()
+    if len(text) >= RAW_TAIL_CHARS and lines:
+        # A full-size tail starts mid-line: its first line is a fragment of
+        # something (often a model event) whose origin cannot be known.
+        lines = lines[1:]
+    for raw_line in reversed(lines):
+        line = _cli_error_text(raw_line)
+        if line is None or not _is_limit_line(line):
+            continue
+        seconds = _line_reset_seconds(line, local_now)
+        if seconds is not None and seconds > 0:
+            return min(seconds, cap_s)
+    return None

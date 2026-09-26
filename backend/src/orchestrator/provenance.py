@@ -620,6 +620,77 @@ def latest_review_for_mission(db: Any, mission_id: str) -> dict[str, Any] | None
     return dict(rows[0]) if rows else None
 
 
+def mission_review_range(db: Any, mission_id: str | None) -> tuple[str | None, str | None]:
+    """Canonical reviewed artifact range: earliest base .. latest candidate tip.
+
+    Single source of truth for DOG-01: the reviewer prompt (via
+    context_compiler.latest_candidate_shas) and the persisted review row
+    (via record_review_attempt) must observe the exact same range. Base is
+    the earliest write_provenance.base_sha (so the first implementation
+    commit is inside the range, not excluded); head is the latest
+    post-checkpoint tip from write_provenance (review runs excluded so a
+    reviewer’s own commit never shifts the range it was asked to judge).
+    provider_runs git_commit_after is pre-checkpoint (stale by one commit)
+    and must not define the range. Returns raw stored values (no SHA
+    normalization) so prompt and ledger compare equal even for
+    non-canonical test SHAs.
+    """
+    if not mission_id:
+        return None, None
+    try:
+        bases = db.query(
+            "SELECT base_sha FROM write_provenance WHERE mission_id=? AND base_sha IS NOT NULL"
+            " AND base_sha != '' ORDER BY created_at ASC, rowid ASC LIMIT 1",
+            (mission_id,),
+        )
+    except Exception:
+        bases = []
+    base = bases[0].get("base_sha") if bases else None
+    try:
+        tips = db.query(
+            "SELECT result_sha FROM write_provenance WHERE mission_id=? AND result_sha IS NOT NULL"
+            " AND result_sha != '' AND (role IS NULL OR role != 'review')"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (mission_id,),
+        )
+    except Exception:
+        tips = []
+    head = tips[0].get("result_sha") if tips else None
+    if head:
+        return (base or None), head
+    # Fallback for missions without write rows yet (historical compatibility
+    # only; write provenance is authoritative when available). AGY-F2: span
+    # the full writer history — earliest writer base .. latest writer tip —
+    # never just the latest run, which would drop earlier commits. Review
+    # runs are excluded so they cannot shift the candidate head. Deterministic
+    # secondary key (rowid) breaks started_at ties the same way every read.
+    try:
+        first = db.query(
+            "SELECT git_commit_before FROM provider_runs WHERE mission_id=?"
+            " AND failure_class='NONE' AND role IN ('implementation','task','testing','repair')"
+            " ORDER BY started_at ASC, rowid ASC LIMIT 1",
+            (mission_id,),
+        )
+    except Exception:
+        return base or None, None
+    try:
+        last = db.query(
+            "SELECT git_commit_before, git_commit_after FROM provider_runs WHERE mission_id=?"
+            " AND failure_class='NONE' AND role IN ('implementation','task','testing','repair')"
+            " ORDER BY started_at DESC, rowid DESC LIMIT 1",
+            (mission_id,),
+        )
+    except Exception:
+        return base or None, None
+    if not first and not last:
+        return base or None, None
+    _fb_base = base or (first[0].get("git_commit_before") if first else None)
+    _fb_head = None
+    if last:
+        _fb_head = last[0].get("git_commit_after") or last[0].get("git_commit_before")
+    return (_fb_base or None), (_fb_head or None)
+
+
 async def record_review_attempt(
     db: Any,
     events: Any,
@@ -648,7 +719,13 @@ async def record_review_attempt(
         return None
     run = runs[0]
     reviewer = str(run.get("provider") or "")
-    reviewed_head = normalize_sha(run.get("git_commit_before")) or normalize_sha(run.get("git_commit_after"))
+    # DOG-01: persisted range must equal the prompt range. Both sides use
+    # mission_review_range (earliest base .. latest candidate tip). The
+    # reviewer's own run SHAs are not used: a reviewer commit must not shift
+    # the artifact it was asked to judge.
+    _range_base, _range_head = mission_review_range(db, mission_id)
+    reviewed_base = _range_base
+    reviewed_head = _range_head
 
     impl_rows = db.query(
         "SELECT provider FROM provider_runs WHERE mission_id=? AND role='implementation'"
@@ -658,22 +735,13 @@ async def record_review_attempt(
     implementer = str(impl_rows[0]["provider"]) if impl_rows else None
 
     writers, complete = mission_provider_writers(db, mission_id)
-    earliest_base: str | None = None
-    if writers or complete:
-        bases = db.query(
-            "SELECT base_sha FROM write_provenance WHERE mission_id=? AND base_sha IS NOT NULL"
-            " ORDER BY created_at ASC LIMIT 1",
-            (mission_id,),
-        )
-        if bases:
-            earliest_base = normalize_sha(bases[0].get("base_sha"))
-    reviewed_base = earliest_base or reviewed_head
 
     # Exact range writers when the repo is available (stronger than the
-    # mission-wide approximation above).
+    # mission-wide approximation above). Unknown range never certifies:
+    # fail closed instead of recording coverage the reviewer never saw.
     range_writers_set = set(writers)
     range_detail: list[dict[str, Any]] = []
-    range_complete = complete
+    range_complete = complete and bool(reviewed_base) and bool(reviewed_head)
     if repo is not None and reviewed_base and reviewed_head:
         from . import git_ops
 

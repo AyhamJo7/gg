@@ -17,7 +17,9 @@ import { Terminal } from "../components/Terminal";
 import { WorkflowTimeline } from "../components/WorkflowTimeline";
 import { TERMINAL_TASK_STATUSES, type Mission } from "../lib/types";
 import { RunInspector } from "../components/RunInspector";
-import { operatorLabel } from "../lib/operator";
+import { AgentRelaySection } from "../components/AgentRelay";
+import { operatorLabel, TERMINAL_MISSION_STATES } from "../lib/operator";
+import { MissionVerdictBadge, ReviewTrustCard } from "../components/MissionVerdict";
 
 function MissionHeader({ mission }: { mission: Mission }) {
   const active = !["COMPLETED", "FAILED", "CANCELLED", "PAUSED", "UNVERIFIED"].includes(mission.status);
@@ -29,6 +31,7 @@ function MissionHeader({ mission }: { mission: Mission }) {
         <details><summary>Mission objective</summary><p className="muted">{mission.task}</p></details>
         <div className="row" style={{ marginTop: 4, gap: 8 }}>
           <Badge value={mission.status} pulse={active} />
+          {TERMINAL_MISSION_STATES.has(mission.status) && <MissionVerdictBadge mission={mission} />}
           {mission.scheduling_mode === "PARALLEL_SAFE" && <Badge value="PARALLEL" />}
           <span className="mono muted">{active ? `Elapsed ${elapsed}` : mission.finished_at ? `Finished ${new Date(mission.finished_at).toLocaleString()}` : "Not running"}</span>
         </div>
@@ -77,6 +80,17 @@ export function MissionControlPage() {
     finally { setBusy(false); }
   };
 
+  const retry = async () => {
+    if (!mission) return;
+    setBusy(true); setActionError(null);
+    try { const newM = await api.missions.retry(mission.id); setSelectedId(newM.id); refreshMissions(); }
+    catch (e) { setActionError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+  const retryable = !!mission && ["FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status);
+  // Retry is idempotent: an existing retry is opened, never re-created.
+  const existingRetry = mission ? missions?.find((m) => m.retry_of_mission_id === mission.id) ?? null : null;
+
   const refreshAll = () => {
     refreshMissions();
     refreshDetail();
@@ -116,25 +130,15 @@ export function MissionControlPage() {
         {mission && !["COMPLETED", "FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status) && (
           <>
             {mission.status === "PAUSED" ? (
-              <button disabled={busy} onClick={() => act("resume")}>▶ Resume</button>
+              <button disabled={busy} onClick={() => act("resume")}>Resume</button>
             ) : (
-              <button disabled={busy} onClick={() => act("pause")}>⏸ Pause</button>
+              <button disabled={busy} onClick={() => act("pause")}>Pause</button>
             )}
-            <button disabled={busy} className="danger" onClick={() => act("cancel")}>✕ Cancel</button>
+            <button disabled={busy} className="danger" onClick={() => act("cancel")}>Cancel mission</button>
           </>
         )}
-        {mission && ["FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status) && (
-          <button
-            onClick={async () => {
-              setBusy(true); setActionError(null);
-              try { const newM = await api.missions.retry(mission.id); setSelectedId(newM.id); refreshMissions(); }
-              catch (e) { setActionError(e instanceof Error ? e.message : String(e)); }
-              finally { setBusy(false); }
-            }}
-            disabled={busy}
-          >
-            🔄 Retry
-          </button>
+        {retryable && !existingRetry && (
+          <button onClick={retry} disabled={busy}>Retry mission</button>
         )}
       </div>
 
@@ -152,23 +156,34 @@ export function MissionControlPage() {
 
           {mission.blocking_issue && !openGate && (
             <div className="card" style={{ borderColor: "var(--orange)" }}>
-              <h3>Blocking issue</h3>
-              <pre className="muted" style={{ whiteSpace: "pre-wrap", margin: 0 }}>{mission.blocking_issue}</pre>
+              <div className="row spread">
+                <h3>Blocking issue</h3>
+                {retryable && existingRetry && <button className="primary" onClick={() => setSelectedId(existingRetry.id)}>Open retry</button>}
+                {retryable && !existingRetry && <button className="primary" onClick={retry} disabled={busy}>Retry mission</button>}
+              </div>
+              <pre className="muted scroll-box" style={{ margin: 0 }}>{mission.blocking_issue}</pre>
+              {retryable && !existingRetry && <p className="muted">A retry starts a new mission that inherits unresolved findings; fix the cause above first if it is environmental.</p>}
+              {retryable && existingRetry && <p className="muted">This mission was already retried as “{existingRetry.title}” ({operatorLabel(existingRetry.status).toLowerCase()}).</p>}
             </div>
           )}
 
-          {detail?.degraded_review && detail.latest_review && (
-            <div className="card" style={{ borderColor: "var(--orange)" }} data-testid="self-review-warning">
-              <div className="row">
-                <Badge value="SELF-REVIEW" />
-                <strong>DEGRADED REVIEW — independent reviewer unavailable</strong>
-              </div>
-              <p className="muted" style={{ margin: "6px 0 0" }}>
-                Reviewer <span className="mono">{detail.latest_review.review_provider}</span> also performed the
-                implementation. {detail.latest_review.degradation_reason}
+          {detail?.trust?.review ? (
+            <ReviewTrustCard review={detail.trust.review} />
+          ) : detail?.degraded_review && detail.latest_review && (
+            <div className="card attention-card" data-testid="review-trust-warning">
+              <strong>Review not certified as independent</strong>
+              <p className="muted">
+                Reviewer <span className="mono">{detail.latest_review.review_provider}</span>. Recorded reason:{" "}
+                {detail.latest_review.degradation_reason || "No reason was recorded."}
               </p>
             </div>
           )}
+
+          <AgentRelaySection
+            missionId={mission.id}
+            running={!TERMINAL_MISSION_STATES.has(mission.status) && !["PAUSED", "WAITING_FOR_HUMAN"].includes(mission.status)}
+            onInspectRun={(id) => { setInspectedRunId(id); document.getElementById("provider-runs")?.scrollIntoView({ behavior: "smooth" }); }}
+          />
 
           {isParallel && dag && (
             <div className="card">
@@ -206,7 +221,7 @@ export function MissionControlPage() {
                         <Badge value={detail.tasks[detail.tasks.length - 1].role} />
                         <Badge value={detail.tasks[detail.tasks.length - 1].status} />
                       </div>
-                      <p className="muted" style={{ marginTop: 8 }}>
+                      <p className="muted scroll-box" style={{ marginTop: 8 }}>
                         {detail.tasks[detail.tasks.length - 1].summary || "Running…"}
                       </p>
                     </>
@@ -221,7 +236,7 @@ export function MissionControlPage() {
               )}
             </div>
             <div className="stack">
-              <ReviewFindingsPanel findings={detail?.findings ?? []} />
+              <ReviewFindingsPanel findings={detail?.findings ?? []} inherited={detail ? detail.inherited_findings ?? [] : []} />
               <div className="card">
                 <h3>Git ledger</h3>
                 <GitPanel git={git ?? null} />
@@ -244,7 +259,7 @@ export function MissionControlPage() {
           )}
 
           {detail && detail.runs.length > 0 && (
-            <div className="card">
+            <div className="card" id="provider-runs">
               <h3>Provider runs</h3>
               <table>
                 <thead>

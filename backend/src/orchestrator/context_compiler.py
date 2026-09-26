@@ -166,6 +166,10 @@ class ContextCompileSpec:
     # absent entries keep the legacy DEPENDENCY_CODE_NOT_PRESENT warning path.
     dependency_verified: dict[str, bool] = field(default_factory=dict)
     failure_text: str = ""
+    # A failed-over attempt's own partial report: separate from orchestrator
+    # evidence so it can never displace "observed vs expected" (never set for
+    # reviewers, to keep review independent of unverified claims).
+    failover_text: str = ""
     failure_command: str = ""
     failure_exit_code: int | None = None
     finding_ids: list[str] = field(default_factory=list)
@@ -452,12 +456,41 @@ def open_findings_for_scope(
         return []
     try:
         rows: list[dict[str, Any]] = db.query(
-            "SELECT id, severity, category, file, description, recommended_fix FROM review_findings"
+            "SELECT id, severity, category, file, description, recommended_fix, fingerprint FROM review_findings"
             " WHERE mission_id=? AND status IN ('open','repair_attempted') ORDER BY created_at DESC LIMIT ?",
             (mission_id, limit * 2),
         )
     except Exception:
         return []
+    # DOG-02: include unresolved retry lineage (deduped by fingerprint;
+    # local rows shadow inherited duplicates; resolved locals hide inherited).
+    try:
+        from .review import inherited_open_findings as _inh
+
+        _local_fps = {str(r.get("fingerprint") or "") for r in rows if r.get("fingerprint")}
+        try:
+            _local_all = db.query("SELECT fingerprint FROM review_findings WHERE mission_id=?", (mission_id,))
+            _local_fps |= {str(r.get("fingerprint") or "") for r in _local_all if r.get("fingerprint")}
+        except Exception:
+            logger.debug("local fingerprint lookup failed", exc_info=True)
+        for _inh_row in _inh(db, mission_id):
+            _fp = str(_inh_row.get("fingerprint") or "")
+            if not _fp or _fp in _local_fps:
+                continue
+            _local_fps.add(_fp)
+            rows.append(
+                {
+                    "id": _inh_row.get("id"),
+                    "severity": _inh_row.get("severity"),
+                    "category": _inh_row.get("category"),
+                    "file": _inh_row.get("file"),
+                    "description": _inh_row.get("description"),
+                    "recommended_fix": _inh_row.get("recommended_fix"),
+                    "fingerprint": _fp,
+                }
+            )
+    except Exception:
+        logger.debug("inherited findings lookup failed", exc_info=True)
     if not files_changed:
         return list(rows[:limit])
     changed = {f.lower() for f in files_changed}
@@ -507,6 +540,98 @@ SAFE_RULES = (
     "Work only in the assigned repository/worktree. Do not fabricate results. "
     "Respect scope. Do not expose secrets. Run verification before claiming success."
 )
+
+
+def _canonical_objective(task_title: str, task_description: str, task_objective: str) -> tuple[str, bool]:
+    """Deduplicate identical source lines emitted via multiple plumbing paths.
+
+    The sequential/parallel engines historically set
+    task_objective=f"{title}\\n{task}" while also setting task_title/title
+    and task_description/task, so naive concatenation emits title+task twice.
+    Dedupe exact duplicate lines (stripped) preserving order; distinct roles
+    (requirement vs acceptance vs safety) live in separate blocks and are
+    never merged here. Returns (text, deduped).
+    """
+    seen: set[str] = set()
+    out_lines: list[str] = []
+    total = 0
+    for chunk in (task_title or "", task_description or "", task_objective or ""):
+        for raw in chunk.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            total += 1
+            if line in seen:
+                continue
+            seen.add(line)
+            out_lines.append(line)
+    # Single-line inputs without newlines are handled above; when all inputs
+    # are single-line identical (e.g. description == objective), the loop
+    # already dedupes. Fall back to stripped whole-text when no lines.
+    if not out_lines:
+        combined = f"{task_title}\n{task_description}\n{task_objective}".strip()
+        return combined, False
+    return "\n".join(out_lines), total > len(out_lines)
+
+
+def prior_planning_summary(db: Any, mission_id: str | None, max_chars: int = 2000) -> str:
+    """Smallest structured planning artifact for the implementer (DOG-04).
+
+    Sequential repository missions have no plan_revisions/requirements; the
+    only durable planning decision record is the planning task summary.
+    Returned coherently truncated (never a mid-JSON slice) and empty when
+    no planning ran. Callers render it as a budget-managed PREFERRED block,
+    never as an arbitrary [:200] fragment.
+    """
+    if not mission_id:
+        return ""
+    try:
+        rows = db.query(
+            "SELECT summary FROM tasks WHERE mission_id=? AND role='planning'"
+            " AND status='completed' AND summary IS NOT NULL AND summary != ''"
+            " ORDER BY finished_at DESC, created_at DESC LIMIT 1",
+            (mission_id,),
+        )
+    except Exception:
+        return ""
+    if not rows:
+        try:
+            rows = db.query(
+                "SELECT summary FROM tasks WHERE mission_id=? AND role='planning'"
+                " AND summary IS NOT NULL AND summary != ''"
+                " ORDER BY created_at DESC LIMIT 1",
+                (mission_id,),
+            )
+        except Exception:
+            return ""
+    if not rows:
+        return ""
+    raw = str(rows[0].get("summary") or "").strip()
+    if not raw:
+        return ""
+    try:
+        from .handoff import truncate_coherent as _coherent
+    except Exception:
+        return raw[:max_chars]
+    return _coherent(raw, max_chars)
+
+
+FAILOVER_TEXT_CHARS = 1800
+
+
+def _add_failover_block(add: Any, spec: ContextCompileSpec) -> None:
+    """Previous failed attempt's own report: PREFERRED, clearly unverified."""
+    if not spec.failover_text:
+        return
+    add(
+        "failover",
+        BlockType.FAILURE_EVIDENCE,
+        Priority.PREFERRED,
+        f"Previous attempt (partial, unverified — re-check before relying on it):\n"
+        f"{spec.failover_text[-FAILOVER_TEXT_CHARS:]}".strip(),
+        source_kind="evidence",
+        source_ref="failover",
+    )
 
 
 def build_candidate_blocks(
@@ -573,11 +698,14 @@ def build_candidate_blocks(
     if role in ("planner", "planning", "product_planner", "mission_planner", "dag_planner"):
         summary, rev = get_project_summary(db, spec.product_project_id or "") if spec.product_project_id else ("", None)
         if spec.task_objective or spec.task_title:
+            _plan_obj, _plan_dedup = _canonical_objective(spec.task_title, "", spec.task_objective)
+            if _plan_dedup:
+                warnings.append("OBJECTIVE_DUPLICATE_SUPPRESSED")
             add(
                 "objective",
                 BlockType.TASK_OBJECTIVE,
                 Priority.MANDATORY,
-                f"Objective:\n{spec.task_title}\n{spec.task_objective}".strip(),
+                f"Objective:\n{_plan_obj}".strip(),
                 source_kind="spec",
                 source_ref="task_objective",
                 required=True,
@@ -606,6 +734,7 @@ def build_candidate_blocks(
                 reason="existing decisions",
             )
         aux["plan_revision"] = rev if rev is not None else spec.plan_revision
+        _add_failover_block(add, spec)
         contract = OUTPUT_CONTRACTS.get("planner", OUTPUT_CONTRACTS["implementer"])
         add(
             "output",
@@ -619,8 +748,12 @@ def build_candidate_blocks(
         )
         return blocks, aux, warnings
 
-    # Non-planner roles: objective first.
-    objective = f"{spec.task_title}\n{spec.task_description}\n{spec.task_objective}".strip()
+    # Non-planner roles: objective first. Identical lines arriving via
+    # multiple plumbing paths (title + description + objective) are emitted
+    # once; distinct semantic roles live in separate blocks and are kept.
+    objective, _obj_dedup = _canonical_objective(spec.task_title, spec.task_description, spec.task_objective)
+    if _obj_dedup:
+        warnings.append("OBJECTIVE_DUPLICATE_SUPPRESSED")
     if objective:
         add(
             "objective",
@@ -689,6 +822,32 @@ def build_candidate_blocks(
             compact=f"[{d['area']}]: {d['choice']}" if d["choice"] else None,
         )
 
+    # Prior planning decisions for the implementer (DOG-04). The full plan
+    # is never pasted; the durable planning task summary is carried as a
+    # budget-managed PREFERRED block with compact/reference fallbacks, so a
+    # 44k-char plan becomes a coherent bounded handoff, never a [:200]
+    # mid-JSON fragment. Mandatory contract (objective/requirements/
+    # acceptance/architecture) still fails closed on overflow.
+    if role in ("implementer", "implementation"):
+        try:
+            _plan_sum = prior_planning_summary(db, spec.mission_id, 2000)
+        except Exception:
+            _plan_sum = ""
+        if _plan_sum:
+            _compact = _plan_sum[:500].rstrip()
+            if len(_plan_sum) > 500:
+                _compact += "\n... [planning summary compacted]"
+            add(
+                "plan-handoff",
+                BlockType.PHASE_CONTEXT,
+                Priority.PREFERRED,
+                f"Prior planning decisions (bounded handoff, full plan in task logs):\n{_plan_sum}",
+                source_kind="handoff",
+                source_ref="planning-summary",
+                compact=f"Planning: {_compact}",
+                reference="Planning summary available in task logs; inspect before implementing.",
+            )
+
     # Phase context (bounded, no full plan JSON).
     if spec.project_phase_id:
         phase = phase_spec(db, spec.project_phase_id)
@@ -744,16 +903,38 @@ def build_candidate_blocks(
             warnings.append("DEPENDENCY_CODE_NOT_PRESENT")
 
     # Git context per role (bounded metadata, never full history).
+    # DOG-03: reviewer map is derived from Git for the exact reviewed range
+    # (base..head), never from findings metadata. Bounded with honest
+    # omission markers; the reviewer inspects full hunks locally.
     if spec.candidate_sha or spec.base_sha:
         if role == "reviewer":
             if spec.base_sha and spec.candidate_sha:
+                _git_files = list(spec.git_files_changed or [])
+                _shown = _git_files[:30]
+                if len(_git_files) > 30:
+                    warnings.append("GIT_DIFF_FILE_LIST_TRUNCATED")
+                _summary = (spec.git_diff_summary or "")[:2000]
+                if len(spec.git_diff_summary or "") > 2000:
+                    warnings.append("GIT_DIFF_SUMMARY_TRUNCATED")
+                    _summary = _summary.rstrip() + "\n... [summary truncated; inspect locally]"
+                if _git_files:
+                    _files_line = f"Changed files ({len(_git_files)}): {', '.join(_shown)}"
+                    if len(_git_files) > 30:
+                        _files_line += f" ... [+{len(_git_files) - 30} more; list truncated]"
+                else:
+                    _files_line = "Changed files (0): no file changes in range"
+                _git_body = (
+                    f"Review exact range: base={spec.base_sha} head={spec.candidate_sha}\n"
+                    f"{_files_line}\n"
+                    f"{_summary}".strip()
+                    + f"\nInspect the exact range locally: git diff {spec.base_sha}..{spec.candidate_sha} "
+                    "(do not rely on the summary alone)."
+                )
                 add(
                     "git",
                     BlockType.GIT_DIFF,
                     Priority.MANDATORY,
-                    f"Candidate range: base={spec.base_sha} candidate={spec.candidate_sha}\n"
-                    f"Files: {', '.join(spec.git_files_changed[:30]) or '(see diff)'}\n"
-                    f"{spec.git_diff_summary[:2000]}".strip(),
+                    _git_body,
                     source_kind="git",
                     source_ref=f"{spec.base_sha}..{spec.candidate_sha}",
                     required=True,
@@ -867,6 +1048,9 @@ def build_candidate_blocks(
                 source_kind="evidence",
                 source_ref="failure-tail",
             )
+
+    if role != "reviewer":
+        _add_failover_block(add, spec)
 
     # Environment contract (compact, scoped).
     add(
@@ -1384,14 +1568,26 @@ def task_dependency_ids(db: Any, task_id: str | None) -> list[str]:
 
 
 def latest_candidate_shas(db: Any, mission_id: str | None) -> tuple[str | None, str | None]:
-    """Most recent implementation-side commit range for reviewer/repairer specs.
+    """Canonical reviewed artifact range for reviewer/repairer specs.
 
-    Returns (base_sha, candidate_sha) or (None, None) when unknown. Fails
-    open: the compiler records MODEL_CONTEXT_LIMIT_UNKNOWN rather than
-    fabricating SHAs.
+    DOG-01: single source of truth shared with
+    provenance.mission_review_range (earliest base .. latest candidate tip),
+    so the prompt range always equals the persisted reviewed range. Returns
+    (base_sha, candidate_sha) or (None, None) when unknown. Fails open: the
+    compiler records MODEL_CONTEXT_LIMIT_UNKNOWN rather than fabricating
+    SHAs; persistence then refuses to certify (fail closed).
     """
     if not mission_id:
         return None, None
+    try:
+        from .provenance import mission_review_range as _range
+    except Exception:
+        _range = None  # type: ignore[assignment]
+    if _range is not None:
+        try:
+            return _range(db, mission_id)
+        except Exception:
+            return None, None
     try:
         rows = db.query(
             "SELECT git_commit_before, git_commit_after FROM provider_runs WHERE mission_id=?"
@@ -1416,7 +1612,12 @@ def finding_ids_in_text(text: str | None) -> list[str]:
 
 
 def finding_files(db: Any, mission_id: str | None) -> list[str]:
-    """Files named by open/repair-attempted findings (diff relevance hint)."""
+    """Files named by open/repair-attempted findings (diff relevance hint).
+
+    DOG-02: includes inherited retry lineage so relevance scoring sees
+    unresolved ancestor files. DOG-03: this never defines review scope;
+    the reviewed file list comes from Git (diff_names) for the exact range.
+    """
     if not mission_id:
         return []
     try:
@@ -1426,8 +1627,18 @@ def finding_files(db: Any, mission_id: str | None) -> list[str]:
             (mission_id,),
         )
     except Exception:
-        return []
-    return [str(r["file"]) for r in rows if r.get("file")][:20]
+        rows = []
+    files = [str(r["file"]) for r in rows if r.get("file")]
+    try:
+        from .review import inherited_open_findings as _inh2
+
+        for r in _inh2(db, mission_id):
+            f = str(r.get("file") or "")
+            if f and f not in files:
+                files.append(f)
+    except Exception:
+        logger.debug("inherited file lookup failed", exc_info=True)
+    return files[:20]
 
 
 # -- integration helper ----------------------------------------------------------

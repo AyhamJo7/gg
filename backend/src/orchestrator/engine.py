@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import git_ops
 from .events import EventBus
+from .failover import format_failover_note
 from .handoff import persist_handoff, render_handoff
 from .locks import ResourceLocks
 from .models import (
@@ -84,6 +85,14 @@ ROLE_PROMPTS = {
     Role.REVIEW: REVIEW_INSTRUCTIONS,
     Role.REPAIR: "Fix the open review findings listed below. Verify your fixes by running relevant tests.",
 }
+
+
+FAILURE_TEXT_CHARS = 4000
+
+
+def _failover_evidence(provider: str, result: ExecutionResult) -> str:
+    """Bounded, redacted, unverified report of a failed attempt (see failover.py)."""
+    return format_failover_note(provider, result.failure_class.value, result.duration_s, result.summary or "")
 
 
 class MissionEngine:
@@ -358,6 +367,10 @@ class MissionEngine:
         last_run_id: str | None = None
         attempt = 0
         wait_started: float | None = None
+        # Dogfood 2026-09-12: a failover retry received a byte-identical prompt
+        # and re-derived ~7 min of the failed run's findings. Carry the failed
+        # attempt's own (partial, unverified) report forward as evidence.
+        failover_note = ""
 
         while attempt < max_attempts:
             if self._cancel.is_set() or self._pause.is_set():
@@ -412,7 +425,12 @@ class MissionEngine:
             mission = self._mission()
             self.events.publish(EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value)
             handoff_content = self._make_handoff(role, last_provider, provider_name, ROLE_PROMPTS[role])
-            prompt = self._build_prompt(role, mission, handoff_content, extra_context)
+            legacy_context = (
+                f"{extra_context}\n\n## Previous attempt (did not complete)\n{failover_note}".strip()
+                if failover_note
+                else extra_context
+            )
+            prompt = self._build_prompt(role, mission, handoff_content, legacy_context)
             # Role-specific context compiler (Increment 2, strict in compiled
             # mode): deterministic projection over requirements/acceptance/
             # architecture/handoffs. Compiled-mode compilation failure records
@@ -428,7 +446,6 @@ class MissionEngine:
             try:
                 from .context_compiler import (
                     ContextCompileSpec,
-                    finding_files,
                     finding_ids_in_text,
                     latest_candidate_shas,
                     prepare_invocation_context,
@@ -448,11 +465,23 @@ class MissionEngine:
                 _candidate_sha: str | None = None
                 _finding_ids: list[str] = []
                 _finding_changed: list[str] = []
+                _git_summary: str = ""
                 if _stage_early in ("review", "repair"):
                     # Reviewer needs the exact candidate range; repairer needs
                     # the defect contract. Fail open: compiler warns on unknown.
+                    # DOG-01/DOG-03: range is the canonical earliest-base ..
+                    # latest-tip; changed files come from Git for that exact
+                    # range, never from findings metadata.
                     _base_sha, _candidate_sha = latest_candidate_shas(self.db, self.mission_id)
-                    _finding_changed = finding_files(self.db, self.mission_id)
+                    if _base_sha and _candidate_sha and self.project_path is not None:
+                        try:
+                            _finding_changed = await git_ops.diff_names(
+                                self.project_path, _base_sha, _candidate_sha, limit=100
+                            )
+                            _git_summary = await git_ops.diff_stat_range(self.project_path, _base_sha, _candidate_sha)
+                        except Exception:
+                            logger.debug("review git context failed for %s", self.mission_id, exc_info=True)
+                            _finding_changed, _git_summary = [], ""
                     if _stage_early == "repair":
                         _finding_ids = finding_ids_in_text(extra_context)
                 _constituted_spec = ContextCompileSpec(
@@ -465,12 +494,14 @@ class MissionEngine:
                     base_sha=_base_sha,
                     candidate_sha=_candidate_sha,
                     git_files_changed=_finding_changed,
+                    git_diff_summary=_git_summary,
                     finding_ids=_finding_ids,
-                    task_objective=f"{mission.title}\n{mission.task}",
+                    task_objective=mission.task,
                     task_title=mission.title,
                     task_description=mission.task,
                     requirement_ids=_req_ids,
-                    failure_text=extra_context[:4000] if extra_context else "",
+                    failure_text=extra_context[:FAILURE_TEXT_CHARS] if extra_context else "",
+                    failover_text=failover_note,
                     extra_context="",
                     workspace_scope=[],
                     attempt=attempt + 1,
@@ -661,7 +692,9 @@ class MissionEngine:
                         base_sha=commit_before,
                         repo_key_value=_repo_key,
                     )
-                self._completed_work.append(f"[{role.value}] {provider_name}: {result.summary[:200]}")
+                from .handoff import truncate_coherent as _coherent
+
+                self._completed_work.append(f"[{role.value}] {provider_name}: {_coherent(result.summary, 2000)}")
                 return result
 
             # failure path (health already accounted by InvocationService)
@@ -738,6 +771,12 @@ class MissionEngine:
                         base_sha=commit_before,
                     )
             last_provider = provider_name
+            # A spawn-gate refusal is orchestrator-internal, not provider evidence;
+            # a failed reviewer's partial claims must not anchor the next
+            # reviewer (independence), so review failover starts clean.
+            failover_note = (
+                "" if result.gate_refused or role == Role.REVIEW else _failover_evidence(provider_name, result)
+            )
             attempt += 1
 
         mission = self._mission()
@@ -982,12 +1021,8 @@ class MissionEngine:
                 # which owns the outcome. Gate only when GG has no history
                 # here yet, i.e. the dirt provably predates any GG run.
                 _has_history = bool(
-                    self.db.query(
-                        "SELECT id FROM provider_runs WHERE mission_id=? LIMIT 1", (self.mission_id,)
-                    )
-                    or self.db.query(
-                        "SELECT id FROM write_provenance WHERE mission_id=? LIMIT 1", (self.mission_id,)
-                    )
+                    self.db.query("SELECT id FROM provider_runs WHERE mission_id=? LIMIT 1", (self.mission_id,))
+                    or self.db.query("SELECT id FROM write_provenance WHERE mission_id=? LIMIT 1", (self.mission_id,))
                 )
                 if _has_history:
                     try:
@@ -1005,9 +1040,7 @@ class MissionEngine:
 
                         _, _, _still_blocking = await _capture_analyze(project_path)
                         if _still_blocking:
-                            await self._gate_unattributed_dirt(
-                                project_path, st, second=True, paths=_still_blocking
-                            )
+                            await self._gate_unattributed_dirt(project_path, st, second=True, paths=_still_blocking)
                             if self._cancel.is_set() or self._pause.is_set():
                                 return False
                             st = await git_ops.status(project_path)
@@ -1090,13 +1123,24 @@ class MissionEngine:
         return rows[0]["cnt"] if rows else 0
 
     def _prior_findings_context(self) -> str:
-        """List prior findings with stable IDs so the reviewer can re-flag or verify each one."""
+        """List prior findings with stable IDs so the reviewer can re-flag or verify each one.
+
+        DOG-02: includes inherited unresolved findings from the retry lineage
+        (marked inherited from <mission>). Omission without explicit
+        VERIFIED_FIXED evidence never resolves them.
+        """
         rows = self.db.query(
             "SELECT id, severity, status, file, description, fingerprint FROM review_findings "
             "WHERE mission_id=? AND status IN ('open','repair_attempted') ORDER BY created_at ASC",
             (self.mission_id,),
         )
-        if not rows:
+        try:
+            from .review import inherited_open_findings as _inh3
+
+            _inh_rows = _inh3(self.db, self.mission_id)
+        except Exception:
+            _inh_rows = []
+        if not rows and not _inh_rows:
             return ""
         lines = [
             "## Prior findings (re-flag if still present, or verify fixed with evidence)",
@@ -1107,6 +1151,12 @@ class MissionEngine:
             f"{r['file'] or ''}: {r['description'][:300]}"
             for r in rows
         )
+        for r in _inh_rows:
+            lines.append(
+                f"- id={r['id']} fp={r.get('fingerprint') or '-'} [{r['severity']}/{r['status']}] "
+                f"{r['file'] or ''}: {r['description'][:300]}"
+                f" (inherited from {r.get('inherited_from_mission_id') or 'prior mission'})"
+            )
         return "\n".join(lines)
 
     async def _phase_review_loop(self) -> bool:

@@ -140,9 +140,57 @@ def test_codex_stdout_without_usage_is_unknown():
     assert summary.input_tokens_total is None
 
 
-def test_agy_always_unknown():
+def test_agy_non_result_lines_stay_unknown():
     lines = [_line({"type": "result", "result": {"tokens": 12345}})]
     summary = U.parse_agy_usage(lines)
     assert summary.source == "UNKNOWN"
     assert summary.input_tokens_total is None
     assert U.parse_usage_for_provider("agy", lines).source == "UNKNOWN"
+
+
+AGY_DOGFOOD_RESULT = {
+    "event": "result",
+    "result": {
+        "status": "SUCCESS",
+        "response": "REVIEW_FINDINGS_JSON: []",
+        "duration_seconds": 423.166498542,
+        "num_turns": 1,
+        "usage": {
+            "input_tokens": 416729,
+            "output_tokens": 32542,
+            "thinking_tokens": 23929,
+            "cache_read_tokens": 4885861,
+            "total_tokens": 449271,
+        },
+    },
+}
+
+
+def test_agy_parses_terminal_result_usage_from_dogfood_log():
+    summary = U.parse_agy_usage([_line({"event": "progress"}), _line(AGY_DOGFOOD_RESULT)])
+    assert summary.source == "PROVIDER_REPORTED"
+    assert summary.input_tokens_total == 416729 + 4885861
+    assert summary.output_tokens_total == 32542
+    assert summary.reasoning_output_tokens == 23929
+    assert summary.native_total_tokens == 449271
+    # Thinking/output relation is unstated: never claim completeness.
+    assert summary.completeness == "PARTIAL"
+    assert summary.evidence_kind == "agy:result.usage"
+
+
+def test_agy_result_without_usage_stays_unknown():
+    summary = U.parse_agy_usage([_line({"event": "result", "result": {"status": "SUCCESS"}})])
+    assert summary.source == "UNKNOWN"
+    assert summary.evidence_kind == "agy:result-without-usage"
+
+
+def test_agy_missing_fields_stay_none_not_zero():
+    summary = U.parse_agy_usage([_line({"event": "result", "result": {"usage": {"output_tokens": 5}}})])
+    assert summary.input_tokens_total is None
+    assert summary.output_tokens_total == 5
+    # Cache reads alone are not an input total.
+    only_cache = U.parse_agy_usage(
+        [_line({"event": "result", "result": {"usage": {"cache_read_tokens": 9, "note": "x" * 999}}})]
+    )
+    assert only_cache.input_tokens_total is None
+    assert only_cache.native_counts == {"usage": {"cache_read_tokens": 9}}
