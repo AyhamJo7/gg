@@ -19,6 +19,8 @@ from ..mission_summary import mission_trust, mission_trust_bulk
 from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
 from ..project_engine import ProductValidationError
+from ..relay import handoff_content, mission_relay
+from ..review import inherited_open_findings
 from ..security import read_redacted_tail, redact, validate_workspace_path
 from ..workspace import inspect_workspace
 from .auth import AuthMiddleware, is_authorized, load_or_create_token
@@ -275,6 +277,11 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         mission["latest_review"] = latest_review
         mission["degraded_review"] = bool(latest_review and not latest_review["independent"])
         mission["trust"] = mission_trust(orchestrator.db, mission)
+        try:
+            mission["inherited_findings"] = inherited_open_findings(orchestrator.db, mission_id)
+        except Exception:
+            logger.warning("inherited findings unavailable for %s", mission_id, exc_info=True)
+            mission["inherited_findings"] = None
         mission["runs"] = orchestrator.db.query(
             "SELECT id, provider, role, failure_class, provider_state, exit_code, started_at, finished_at, "
             "summary FROM provider_runs WHERE mission_id=? ORDER BY started_at",
@@ -288,6 +295,19 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             "SELECT * FROM task_integrations WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,)
         )
         return mission
+
+    @app.get("/api/missions/{mission_id}/relay")
+    def get_mission_relay(mission_id: str) -> dict[str, Any]:
+        if not orchestrator.db.get("missions", mission_id):
+            raise HTTPException(404, "mission not found")
+        return mission_relay(orchestrator.db, mission_id)
+
+    @app.get("/api/missions/{mission_id}/handoffs/{handoff_id}")
+    def get_mission_handoff(mission_id: str, handoff_id: str) -> dict[str, Any]:
+        handoff = handoff_content(orchestrator.db, mission_id, handoff_id)
+        if handoff is None:
+            raise HTTPException(404, "handoff not found")
+        return handoff
 
     @app.post("/api/missions/{mission_id}/start")
     async def start_mission(mission_id: str) -> dict[str, str]:

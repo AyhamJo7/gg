@@ -42,15 +42,15 @@ function productSummary(p: ProductProjectSummary, activeRepair: boolean): string
 
 function MissionRow({ m }: { m: Mission }) {
   const verdict = missionVerdict(m);
-  const summary = m.blocking_issue || (TERMINAL_MISSION_STATES.has(m.status)
-    ? null : `Mission · ${m.current_provider || "No provider running"}`);
+  const terminal = TERMINAL_MISSION_STATES.has(m.status);
+  const summary = m.blocking_issue || (terminal ? null : `Mission · ${m.current_provider || "No provider running"}`);
   return <Link className="operator-row" to={missionHref(m.id)}>
     <div>
       <strong>{m.title}</strong>
-      {summary && <p className="muted">{summary}</p>}
-      {TERMINAL_MISSION_STATES.has(m.status) && <p><MissionVerdictBadge mission={m} /></p>}
+      {summary && <p className="muted clamp" title={summary}>{summary}</p>}
+      {terminal && <p><MissionVerdictBadge mission={m} /></p>}
     </div>
-    <span className="operator-state">{verdict.needsAttention ? "Inspect →" : `${verdict.label} →`}</span>
+    <span className="operator-state">{terminal ? "Inspect" : verdict.label} →</span>
   </Link>;
 }
 

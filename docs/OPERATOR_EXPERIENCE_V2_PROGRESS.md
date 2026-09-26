@@ -16,10 +16,10 @@ presentation endpoints over persisted records. Unknown is never rendered as zero
 
 ## Tier 2 — Agent Relay (who was told what, who handed what to whom)
 
-- [ ] T2.1 `GET /api/missions/{id}/relay`: runs + context summary, handoffs
+- [x] T2.1 `GET /api/missions/{id}/relay`: runs + context summary, handoffs
       (bounded, truncation flagged), reviews (writer set, range, independence),
       finding lineage. Read-only.
-- [ ] T2.2 Relay view: per-provider lanes, chronological steps, thin-context and
+- [x] T2.2 Relay view: per-provider lanes, chronological steps, thin-context and
       idle/lost-run flags, finding → repair → re-review lineage.
 
 ## Tier 3 — live and fast

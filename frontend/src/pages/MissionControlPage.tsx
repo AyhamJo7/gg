@@ -17,6 +17,7 @@ import { Terminal } from "../components/Terminal";
 import { WorkflowTimeline } from "../components/WorkflowTimeline";
 import { TERMINAL_TASK_STATUSES, type Mission } from "../lib/types";
 import { RunInspector } from "../components/RunInspector";
+import { AgentRelay } from "../components/AgentRelay";
 import { operatorLabel, TERMINAL_MISSION_STATES } from "../lib/operator";
 import { MissionVerdictBadge, ReviewTrustCard } from "../components/MissionVerdict";
 
@@ -171,6 +172,18 @@ export function MissionControlPage() {
             </div>
           )}
 
+          <section className="card" aria-labelledby="relay-heading">
+            <div className="row spread">
+              <h3 id="relay-heading">Agent relay</h3>
+              <span className="muted">Who ran, what they were told, and what they handed on — from recorded evidence.</span>
+            </div>
+            <AgentRelay
+              missionId={mission.id}
+              active={!TERMINAL_MISSION_STATES.has(mission.status)}
+              onInspectRun={(id) => { setInspectedRunId(id); document.getElementById("provider-runs")?.scrollIntoView({ behavior: "smooth" }); }}
+            />
+          </section>
+
           {isParallel && dag && (
             <div className="card">
               <h3>Task DAG</h3>
@@ -207,7 +220,7 @@ export function MissionControlPage() {
                         <Badge value={detail.tasks[detail.tasks.length - 1].role} />
                         <Badge value={detail.tasks[detail.tasks.length - 1].status} />
                       </div>
-                      <p className="muted" style={{ marginTop: 8 }}>
+                      <p className="muted scroll-box" style={{ marginTop: 8 }}>
                         {detail.tasks[detail.tasks.length - 1].summary || "Running…"}
                       </p>
                     </>
@@ -222,7 +235,7 @@ export function MissionControlPage() {
               )}
             </div>
             <div className="stack">
-              <ReviewFindingsPanel findings={detail?.findings ?? []} />
+              <ReviewFindingsPanel findings={detail?.findings ?? []} inherited={detail ? detail.inherited_findings ?? [] : []} />
               <div className="card">
                 <h3>Git ledger</h3>
                 <GitPanel git={git ?? null} />
@@ -245,7 +258,7 @@ export function MissionControlPage() {
           )}
 
           {detail && detail.runs.length > 0 && (
-            <div className="card">
+            <div className="card" id="provider-runs">
               <h3>Provider runs</h3>
               <table>
                 <thead>

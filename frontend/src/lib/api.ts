@@ -33,9 +33,11 @@ import type {
   DagDependencyInput,
   DagTaskInput,
   GitState,
+  HandoffContent,
   Mission,
   MissionDag,
   MissionDetail,
+  MissionRelay,
   PriorityMatrix,
   ProductProjectDetail,
   ProductProjectSummary,
@@ -64,6 +66,9 @@ export const api = {
     list: (projectId?: string) =>
       req<Mission[]>(`/api/missions${projectId ? `?project_id=${projectId}` : ""}`),
     get: (id: string) => req<MissionDetail>(`/api/missions/${id}`),
+    relay: (id: string) => req<MissionRelay>(`/api/missions/${encodeURIComponent(id)}/relay`),
+    handoff: (id: string, handoffId: string) =>
+      req<HandoffContent>(`/api/missions/${encodeURIComponent(id)}/handoffs/${encodeURIComponent(handoffId)}`),
     create: (body: {
       project_id: string;
       title: string;
