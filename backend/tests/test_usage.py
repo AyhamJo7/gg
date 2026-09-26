@@ -140,7 +140,7 @@ def test_codex_stdout_without_usage_is_unknown():
     assert summary.input_tokens_total is None
 
 
-def test_agy_always_unknown():
+def test_agy_non_result_lines_stay_unknown():
     lines = [_line({"type": "result", "result": {"tokens": 12345}})]
     summary = U.parse_agy_usage(lines)
     assert summary.source == "UNKNOWN"
@@ -188,3 +188,9 @@ def test_agy_missing_fields_stay_none_not_zero():
     summary = U.parse_agy_usage([_line({"event": "result", "result": {"usage": {"output_tokens": 5}}})])
     assert summary.input_tokens_total is None
     assert summary.output_tokens_total == 5
+    # Cache reads alone are not an input total.
+    only_cache = U.parse_agy_usage(
+        [_line({"event": "result", "result": {"usage": {"cache_read_tokens": 9, "note": "x" * 999}}})]
+    )
+    assert only_cache.input_tokens_total is None
+    assert only_cache.native_counts == {"usage": {"cache_read_tokens": 9}}

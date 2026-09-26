@@ -166,6 +166,10 @@ class ContextCompileSpec:
     # absent entries keep the legacy DEPENDENCY_CODE_NOT_PRESENT warning path.
     dependency_verified: dict[str, bool] = field(default_factory=dict)
     failure_text: str = ""
+    # A failed-over attempt's own partial report: separate from orchestrator
+    # evidence so it can never displace "observed vs expected" (never set for
+    # reviewers, to keep review independent of unverified claims).
+    failover_text: str = ""
     failure_command: str = ""
     failure_exit_code: int | None = None
     finding_ids: list[str] = field(default_factory=list)
@@ -612,6 +616,24 @@ def prior_planning_summary(db: Any, mission_id: str | None, max_chars: int = 200
     return _coherent(raw, max_chars)
 
 
+FAILOVER_TEXT_CHARS = 1800
+
+
+def _add_failover_block(add: Any, spec: ContextCompileSpec) -> None:
+    """Previous failed attempt's own report: PREFERRED, clearly unverified."""
+    if not spec.failover_text:
+        return
+    add(
+        "failover",
+        BlockType.FAILURE_EVIDENCE,
+        Priority.PREFERRED,
+        f"Previous attempt (partial, unverified — re-check before relying on it):\n"
+        f"{spec.failover_text[-FAILOVER_TEXT_CHARS:]}".strip(),
+        source_kind="evidence",
+        source_ref="failover",
+    )
+
+
 def build_candidate_blocks(
     spec: ContextCompileSpec, db: Any, config: Any | None = None
 ) -> tuple[list[ContextBlock], dict[str, Any], list[str]]:
@@ -712,17 +734,7 @@ def build_candidate_blocks(
                 reason="existing decisions",
             )
         aux["plan_revision"] = rev if rev is not None else spec.plan_revision
-        if spec.failure_text:
-            # A failed-over planning attempt's partial report (dogfood
-            # 2026-09-12: the retry otherwise re-derives it from scratch).
-            add(
-                "failure",
-                BlockType.FAILURE_EVIDENCE,
-                Priority.PREFERRED,
-                f"Prior failure (bounded tail):\n{spec.failure_text[-1500:]}".strip(),
-                source_kind="evidence",
-                source_ref="failure-tail",
-            )
+        _add_failover_block(add, spec)
         contract = OUTPUT_CONTRACTS.get("planner", OUTPUT_CONTRACTS["implementer"])
         add(
             "output",
@@ -1036,6 +1048,9 @@ def build_candidate_blocks(
                 source_kind="evidence",
                 source_ref="failure-tail",
             )
+
+    if role != "reviewer":
+        _add_failover_block(add, spec)
 
     # Environment contract (compact, scoped).
     add(

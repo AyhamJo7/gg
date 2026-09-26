@@ -30,30 +30,56 @@ def test_parses_real_codex_wall_clock_message() -> None:
 
 def test_wall_clock_in_the_past_means_tomorrow() -> None:
     now = _local(7, 0)
-    assert parse_reset_after("try again at 6:37 AM", now) == (24 * 60 - 23) * 60
+    assert parse_reset_after("usage limit reached, try again at 6:37 AM", now) == (24 * 60 - 23) * 60
 
 
-def test_pm_and_24h_forms() -> None:
+def test_pm_24h_and_ambiguous_forms() -> None:
     now = _local(12, 0)
-    assert parse_reset_after("try again at 1:00 PM", now) == 3600
-    assert parse_reset_after("try again at 13:30", now) == 90 * 60
-    assert parse_reset_after("try again at 12:30 a.m.", _local(0, 0)) == 30 * 60
+    assert parse_reset_after("rate limit reached; try again at 1:00 PM", now) == 3600
+    assert parse_reset_after("rate limit reached; try again at 13:30", now) == 90 * 60
+    assert parse_reset_after("rate limit reached; try again at 12:30 a.m.", _local(0, 0)) == 30 * 60
+    # No AM/PM: the sooner of 6:37 and 18:37 from 10:00 is 18:37.
+    assert parse_reset_after("usage limit reached, try again at 6:37", _local(10, 0)) == (8 * 60 + 37) * 60
 
 
-def test_relative_forms() -> None:
-    assert parse_reset_after("Rate limited. Try again in 20 minutes.") == 1200
-    assert parse_reset_after("limit resets in 2 hours") == 7200
-    assert parse_reset_after("Retry-After: 45") == 45
+def test_relative_and_compound_forms() -> None:
+    assert parse_reset_after("Rate limit exceeded. Try again in 20 minutes.") == 1200
+    assert parse_reset_after("429 Too Many Requests, retry-after: 45") == 45
+    three_days = parse_reset_after("You've hit your usage limit. Try again in 3 days 4 hours 9 minutes.", cap_s=10**7)
+    assert three_days == 3 * 86400 + 4 * 3600 + 9 * 60
 
 
 def test_absent_or_nonsense_hint_is_none() -> None:
     assert parse_reset_after("") is None
     assert parse_reset_after("429 Too Many Requests") is None
-    assert parse_reset_after("try again at 99:99") is None
+    assert parse_reset_after("rate limit reached; try again at 99:99") is None
 
 
 def test_hint_is_capped() -> None:
-    assert parse_reset_after("try again in 400 hours") == MAX_PROVIDER_RESET_S
+    assert parse_reset_after("rate limit exceeded, try again in 400 hours") == MAX_PROVIDER_RESET_S
+
+
+def test_model_prose_cannot_set_the_cooldown() -> None:
+    """Security/architecture round 4: only limit lines, last one wins."""
+    tail = "\n".join(
+        [
+            "The README says: retry after 86400 seconds if things fail.",
+            "usage limit reached; try again at 11:59",
+            "Error: rate limit reached, try again in 2 minutes",
+        ]
+    )
+    assert parse_reset_after(tail) == 120
+    # A line with only a reset phrase and a limit-signal-free context is ignored.
+    assert parse_reset_after("The build log says: see docs, retry after 999 seconds") is None
+
+
+def test_parsing_is_fast_on_hostile_lines() -> None:
+    import time
+
+    hostile = "rate limit reached, try again in " + "1 s " * 2000 + "!"
+    started = time.perf_counter()
+    parse_reset_after(hostile)
+    assert time.perf_counter() - started < 0.5
 
 
 def _registry(tmp_path: Path) -> tuple[ProviderRegistry, Database]:
@@ -74,6 +100,19 @@ def test_stated_reset_raises_rate_limit_cooldown(tmp_path: Path) -> None:
     registry, db = _registry(tmp_path)
     registry.record_failure("codex", FailureClass.RATE_LIMIT, 5.0, "limit", stated_reset_s=1140)
     assert 1100 < _cooldown_s(db) <= 1140
+    # The operator can see why the cooldown is longer than the backoff.
+    assert db.get("providers", "codex", key="name")["last_error"].startswith("provider-stated reset in 1140s")
+
+
+def test_stated_reset_is_capped_by_config(tmp_path: Path) -> None:
+    db = Database(tmp_path / "cap.db")
+    config = make_config(providers=["codex"])
+    config._data.setdefault("orchestration", {})["stated_reset_max_seconds"] = 600
+    registry = ProviderRegistry(db, {"codex": FakeAdapter("codex", ["ok"])}, config)
+    if not db.get("providers", "codex", key="name"):
+        db.insert("providers", {"name": "codex", "state": "AVAILABLE"})
+    registry.record_failure("codex", FailureClass.RATE_LIMIT, 5.0, "limit", stated_reset_s=86400)
+    assert _cooldown_s(db) <= 600
 
 
 def test_stated_reset_never_shortens_backoff(tmp_path: Path) -> None:

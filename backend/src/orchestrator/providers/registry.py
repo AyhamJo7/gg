@@ -208,7 +208,13 @@ class ProviderRegistry:
             # Daily or long-horizon quota limit: enforce minimum 4-hour floor (F-18)
             cooldown_s = max(cooldown_s, float(self._config.get("orchestration.quota_cooldown_seconds", 14400)))
         if stated_reset_s and failure in (FailureClass.RATE_LIMIT, FailureClass.QUOTA_EXHAUSTED):
-            cooldown_s = max(cooldown_s, stated_reset_s)
+            # Provider text is untrusted: bounded by config, and shown to the
+            # operator as the reason for the longer cooldown.
+            stated_cap = float(self._config.get("orchestration.stated_reset_max_seconds", 86400))
+            stated = min(stated_reset_s, stated_cap)
+            if stated > cooldown_s:
+                cooldown_s = stated
+                error = f"provider-stated reset in {int(stated)}s; {error}"
         state_by_failure = {
             FailureClass.RATE_LIMIT: ProviderState.RATE_LIMITED,
             FailureClass.QUOTA_EXHAUSTED: ProviderState.RATE_LIMITED,

@@ -164,40 +164,75 @@ def classify_output(
 
 # -- Provider-stated reset times ---------------------------------------------
 # Providers often print when a limit lifts ("try again at 6:37 AM", "try
-# again in 20 minutes"). The registry uses this only as a floor on its own
-# exponential cooldown, never to shorten it. Wall-clock times carry no zone:
-# they are read as the host's local time, since the CLI runs on this host.
+# again in 3 days 4 hours"). The registry uses this only as a floor on its own
+# exponential cooldown (never to shorten it) and caps it by config. Only lines
+# that themselves carry a limit signal are read, and the LAST such line wins:
+# model-streamed prose earlier in the tail must not set the provider's
+# cooldown. Wall-clock times carry no zone and are read as the host's local
+# time (the CLI runs on this host); a 12-hour time without AM/PM takes the
+# sooner of its two readings.
 MAX_PROVIDER_RESET_S = 24 * 60 * 60
-_SECONDS_PER_UNIT = {"s": 1, "m": 60, "h": 3600}
+HOURS_PER_HALF_DAY = 12
+_SECONDS_PER_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _RESET_AT = re.compile(r"try again at\s+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?", re.IGNORECASE)
+_DURATION_PART = r"(\d+(?:\.\d+)?)\s*(s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)\b"
 _RESET_IN = re.compile(
-    r"(?:try again|retry|resets?)\s+in\s+(\d+(?:\.\d+)?)\s*(s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?)\b",
+    rf"(?:try again|retry|resets?)\s+in\s+((?:{_DURATION_PART}[\s,]*(?:and\s+)?)+)",
     re.IGNORECASE,
 )
+_DURATION_ITEM = re.compile(_DURATION_PART, re.IGNORECASE)
 _RETRY_AFTER = re.compile(r"retry[- ]after[:=\s]+(\d+)\b", re.IGNORECASE)
 
 
-def parse_reset_after(text: str, now: datetime | None = None) -> float | None:
-    """Seconds until the provider says its limit resets, or None if unstated."""
+def _is_limit_line(line: str) -> bool:
+    return bool(_RATE_LIMIT_PATTERNS.search(line) or _QUOTA_PATTERNS.search(line))
+
+
+def _wall_clock_seconds(hour: int, minute: int, meridiem: str, now: datetime) -> float | None:
+    if minute >= 60:
+        return None
+    candidates: list[int] = []
+    if meridiem:
+        if hour > HOURS_PER_HALF_DAY or hour == 0:
+            return None
+        candidates = [hour % HOURS_PER_HALF_DAY + (HOURS_PER_HALF_DAY if meridiem == "pm" else 0)]
+    elif hour < 24:
+        candidates = [hour]
+        if 0 < hour <= HOURS_PER_HALF_DAY:
+            candidates.append((hour + HOURS_PER_HALF_DAY) % 24)
+    best: float | None = None
+    for h in candidates:
+        target = now.replace(hour=h, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        delta = (target - now).total_seconds()
+        best = delta if best is None else min(best, delta)
+    return best
+
+
+def _line_reset_seconds(line: str, now: datetime) -> float | None:
+    if m := _RESET_AT.search(line):
+        meridiem = (m.group(3) or "").lower().replace(".", "")
+        return _wall_clock_seconds(int(m.group(1)), int(m.group(2)), meridiem, now)
+    if m := _RESET_IN.search(line):
+        return sum(
+            float(part.group(1)) * _SECONDS_PER_UNIT[part.group(2)[0].lower()]
+            for part in _DURATION_ITEM.finditer(m.group(1))
+        )
+    if m := _RETRY_AFTER.search(line):
+        return float(m.group(1))
+    return None
+
+
+def parse_reset_after(text: str, now: datetime | None = None, cap_s: float = MAX_PROVIDER_RESET_S) -> float | None:
+    """Seconds until the provider's own limit message says it resets, or None."""
     if not text:
         return None
     local_now = (now or datetime.now(UTC)).astimezone()
-    seconds: float | None = None
-    if m := _RESET_AT.search(text):
-        hour, minute, meridiem = int(m.group(1)), int(m.group(2)), (m.group(3) or "").lower().replace(".", "")
-        if meridiem == "pm" and hour < 12:
-            hour += 12
-        elif meridiem == "am" and hour == 12:
-            hour = 0
-        if hour < 24 and minute < 60:
-            target = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if target <= local_now:
-                target += timedelta(days=1)
-            seconds = (target - local_now).total_seconds()
-    elif m := _RESET_IN.search(text):
-        seconds = float(m.group(1)) * _SECONDS_PER_UNIT[m.group(2)[0].lower()]
-    elif m := _RETRY_AFTER.search(text):
-        seconds = float(m.group(1))
-    if seconds is None or seconds <= 0:
-        return None
-    return min(seconds, MAX_PROVIDER_RESET_S)
+    for line in reversed(text.splitlines()):
+        if not _is_limit_line(line):
+            continue
+        seconds = _line_reset_seconds(line, local_now)
+        if seconds is not None and seconds > 0:
+            return min(seconds, cap_s)
+    return None

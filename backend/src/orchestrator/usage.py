@@ -346,9 +346,8 @@ def parse_agy_usage(stdout_lines: list[str]) -> UsageSummary:
     cache_read = _nonneg(raw_usage.get("cache_read_tokens"))
     thinking = _nonneg(raw_usage.get("thinking_tokens"))
     total = _nonneg(raw_usage.get("total_tokens"))
-    normalized_input: int | None = None
-    if inp is not None or cache_read is not None:
-        normalized_input = (inp or 0) + (cache_read or 0)
+    # Unknown input stays unknown: cache reads alone are not an input total.
+    normalized_input = inp + (cache_read or 0) if inp is not None else None
     return UsageSummary(
         input_tokens_total=normalized_input,
         output_tokens_total=outp,
@@ -361,7 +360,11 @@ def parse_agy_usage(stdout_lines: list[str]) -> UsageSummary:
         output_basis="FINAL_INVOCATION",
         evidence_kind="agy:result.usage",
         observations_count=len(finals),
-        native_counts={"usage": {k: v for k, v in raw_usage.items() if isinstance(v, (int, float, str))}},
+        native_counts={
+            "usage": {
+                str(k)[:64]: v for k, v in raw_usage.items() if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+        },
     )
 
 

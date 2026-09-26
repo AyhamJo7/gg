@@ -439,8 +439,8 @@ class MissionEngine:
             mission = self._mission()
             self.events.publish(EventType.PROVIDER_SELECTED, self.mission_id, provider=provider_name, role=role.value)
             handoff_content = self._make_handoff(role, last_provider, provider_name, ROLE_PROMPTS[role])
-            effective_context = f"{extra_context}\n\n{failover_note}".strip() if failover_note else extra_context
-            prompt = self._build_prompt(role, mission, handoff_content, effective_context)
+            legacy_context = f"{extra_context}\n\n{failover_note}".strip() if failover_note else extra_context
+            prompt = self._build_prompt(role, mission, handoff_content, legacy_context)
             # Role-specific context compiler (Increment 2, strict in compiled
             # mode): deterministic projection over requirements/acceptance/
             # architecture/handoffs. Compiled-mode compilation failure records
@@ -510,7 +510,8 @@ class MissionEngine:
                     task_title=mission.title,
                     task_description=mission.task,
                     requirement_ids=_req_ids,
-                    failure_text=effective_context[-FAILURE_TEXT_CHARS:] if effective_context else "",
+                    failure_text=extra_context[:FAILURE_TEXT_CHARS] if extra_context else "",
+                    failover_text=failover_note,
                     extra_context="",
                     workspace_scope=[],
                     attempt=attempt + 1,
@@ -780,8 +781,12 @@ class MissionEngine:
                         base_sha=commit_before,
                     )
             last_provider = provider_name
-            # A spawn-gate refusal is orchestrator-internal, not provider evidence.
-            failover_note = "" if result.gate_refused else _failover_evidence(provider_name, result)
+            # A spawn-gate refusal is orchestrator-internal, not provider evidence;
+            # a failed reviewer's partial claims must not anchor the next
+            # reviewer (independence), so review failover starts clean.
+            failover_note = (
+                "" if result.gate_refused or role == Role.REVIEW else _failover_evidence(provider_name, result)
+            )
             attempt += 1
 
         mission = self._mission()

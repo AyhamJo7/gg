@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from conftest import make_orchestrator
+from orchestrator.context_compiler import ContextCompileSpec, build_candidate_blocks
 from orchestrator.engine import FAILOVER_EVIDENCE_CHARS, _failover_evidence
 from orchestrator.models import FailureClass, MissionStatus, ProviderState
 from orchestrator.orchestrator import Orchestrator
@@ -62,7 +63,62 @@ def test_failover_prompt_differs_and_carries_failure_evidence(tmp_path: Path, wo
         retry = runs[1]
         assert retry["prompt_hash"] != runs[0]["prompt_hash"]
         blocks = json.loads(retry["blocks_json"])
-        assert any(b.get("block_type") == "FAILURE_EVIDENCE" for b in blocks)
+        assert any(b.get("block_id") == "failover" for b in blocks)
+        await orch.shutdown()
+
+    asyncio.run(main())
+
+
+def _repair_spec(**over: object) -> ContextCompileSpec:
+    base: dict[str, object] = {
+        "role": "repairer",
+        "stage": "repair",
+        "mission_id": "m",
+        "provider": "claude",
+        "task_objective": "fix it",
+        "failure_text": "## Verification failures to fix\n" + "E" * 1900 + "\nFAILED test_vat",
+        "failover_text": "codex stopped with RATE_LIMIT: I think the fix is " + "p" * 1500,
+    }
+    base.update(over)
+    return ContextCompileSpec(**base)  # type: ignore[arg-type]
+
+
+def _blocks(spec: ContextCompileSpec) -> dict[str, str]:
+    blocks, _aux, _warnings = build_candidate_blocks(spec, None)
+    return {b.id: b.content for b in blocks}
+
+
+def test_repair_failover_keeps_verification_evidence_separate() -> None:
+    """Round 4 H1: the note never displaces observed-vs-expected evidence."""
+    blocks = _blocks(_repair_spec())
+    assert "FAILED test_vat" in blocks["failure"]
+    assert "codex stopped" not in blocks["failure"]
+    assert blocks["failover"].startswith("Previous attempt (partial, unverified")
+
+
+def test_reviewer_never_receives_failover_text() -> None:
+    blocks = _blocks(_repair_spec(role="reviewer", stage="review", failure_text=""))
+    assert "failover" not in blocks
+
+
+def test_failover_skipped_after_gate_refusal(tmp_path: Path, workspace: Path) -> None:
+    async def main() -> None:
+        orch = make_orchestrator(
+            tmp_path, {"fake-a": FakeAdapter("fake-a", ["gate_refused", "ok"]), "fake-b": FakeAdapter("fake-b", ["ok"])}
+        )
+        await orch.registry.detect_all()
+        orch.db.insert(
+            "projects",
+            {"id": "p1", "name": "w", "path": str(workspace), "detected_type": "node", "created_at": "2024-01-01"},
+        )
+        mission = orch.create_mission("p1", "m", "t", "AUTONOMOUS", "balanced")
+        await _run(orch, mission["id"])
+        manifests = orch.db.query(
+            "SELECT m.blocks_json FROM provider_runs r JOIN run_context_manifests m ON m.run_id = r.id "
+            "WHERE r.mission_id=?",
+            (mission["id"],),
+        )
+        assert not any('"failover"' in row["blocks_json"] for row in manifests)
         await orch.shutdown()
 
     asyncio.run(main())

@@ -95,3 +95,20 @@ page cannot cover the outage.
 - [x] Failover carries the failed attempt's bounded, redacted, "partial and
       unverified" report as FAILURE_EVIDENCE (planner policy included); the
       retry prompt is no longer byte-identical. Backend 677 passed.
+
+### Review round 4 (backend dogfood fixes) — security: OK TO MERGE; architecture: BLOCK (H1) → fixed
+
+- Failover note moved to its own `ContextCompileSpec.failover_text` PREFERRED
+  block ("Previous attempt (partial, unverified…)"); `failure_text` is again
+  `extra_context[:4000]` byte-for-byte, so observed-vs-expected evidence is
+  never displaced. Reviewers never receive it (independence), in both the
+  legacy and compiled paths.
+- Reset hints: only limit-signal lines, last one wins; day and compound units;
+  a 12-hour time without AM/PM takes the sooner reading; capped by
+  `orchestration.stated_reset_max_seconds`; the reason is written to
+  `last_error`.
+- AGY usage: unknown input stays `None`; numeric native counts only.
+- Known gap (documented, not built): the parallel DAG task loop and
+  `repair_worker` do not yet carry failover notes. Reset-time cooldowns do
+  apply there (they live in `invocations.py`). Port only if a dogfood run shows
+  duplicated work on those paths.
