@@ -173,6 +173,8 @@ def classify_output(
 # time (the CLI runs on this host); a 12-hour time without AM/PM takes the
 # sooner of its two readings.
 MAX_PROVIDER_RESET_S = 24 * 60 * 60
+# Bounded combined stdout+stderr tail kept on ExecutionResult.raw_tail.
+RAW_TAIL_CHARS = 4000
 HOURS_PER_HALF_DAY = 12
 _SECONDS_PER_UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _RESET_AT = re.compile(r"try again at\s+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?", re.IGNORECASE)
@@ -244,7 +246,8 @@ def _cli_error_text(line: str) -> str | None:
     try:
         event = json.loads(stripped)
     except json.JSONDecodeError:
-        return line
+        # A broken event is not the CLI's own plain-text error line.
+        return None
     if not isinstance(event, dict):
         return None
     if "error" in event:
@@ -260,7 +263,12 @@ def parse_reset_after(text: str, now: datetime | None = None, cap_s: float = MAX
     if not text:
         return None
     local_now = (now or datetime.now(UTC)).astimezone()
-    for raw_line in reversed(text.splitlines()):
+    lines = text.splitlines()
+    if len(text) >= RAW_TAIL_CHARS and lines:
+        # A full-size tail starts mid-line: its first line is a fragment of
+        # something (often a model event) whose origin cannot be known.
+        lines = lines[1:]
+    for raw_line in reversed(lines):
         line = _cli_error_text(raw_line)
         if line is None or not _is_limit_line(line):
             continue

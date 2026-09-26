@@ -112,3 +112,13 @@ page cannot cover the outage.
   `repair_worker` do not yet carry failover notes. Reset-time cooldowns do
   apply there (they live in `invocations.py`). Port only if a dogfood run shows
   duplicated work on those paths.
+
+### Review rounds 5–6 — security: OK TO MERGE; architecture: OK TO MERGE
+
+Reset hints are read only from CLI-written text: structured stream events via
+their error payload, never assistant/message/result events; broken JSON-like
+lines and the cut first line of a full tail are skipped; the default cap is the
+quota floor; wall-clock resets are DST-localized. No open Critical/High/Medium
+findings remain on the branch. Accepted Low: weekly limits beyond the cap are
+retried at the cap interval (safe floor); parallel/repair-worker failover notes
+are a documented gap.

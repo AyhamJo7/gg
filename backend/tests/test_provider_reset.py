@@ -150,3 +150,19 @@ def test_default_cap_is_the_quota_floor(tmp_path: Path) -> None:
     registry, db = _registry(tmp_path)
     registry.record_failure("codex", FailureClass.RATE_LIMIT, 5.0, "limit", stated_reset_s=86400)
     assert _cooldown_s(db) <= 14400
+
+
+def test_cut_fragment_at_start_of_full_tail_is_ignored() -> None:
+    """Security round 6: a model event cut by the tail window reads as plain text."""
+    from orchestrator.providers.classify import RAW_TAIL_CHARS
+
+    fragment = "x" * 200 + 'rate limit reached, try again at 11:59"}}'
+    result = '{"event":"result","result":{"status":"FAILED"}}'
+    tail = (fragment + "\n" + result).rjust(RAW_TAIL_CHARS, "y")[-RAW_TAIL_CHARS:]
+    tail = tail[len(tail) - RAW_TAIL_CHARS :]
+    assert len(tail) == RAW_TAIL_CHARS
+    assert parse_reset_after(tail) is None
+
+
+def test_unparseable_json_like_line_is_skipped() -> None:
+    assert parse_reset_after('{"type":"assistant","text":"rate limit reached, try again in 9 hours"') is None
