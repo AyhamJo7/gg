@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
-import { activityHref, describeEvent, relativeTime, type ActivityEvent, type ActivityItem } from "../lib/activity";
+import { activityHref, describeEvent, relativeTime, unreadAttention, type ActivityEvent, type ActivityItem } from "../lib/activity";
 import { useGlobalEvents } from "../lib/ws";
 import { ActivityContext, useActivity } from "../lib/activityContext";
 
@@ -47,11 +47,19 @@ export function ActivityProvider({ children, live = true }: { children: ReactNod
     setItems(prev => [...fresh, ...prev].sort((a, b) => atMs(b.at) - atMs(a.at)).slice(0, FEED_LIMIT));
   }, []);
 
+  const [gap, setGap] = useState(false);
+  const newestKnown = useRef(0);
+  useEffect(() => { newestKnown.current = items.length ? atMs(items[0].at) : 0; }, [items]);
+
   const seed = useCallback(() => {
     let cancelled = false;
+    const before = newestKnown.current;
     api.events.recent(SEED_LIMIT)
       .then(events => {
         if (cancelled) return;
+        // A full page entirely newer than what we already had means events
+        // between them may be missing from the feed: say so.
+        if (before > 0 && events.length >= SEED_LIMIT && events.every(e => atMs(e.created_at) > before)) setGap(true);
         add(events.map(describeEvent).filter((i): i is ActivityItem => i !== null));
         setSeeded(true);
         setSeedError(null);
@@ -96,7 +104,7 @@ export function ActivityProvider({ children, live = true }: { children: ReactNod
     if (!connected) wasConnected.current = false;
   }, [connected, seed]);
 
-  const unread = useMemo(() => items.filter(i => i.attention && atMs(i.at) > atMs(lastSeen)).length, [items, lastSeen]);
+  const unread = useMemo(() => unreadAttention(items, atMs(lastSeen), atMs), [items, lastSeen]);
   const markSeen = useCallback(() => {
     const newest = items[0]?.at;
     if (newest) { writeLastSeen(newest); setLastSeen(newest); }
@@ -106,8 +114,8 @@ export function ActivityProvider({ children, live = true }: { children: ReactNod
     document.title = unread > 0 ? `(${unread}) ${BASE_TITLE}` : BASE_TITLE;
   }, [unread]);
 
-  const value = useMemo(() => ({ items, unread, connected, seeded, seedError, open, setOpen, markSeen }),
-    [items, unread, connected, seeded, seedError, open, markSeen]);
+  const value = useMemo(() => ({ items, unread, connected, seeded, seedError, gap, open, setOpen, markSeen }),
+    [items, unread, connected, seeded, seedError, gap, open, markSeen]);
   return <ActivityContext.Provider value={value}>{children}</ActivityContext.Provider>;
 }
 
@@ -124,7 +132,7 @@ export function ActivityButton() {
 }
 
 export function ActivityPanel() {
-  const { items, connected, seeded, seedError, open, setOpen, markSeen } = useActivity();
+  const { items, connected, seeded, seedError, gap, open, setOpen, markSeen } = useActivity();
   const [now, setNow] = useState(() => Date.now());
   const panelRef = useRef<HTMLElement>(null);
   useEffect(() => {
@@ -148,6 +156,7 @@ export function ActivityPanel() {
         {connected ? "Live — new events appear as GG records them." : "Not connected to live updates; showing recorded history."}
       </p>
       {seedError && <p role="alert" className="notice error">Recent history could not be loaded.</p>}
+      {gap && <p role="status" className="notice">Some activity from while the connection was down may be missing here. Mission pages show complete history.</p>}
       {!items.length && !seedError && !seeded && <p role="status" className="muted">Loading recent activity…</p>}
       {!items.length && !seedError && seeded && <p className="muted">No activity recorded yet.</p>}
       <ol className="activity-list">

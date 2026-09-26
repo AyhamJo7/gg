@@ -77,3 +77,10 @@ on reconnect and shows loading, each stop counted once with the recorded cause,
 "Open retry" for idempotent retries, instant-based timestamp ordering, live
 mission titles, DAG arrow tones and no "done" edge into STALE tasks, relay never
 shows "0s" for unrecorded durations. Backend 661 passed; frontend 137 passed.
+
+### Review round 3 — security: OK TO MERGE; architecture: OK TO MERGE
+
+Fixed: linear token-tail strip (quadratic regex DoS), formatter churn reverted
+from unrelated modules, unread attention counted per mission so parallel-engine
+stops (status change only) still count, reconnect gap stated when the re-seed
+page cannot cover the outage.

@@ -7,6 +7,8 @@ export interface ActivityState {
   connected: boolean;
   seeded: boolean;
   seedError: string | null;
+  /** A reconnect re-seed could not cover the whole disconnect window. */
+  gap: boolean;
   open: boolean;
   setOpen: (open: boolean) => void;
   markSeen: () => void;

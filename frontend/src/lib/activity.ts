@@ -51,11 +51,10 @@ export function describeEvent(event: ActivityEvent): ActivityItem | null {
     case "MISSION_CREATED": return make("Mission created", "info");
     case "MISSION_STATUS_CHANGED": {
       const status = str(p.status);
-      // FAILED and WAITING_FOR_HUMAN are followed by MISSION_FAILED /
-      // HUMAN_GATE_CREATED, which carry the attention; count each stop once.
-      const attention = status === "UNVERIFIED";
+      // Engines differ in which follow-up events they publish for a stop, so
+      // every stop is attention here; unread counting dedupes per mission.
       const stopped = !!status && ["WAITING_FOR_HUMAN", "FAILED", "UNVERIFIED"].includes(status);
-      return make(withReason(`Now ${status ? operatorLabel(status).toLowerCase() : "in an unrecorded state"}`, p.reason ?? p.blocking_issue), stopped ? "attention" : "info", attention);
+      return make(withReason(`Now ${status ? operatorLabel(status).toLowerCase() : "in an unrecorded state"}`, p.reason ?? p.blocking_issue), stopped ? "attention" : "info", stopped);
     }
     case "MISSION_COMPLETED": return make("Mission completed — check its verdict for caveats", "good", true);
     case "MISSION_FAILED": return make(withReason("Mission stopped", p.reason), "bad", true);
@@ -119,4 +118,14 @@ export function relativeTime(iso: string, now: number): string {
   const hours = Math.round(minutes / MINUTES_PER_HOUR);
   if (hours < RELATIVE_HOURS_LIMIT) return `${hours}h ago`;
   return new Date(iso).toLocaleDateString();
+}
+
+/** Unread = distinct missions/products with attention newer than lastSeen,
+ * so one stop reported by several events counts once. */
+export function unreadAttention(items: ActivityItem[], lastSeenMs: number, atMs: (iso: string) => number): number {
+  const keys = new Set<string>();
+  for (const i of items) {
+    if (i.attention && atMs(i.at) > lastSeenMs) keys.add(i.missionId ?? i.productId ?? i.id);
+  }
+  return keys.size;
 }

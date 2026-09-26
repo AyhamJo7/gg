@@ -134,7 +134,7 @@ describe("Activity center", () => {
     mocks.connected = true; rerender(ui());
     await waitFor(() => expect(screen.getByLabelText("1 need attention")).toBeInTheDocument());
   });
-  it("counts one failure once, with the recorded cause", async () => {
+  it("counts one sequential failure (status change + MISSION_FAILED) once, with the recorded cause", async () => {
     mocks.recent.mockResolvedValue([
       ev({ id: "s", type: "MISSION_STATUS_CHANGED", payload: { status: "FAILED", blocking_issue: "verification failed" } }),
       ev({ id: "f", type: "MISSION_FAILED", payload: { reason: "verification failed" } }),
@@ -160,5 +160,22 @@ describe("Activity center", () => {
     fireEvent.click(screen.getByRole("button", { name: /Activity/ }));
     expect(screen.getByText("Loading recent activity…")).toBeInTheDocument();
     expect(screen.queryByText("No activity recorded yet.")).not.toBeInTheDocument();
+  });
+  it("counts a parallel-engine failure (status change only) as one unread stop", async () => {
+    mocks.recent.mockResolvedValue([ev({ id: "p", mission_id: "par", type: "MISSION_STATUS_CHANGED", payload: { status: "FAILED", blocking_issue: "invalid DAG" } })]);
+    render(<MemoryRouter><ActivityProvider><ActivityButton /><ActivityPanel /></ActivityProvider></MemoryRouter>);
+    await waitFor(() => expect(screen.getByLabelText("1 need attention")).toBeInTheDocument());
+  });
+  it("says when a reconnect may have missed events", async () => {
+    mocks.recent.mockResolvedValue([ev({ id: "first", type: "MISSION_CREATED", created_at: "2026-09-12T00:00:00Z" })]);
+    const ui = () => <MemoryRouter><ActivityProvider><ActivityButton /><ActivityPanel /></ActivityProvider></MemoryRouter>;
+    const { rerender } = render(ui());
+    fireEvent.click(screen.getByRole("button", { name: /Activity/ }));
+    await screen.findByText("Mission created");
+    mocks.connected = false; rerender(ui());
+    mocks.recent.mockResolvedValue(Array.from({ length: 50 }, (_, i) =>
+      ev({ id: `n${i}`, type: "MISSION_PAUSED", created_at: `2026-09-12T02:${String(i).padStart(2, "0")}:00Z` })));
+    mocks.connected = true; rerender(ui());
+    expect(await screen.findByText(/may be missing here/)).toBeInTheDocument();
   });
 });
