@@ -408,3 +408,16 @@ def test_recent_events_skip_routine_bookkeeping(tmp_path: Path) -> None:
     for _ in range(5):
         orch.events.publish(EventType.LOCK_ACQUIRED, "m1")
     assert [e["type"] for e in orch.events.recent(3)] == ["HUMAN_GATE_CREATED"]
+
+
+def test_prefix_trim_is_linear_on_long_token_runs(db: Database) -> None:
+    """Security round 3: no quadratic backtracking on a cut token run."""
+    import time
+
+    from orchestrator.relay import _redacted_prefix
+
+    raw = "A" * 200_000 + " tail"
+    started = time.perf_counter()
+    out = _redacted_prefix(raw, len(raw) + 1_000)
+    assert time.perf_counter() - started < 1.0
+    assert not out.endswith("A")

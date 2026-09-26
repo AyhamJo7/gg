@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-import re
+import string
 from typing import Any
 
 from .context_compiler import BlockType, Priority
@@ -30,7 +30,9 @@ HANDOFF_PREVIEW_CHARS = 1200
 # secret split by the SQL cut is never returned as an unmatched fragment.
 REDACTION_MARGIN_CHARS = 512
 HANDOFF_MAX_CHARS = 1_000_000
-_TRAILING_TOKEN = re.compile(r"[A-Za-z0-9_\-.+/=]+$")
+# Characters of base64/JWT/key-like tokens; stripped linearly (a regex with
+# a trailing "+$" backtracks quadratically on long runs).
+_TOKEN_CHARS = string.ascii_letters + string.digits + "_-.+/="
 RUN_SUMMARY_CHARS = 400
 # Evidence blocks below this size are flagged: the dogfood review ran on a
 # 131-character GIT_DIFF while believing it saw the change.
@@ -193,7 +195,7 @@ def _redacted_prefix(raw_prefix: str, stored_chars: int) -> str:
         trimmed = redacted[: max(0, len(redacted) - REDACTION_MARGIN_CHARS)]
         # A token longer than the margin (e.g. a JWT) may still be cut
         # before its closing structure: drop any trailing token-like run.
-        return _TRAILING_TOKEN.sub("", trimmed)
+        return trimmed.rstrip(_TOKEN_CHARS)
     return redacted
 
 

@@ -26,13 +26,10 @@ class ClaudeAdapter(ProviderAdapter):
     def build_command(self, request: ExecutionRequest) -> list[str]:
         return [
             self.executable,
-            "-p",
-            request.prompt,
-            "--output-format",
-            "stream-json",
+            "-p", request.prompt,
+            "--output-format", "stream-json",
             "--verbose",
-            "--permission-mode",
-            "bypassPermissions",
+            "--permission-mode", "bypassPermissions",
         ]
 
     def normalize_output_line(self, line: str) -> str | None:

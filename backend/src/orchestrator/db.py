@@ -43,13 +43,11 @@ class Database:
 
     def migrate(self) -> None:
         with self._lock:
-            applied = (
-                {r[0] for r in self._conn.execute("SELECT version FROM schema_migrations").fetchall()}
-                if self._conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
-                ).fetchone()
-                else set()
-            )
+            applied = {
+                r[0] for r in self._conn.execute("SELECT version FROM schema_migrations").fetchall()
+            } if self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+            ).fetchone() else set()
             for sql_file in sorted(MIGRATIONS_DIR.glob("*.sql")):
                 version = int(sql_file.stem.split("_")[0])
                 if version in applied:

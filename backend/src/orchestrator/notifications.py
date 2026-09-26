@@ -27,9 +27,7 @@ class DesktopNotifier(Notifier):
             return
         try:
             proc = await asyncio.create_subprocess_exec(
-                binary,
-                title,
-                body[:200],
+                binary, title, body[:200],
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )

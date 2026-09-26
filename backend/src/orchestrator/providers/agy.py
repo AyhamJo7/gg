@@ -26,13 +26,10 @@ class AgyAdapter(ProviderAdapter):
         timeout_min = max(1, int(request.timeout_s // 60))
         return [
             self.executable,
-            "--print",
-            request.prompt,
-            "--output-format",
-            "stream-json",
+            "--print", request.prompt,
+            "--output-format", "stream-json",
             "--dangerously-skip-permissions",
-            "--print-timeout",
-            f"{timeout_min}m",
+            "--print-timeout", f"{timeout_min}m",
         ]
 
     def normalize_output_line(self, line: str) -> str | None:

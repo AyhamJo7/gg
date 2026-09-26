@@ -51,9 +51,8 @@ async def inspect_workspace(path: str | Path, allowed_roots: list[Path] | None =
     has_node = (root / "package.json").exists()
     has_rust = (root / "Cargo.toml").exists()
     has_go = (root / "go.mod").exists()
-    types = [
-        t for t, present in (("python", has_py), ("node", has_node), ("rust", has_rust), ("go", has_go)) if present
-    ]
+    types = [t for t, present in (("python", has_py), ("node", has_node), ("rust", has_rust), ("go",
+        has_go)) if present]
     info.project_type = "+".join(types) if len(types) > 1 else (types[0] if types else "unknown")
 
     if has_py:

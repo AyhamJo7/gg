@@ -143,7 +143,9 @@ ACTIVE_PRODUCT_STATUSES = frozenset(
     }
 )
 
-TERMINAL_PRODUCT_STATUSES = frozenset({ProductStatus.DELIVERED, ProductStatus.FAILED, ProductStatus.CANCELLED})
+TERMINAL_PRODUCT_STATUSES = frozenset(
+    {ProductStatus.DELIVERED, ProductStatus.FAILED, ProductStatus.CANCELLED}
+)
 
 
 class AcceptanceState(StrValueEnum):
