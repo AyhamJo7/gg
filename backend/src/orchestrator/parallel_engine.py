@@ -2022,8 +2022,9 @@ class ParallelMissionEngine:
                 # Newest run for the task: crash recovery never rewrites
                 # tasks.provider_run_id, so that column can point at an older run.
                 _last_runs = self.db.query(
-                    "SELECT * FROM provider_runs WHERE task_id=? ORDER BY started_at DESC, rowid DESC LIMIT 1",
-                    (task_id,),
+                    "SELECT * FROM provider_runs WHERE mission_id=? AND task_id=? "
+                    "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                    (self.mission_id, task_id),
                 )
                 _task_failover = failover_note_from_run(_last_runs[0] if _last_runs else None)
             _task_ctx_spec = ContextCompileSpec(

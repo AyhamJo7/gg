@@ -119,3 +119,23 @@ def test_summary_parsing_is_fast_on_long_lines() -> None:
     started = time.perf_counter()
     count_skipped("\n".join([hostile] * 10))
     assert time.perf_counter() - started < 0.5
+
+
+def test_fallback_insert_works_without_the_skip_column(tmp_path: Path) -> None:
+    """Round 8 L1: the fallback must not name the column it is recovering from."""
+    db = Database(tmp_path / "v.db")
+    db.execute("ALTER TABLE verification_attempts DROP COLUMN skipped_tests")
+    report = VerificationReport(results=[CommandResult("pytest", 0, True, 1.0, skipped=3)])
+    attempt = _persist_verification_attempt(
+        db,
+        mission_id="m",
+        product_project_id=None,
+        task_id=None,
+        sha=SHA,
+        repo_key="",
+        kind="toolchain",
+        report=report,
+        started_at="t",
+    )
+    assert attempt is not None
+    assert db.get("verification_attempts", attempt)["status"] == "passed"

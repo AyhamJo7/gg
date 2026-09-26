@@ -166,7 +166,7 @@ def _persist_verification_attempt(
         # Accounting must never cost the SHA-bound record itself.
         logger.warning("verification attempt insert failed; retrying without skip count", exc_info=True)
         try:
-            db.insert("verification_attempts", {**row, "skipped_tests": None})
+            db.insert("verification_attempts", {k: v for k, v in row.items() if k != "skipped_tests"})
         except Exception:
             logger.warning("verification attempt insert failed", exc_info=True)
             return None
