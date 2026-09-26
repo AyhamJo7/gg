@@ -2,7 +2,7 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { usePolling } from "../lib/hooks";
 import {
-  FINISHED_PRODUCT_STATES, TERMINAL_MISSION_STATES, missionHref, missionVerdict, productAttention,
+  FINISHED_PRODUCT_STATES, TERMINAL_MISSION_STATES, missionAttentionList, missionHref, missionVerdict, productAttention,
 } from "../lib/operator";
 import type { Mission, ProductProjectSummary, RepairCycle } from "../lib/types";
 import { Badge } from "../components/Badge";
@@ -12,6 +12,8 @@ import { MissionVerdictBadge } from "../components/MissionVerdict";
 const REPAIR_DETAIL_LIMIT = 20;
 const RECENT_OUTCOME_LIMIT = 8;
 const ACTIVE_MISSION_LIMIT = 8;
+const ATTENTION_MISSION_LIMIT = 8;
+
 
 async function snapshot() {
   const [products, missions, providers] = await Promise.all([
@@ -40,7 +42,7 @@ function productSummary(p: ProductProjectSummary, activeRepair: boolean): string
   return `${total} phases · ${p.phase_counts.COMPLETED ?? 0} completed`;
 }
 
-function MissionRow({ m }: { m: Mission }) {
+function MissionRow({ m, superseded = false }: { m: Mission; superseded?: boolean }) {
   const verdict = missionVerdict(m);
   const terminal = TERMINAL_MISSION_STATES.has(m.status);
   const summary = m.blocking_issue || (terminal ? null : `Mission · ${m.current_provider || "No provider running"}`);
@@ -50,7 +52,7 @@ function MissionRow({ m }: { m: Mission }) {
       {summary && <p className="muted clamp" title={summary}>{summary}</p>}
       {terminal && <p><MissionVerdictBadge mission={m} /></p>}
     </div>
-    <span className="operator-state">{terminal ? "Inspect" : verdict.label} →</span>
+    <span className="operator-state">{superseded ? "Superseded by a retry" : terminal ? "Inspect" : verdict.label} →</span>
   </Link>;
 }
 
@@ -60,13 +62,17 @@ export function OverviewPage() {
   const attention = data?.products.filter(p => productStatus(p).needsAttention) ?? [];
   const active = data?.products.filter(p => !FINISHED_PRODUCT_STATES.has(p.state) &&
     !productStatus(p).needsAttention) ?? [];
-  const missionAttention = data?.missions.filter(m => missionVerdict(m).needsAttention) ?? [];
+  const allMissionAttention = data ? missionAttentionList(data.missions) : [];
+  const missionAttention = allMissionAttention.slice(0, ATTENTION_MISSION_LIMIT);
+  const hiddenAttention = allMissionAttention.length - missionAttention.length;
+  const superseded = new Set(data?.missions.map(m => m.retry_of_mission_id).filter(Boolean) ?? []);
   const activeMissions = data?.missions.filter(m => !TERMINAL_MISSION_STATES.has(m.status) &&
     !missionVerdict(m).needsAttention).slice(0, ACTIVE_MISSION_LIMIT) ?? [];
   const outcomes: Outcome[] = data ? [
     ...data.products.filter(p => FINISHED_PRODUCT_STATES.has(p.state) && !productStatus(p).needsAttention)
       .map(p => ({ kind: "product" as const, at: p.updated_at, product: p })),
-    ...data.missions.filter(m => TERMINAL_MISSION_STATES.has(m.status) && !missionVerdict(m).needsAttention)
+    ...data.missions.filter(m => TERMINAL_MISSION_STATES.has(m.status) &&
+      (superseded.has(m.id) || !missionVerdict(m).needsAttention))
       .map(m => ({ kind: "mission" as const, at: m.finished_at || m.updated_at, mission: m })),
   ].sort((a, b) => b.at.localeCompare(a.at)).slice(0, RECENT_OUTCOME_LIMIT) : [];
 
@@ -77,7 +83,7 @@ export function OverviewPage() {
       <span className="operator-state">{status.label} →</span>
     </Link>;
   };
-  const nothingWaiting = !attention.length && !missionAttention.length;
+  const nothingWaiting = !attention.length && !allMissionAttention.length;
 
   return <div className="stack operator-page">
     <header className="page-header"><div><h1>Overview</h1><p className="muted">Your builds, decisions, and recent deliveries.</p></div>
@@ -90,9 +96,10 @@ export function OverviewPage() {
       <div className="operator-columns">
         <div className="stack">
           <section className="card" aria-labelledby="attention-heading">
-            <h2 id="attention-heading">Needs your attention {!nothingWaiting && <span className="count">{attention.length + missionAttention.length}</span>}</h2>
+            <h2 id="attention-heading">Needs your attention {!nothingWaiting && <span className="count">{attention.length + allMissionAttention.length}</span>}</h2>
             {attention.map(productRow)}
             {missionAttention.map(m => <MissionRow key={m.id} m={m} />)}
+            {hiddenAttention > 0 && <p><Link to="/missions">{hiddenAttention} more missions need a look →</Link></p>}
             {nothingWaiting && <p className="muted">Nothing is waiting on you. Finished work with open findings or an uncertified review would appear here.</p>}
             {missionAttention.length > 0 && attention.length > 0 && <p className="muted">Product phases run as missions, so a product stop may also appear as a mission stop.</p>}
           </section>
@@ -102,7 +109,7 @@ export function OverviewPage() {
             {!active.length && !activeMissions.length && <p className="muted">Nothing is running. Start with an idea or a task in an existing repository.</p>}
           </section>
           <section className="card"><div className="row spread"><h2>Recent outcomes</h2><span className="row"><Link to="/missions">Missions</Link><Link to="/lifecycle">Products</Link></span></div>
-            {outcomes.map(o => o.kind === "product" ? productRow(o.product) : <MissionRow key={o.mission.id} m={o.mission} />)}
+            {outcomes.map(o => o.kind === "product" ? productRow(o.product) : <MissionRow key={o.mission.id} m={o.mission} superseded={superseded.has(o.mission.id)} />)}
             {!outcomes.length && <p className="muted">Deliveries, finished missions and stopped work will appear here. A completed mission is not necessarily a delivered product.</p>}
           </section>
         </div>

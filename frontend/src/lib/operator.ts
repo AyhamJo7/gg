@@ -52,7 +52,8 @@ export function missionHref(id: string): string {
 }
 
 export const TERMINAL_MISSION_STATES = new Set(["COMPLETED", "FAILED", "CANCELLED", "UNVERIFIED"]);
-const STOPPED_MISSION_STATES = new Set(["FAILED", "UNVERIFIED", "WAITING_FOR_HUMAN", "BLOCKED"]);
+/** Mission states that stop and wait on the operator (MissionStatus values). */
+const STOPPED_MISSION_STATES = new Set(["FAILED", "UNVERIFIED", "WAITING_FOR_HUMAN"]);
 const SEVERITIES = ["BLOCKER", "HIGH", "MEDIUM", "LOW"] as const;
 /** Severities that make a finished mission need an operator look. */
 const ATTENTION_SEVERITIES = new Set<string>(["BLOCKER", "HIGH", "MEDIUM"]);
@@ -64,10 +65,6 @@ export interface MissionVerdict {
   tone: VerdictTone;
   caveats: string[];
   needsAttention: boolean;
-}
-
-function plural(n: number, word: string): string {
-  return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
 /** Operator description of why a review was not certified. Never infers a
@@ -89,18 +86,14 @@ export function trustCaveats(trust: MissionTrust, status: string): { caveats: st
   const caveats: string[] = [];
   let serious = false;
   for (const sev of SEVERITIES) {
-    const n = trust.unresolved_findings[sev] ?? 0;
-    if (n > 0) {
-      caveats.push(`${n} unresolved ${sev}`);
-      if (ATTENTION_SEVERITIES.has(sev)) serious = true;
-    }
+    const open = trust.open_findings[sev] ?? 0;
+    const claimed = trust.repair_claimed_findings[sev] ?? 0;
+    if (open > 0) caveats.push(`${open} open ${sev}`);
+    if (claimed > 0) caveats.push(`${claimed} ${sev} repair${claimed === 1 ? "" : "s"} claimed, not verified`);
+    if ((open > 0 || claimed > 0) && ATTENTION_SEVERITIES.has(sev)) serious = true;
   }
-  if (trust.unresolved_other > 0) {
-    caveats.push(`${trust.unresolved_other} unresolved (unrecognized severity)`);
-    serious = true;
-  }
-  if (trust.unverified_repairs > 0) {
-    caveats.push(`${plural(trust.unverified_repairs, "repair claim")} not verified fixed`);
+  if (trust.unrecognized_severity > 0) {
+    caveats.push(`${trust.unrecognized_severity} unresolved (unrecognized severity)`);
     serious = true;
   }
   if (!trust.inherited_available) {
@@ -138,6 +131,8 @@ export function missionVerdict(mission: Pick<Mission, "status" | "trust">): Miss
   }
   const { caveats, serious } = trustCaveats(mission.trust, status);
   if (STOPPED_MISSION_STATES.has(status)) return { label: base, tone: "stopped", caveats, needsAttention: true };
+  // Paused by the operator: not a stop that asks for a decision.
+  if (status === "PAUSED") return { label: base, tone: "active", caveats, needsAttention: false };
   if (status === "CANCELLED") return { label: base, tone: "stopped", caveats, needsAttention: false };
   if (status === "COMPLETED") {
     return caveats.length
@@ -145,4 +140,15 @@ export function missionVerdict(mission: Pick<Mission, "status" | "trust">): Miss
       : { label: "Completed · no caveats recorded", tone: "clean", caveats, needsAttention: false };
   }
   return { label: base, tone: "active", caveats, needsAttention: false };
+}
+
+/** Missions needing a look, excluding ones a retry has superseded; stops
+ * (which block progress) sort before finished-with-caveats, newest first. */
+export function missionAttentionList(missions: Mission[]): Mission[] {
+  const superseded = new Set(missions.map(m => m.retry_of_mission_id).filter((id): id is string => !!id));
+  return missions
+    .filter(m => !superseded.has(m.id) && missionVerdict(m).needsAttention)
+    .map(m => ({ m, stopped: missionVerdict(m).tone === "stopped" ? 0 : 1, at: m.updated_at }))
+    .sort((a, b) => a.stopped - b.stopped || b.at.localeCompare(a.at))
+    .map(x => x.m);
 }

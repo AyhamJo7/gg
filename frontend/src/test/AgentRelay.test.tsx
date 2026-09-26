@@ -13,17 +13,17 @@ const run = (over: Partial<RelayRun> = {}): RelayRun => ({
   failure_class: "NONE", exit_code: 0, started_at: null, finished_at: null, duration_ms: 642998, model_observed: null,
   commit_before: "aaaaaaaaa", commit_after: "aaaaaaaaa", changed_commit: false, summary: "planned", summary_truncated: false,
   context: { capture_status: "CAPTURED", schema_version: "v2", prompt_chars: 12944, estimated_prompt_tokens: 3236,
-    block_count: 3, warnings: [], thin_evidence_blocks: [], truncated_blocks: [] },
+    block_count: 3, warnings: [], thin_evidence_blocks: [], reduced_blocks: [] },
   flags: [], ...over,
 });
 const handoff = (over: Partial<RelayHandoff> = {}): RelayHandoff => ({
   kind: "handoff", id: "h1", at: "2026-09-12T01:10:00", from_provider: "codex", to_provider: "agy", role: "review",
-  git_head: null, content_chars: 16443, preview: "handoff preview", preview_truncated: true, ...over,
+  git_head: null, stored_chars: 16443, preview: "handoff preview", preview_truncated: true, ...over,
 });
 const thinReview = run({
   id: "r-agy", provider: "agy", role: "review", duration_ms: 462767, flags: ["THIN_REQUIRED_EVIDENCE"],
   context: { capture_status: "CAPTURED", schema_version: "v2", prompt_chars: 25700, estimated_prompt_tokens: null,
-    block_count: 4, warnings: [], truncated_blocks: [],
+    block_count: 4, warnings: [], reduced_blocks: [],
     thin_evidence_blocks: [{ block_type: "GIT_DIFF", block_id: "git_diff", included_chars: 131, original_chars: 131 }] },
 });
 const lost = run({ id: "r-codex", provider: "codex", role: "testing", outcome: "FAILED", duration_ms: 438392, flags: ["LOST_WORK"] });
@@ -42,7 +42,7 @@ const relay: MissionRelay = {
       recommended_fix: "", text_truncated: false, origin_review_id: "rv0", origin_sha: "1111111111", resolved_review_id: "rv1",
       resolved_sha: "2222222222", verified_by: "claude", inherited_from_mission_id: "44cdae6dbf4d45c5", created_at: null, resolved_at: null },
   ],
-  providers: [{ provider: "claude", runs: 1, succeeded: 1, not_succeeded: 0, in_flight: 0, known_duration_ms: 642998, unknown_duration_runs: 1, roles: ["planning"] }],
+  providers: [{ provider: "claude", runs: 1, succeeded: 1, not_succeeded: 0, in_flight: 0, outcome_unknown: 0, known_duration_ms: 642998, unknown_duration_runs: 1, roles: ["planning"] }],
   runs_truncated: false,
   limits: { handoff_preview_chars: 1200, thin_evidence_block_chars: 500, lost_work_min_ms: 60000, run_limit: 500 },
 };
@@ -88,7 +88,7 @@ describe("AgentRelayView", () => {
     expect(items[1]).toHaveTextContent("inherited from mission 44cdae6d");
   });
   it("loads the full handoff on demand", async () => {
-    mocks.handoff.mockResolvedValue({ content: "FULL HANDOFF TEXT" });
+    mocks.handoff.mockResolvedValue({ content: "FULL HANDOFF TEXT", stored_chars: 17, truncated: false });
     render(<AgentRelayView relay={relay} />);
     fireEvent.click(screen.getByRole("button", { name: "Show all 16,443 chars" }));
     await waitFor(() => expect(screen.getByText("FULL HANDOFF TEXT")).toBeInTheDocument());
@@ -110,5 +110,20 @@ describe("AgentRelayView", () => {
   it("has an explicit empty state", () => {
     render(<AgentRelayView relay={{ ...relay, timeline: [], findings: [] }} />);
     expect(screen.getByText("No provider has run for this mission yet.")).toBeInTheDocument();
+  });
+  it("states recorded reduction facts instead of inventing a budget cause", () => {
+    const reduced = run({ flags: ["CONTEXT_REDUCED"], context: { ...run().context!, reduced_blocks: [
+      { block_type: "PHASE_CONTEXT", block_id: "p", included_chars: 900, original_chars: 5000, representation: "COMPACT", reason: null },
+    ] } });
+    expect(flagText("CONTEXT_REDUCED", reduced, 500)).toBe("Included in reduced form: PHASE_CONTEXT 900 chars of 5,000 chars (COMPACT)");
+  });
+  it("spans a reviewer-less review across lanes instead of crediting the first provider", () => {
+    const { container } = render(<AgentRelayView relay={{ ...relay, timeline: [run(), { ...relay.timeline[4], reviewer: "" } as MissionRelay["timeline"][number]] }} />);
+    const review = container.querySelector(".relay-review") as HTMLElement;
+    expect(review.style.gridColumn).toBe("1 / -1");
+  });
+  it("labels an unrecorded outcome as such", () => {
+    render(<AgentRelayView relay={{ ...relay, timeline: [run({ outcome: "UNKNOWN", outcome_source: "legacy" })] }} />);
+    expect(screen.getByText(/Outcome not recorded/)).toBeInTheDocument();
   });
 });

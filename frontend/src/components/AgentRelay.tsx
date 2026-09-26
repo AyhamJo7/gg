@@ -16,9 +16,11 @@ function short(sha: string | null | undefined): string {
   return sha ? sha.slice(0, SHA_DISPLAY_CHARS) : "unknown";
 }
 
+/** Place in the actor's lane; an unrecorded actor spans every lane rather
+ * than being auto-placed into (and credited to) the first provider. */
 function laneStyle(lanes: string[], name: string | null): CSSProperties {
   const index = name ? lanes.indexOf(name) : -1;
-  return index < 0 ? {} : { gridColumn: `${index + 1}` };
+  return index < 0 ? { gridColumn: "1 / -1" } : { gridColumn: `${index + 1}` };
 }
 
 function laneClass(lanes: string[], name: string): string {
@@ -38,7 +40,8 @@ function RunStep({ run, lanes, row, thinLimit, onInspect }: {
         <span className="relay-step-head">
           <strong>{run.provider}</strong> · {run.role}
           <span className={`relay-outcome ${ok ? "ok" : run.outcome_source === "legacy" || run.outcome === "UNKNOWN" ? "" : "bad"}`}>
-            {runOutcomeLabel(run.outcome)}{run.outcome_source === "legacy" ? " (legacy record)" : ""}
+            {run.outcome === "UNKNOWN" ? "Outcome not recorded" : runOutcomeLabel(run.outcome)}
+            {run.outcome_source === "legacy" ? " (legacy record)" : ""}
           </span>
         </span>
         <span className="relay-step-meta muted">
@@ -89,7 +92,10 @@ function HandoffStep({ handoff, lanes, row, missionId }: { handoff: RelayHandoff
   const direction = a <= b ? "forward" : "backward";
   const load = async () => {
     setLoading(true); setError(null);
-    try { setFull((await api.missions.handoff(missionId, handoff.id)).content); }
+    try {
+      const loaded = await api.missions.handoff(missionId, handoff.id);
+      setFull(loaded.truncated ? `${loaded.content}\n\n[Showing the first ${formatChars(loaded.content.length)} of ${formatChars(loaded.stored_chars)}.]` : loaded.content);
+    }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     finally { setLoading(false); }
   };
@@ -100,14 +106,14 @@ function HandoffStep({ handoff, lanes, row, missionId }: { handoff: RelayHandoff
         <span>
           <strong>{sender}</strong> handed off to <strong>{handoff.to_provider ?? "an unrecorded provider"}</strong>
           {handoff.role && <> for {handoff.role}</>}
-          <span className="muted"> · {formatChars(handoff.content_chars)}</span>
+          <span className="muted"> · {formatChars(handoff.stored_chars)}</span>
         </span>
       </summary>
       <div className="relay-step-body">
         {!handoff.from_provider && <p className="muted">The sender was not recorded; GG compiled this handoff.</p>}
         <pre className="relay-text">{full ?? handoff.preview}{!full && handoff.preview_truncated ? "…" : ""}</pre>
         {handoff.preview_truncated && !full && (
-          <button onClick={load} disabled={loading}>{loading ? "Loading…" : `Show all ${formatChars(handoff.content_chars)}`}</button>
+          <button onClick={load} disabled={loading}>{loading ? "Loading…" : `Show all ${formatChars(handoff.stored_chars)}`}</button>
         )}
         {error && <p role="alert" className="notice error">Could not load the full handoff. {error}</p>}
       </div>
@@ -172,7 +178,10 @@ export function AgentRelayView({ relay, onInspectRun }: { relay: MissionRelay; o
           <div key={p.provider} className={`relay-total ${laneClass(lanes, p.provider)}`}>
             <strong>{p.provider}</strong>
             <span className="muted">{p.roles.join(", ")}</span>
-            <span>{p.succeeded}/{p.runs} succeeded{p.in_flight ? ` · ${p.in_flight} in flight` : ""}</span>
+            <span>
+              {p.succeeded}/{p.runs} succeeded{p.in_flight ? ` · ${p.in_flight} in flight` : ""}
+              {p.outcome_unknown ? ` · ${p.outcome_unknown} outcome not recorded` : ""}
+            </span>
             <span className="muted">
               {formatDuration(p.known_duration_ms)}{p.unknown_duration_runs ? ` + ${p.unknown_duration_runs} run(s) of unknown length` : ""}
             </span>
@@ -181,6 +190,9 @@ export function AgentRelayView({ relay, onInspectRun }: { relay: MissionRelay; o
       </div>
       {relay.inherited_findings_available === false && <p className="notice">Findings inherited from earlier attempts could not be loaded.</p>}
       {relay.runs_truncated && <p className="notice">Showing the first {relay.limits.run_limit} runs only.</p>}
+      {(relay.handoffs_truncated || relay.reviews_truncated || relay.findings_truncated) && (
+        <p className="notice">Some handoffs, reviews or findings are beyond the first {relay.limits.item_limit ?? "few hundred"} shown here.</p>
+      )}
       <div className="relay-lanes" style={{ gridTemplateColumns: `repeat(${lanes.length}, minmax(180px, 1fr))` }} aria-label="Agent relay timeline">
         {lanes.map((lane, i) => (
           <div key={`guide-${lane}`} className="relay-lane-guide" aria-hidden style={{ gridColumn: `${i + 1}`, gridRow: `1 / ${relay.timeline.length + 2}` }} />
@@ -203,12 +215,27 @@ export function AgentRelayView({ relay, onInspectRun }: { relay: MissionRelay; o
   );
 }
 
-export function AgentRelay({ missionId, active, onInspectRun }: { missionId: string; active: boolean; onInspectRun?: (runId: string) => void }) {
-  const { data, error, refresh } = usePolling(() => api.missions.relay(missionId), active ? ACTIVE_POLL_MS : null, [missionId]);
+/** Polls only while the mission is running and the operator has the relay
+ * open; otherwise it loads once. */
+export function AgentRelay({ missionId, running, onInspectRun }: { missionId: string; running: boolean; onInspectRun?: (runId: string) => void }) {
+  const { data, error, refresh } = usePolling(() => api.missions.relay(missionId), running ? ACTIVE_POLL_MS : null, [missionId]);
   if (error && !data) return <div role="alert" className="notice error">The agent relay is unavailable. <button onClick={refresh}>Retry</button></div>;
   if (!data) return <p role="status" className="muted">Loading agent relay…</p>;
   return <>
     {error && <p role="status" className="notice">Relay updates unavailable; showing the last loaded state.</p>}
     <AgentRelayView relay={data} onInspectRun={onInspectRun} />
   </>;
+}
+
+export function AgentRelaySection({ missionId, running, onInspectRun }: { missionId: string; running: boolean; onInspectRun?: (runId: string) => void }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <details className="card relay-section" open={open} onToggle={e => setOpen((e.currentTarget as HTMLDetailsElement).open)}>
+      <summary className="row spread">
+        <h3 id="relay-heading">Agent relay</h3>
+        <span className="muted">Who ran, what they were told, and what they handed on — from recorded evidence.</span>
+      </summary>
+      {open && <AgentRelay missionId={missionId} running={running} onInspectRun={onInspectRun} />}
+    </details>
+  );
 }

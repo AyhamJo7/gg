@@ -89,6 +89,24 @@ class EventBus:
         """The bounded in-memory tail of transient events for a mission."""
         return list(self._transient.get(mission_id, ()))
 
+    def recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Newest durable events across all missions, with mission titles.
+
+        Transient provider output is never persisted, so it never appears.
+        """
+        rows = self._db.query(
+            "SELECT e.*, m.title AS mission_title FROM events e LEFT JOIN missions m ON m.id = e.mission_id "
+            "ORDER BY e.created_at DESC, e.rowid DESC LIMIT ?",
+            (limit,),
+        )
+        for row in rows:
+            if isinstance(row.get("payload"), str):
+                try:
+                    row["payload"] = json.loads(row["payload"])
+                except json.JSONDecodeError:
+                    row["payload"] = {}
+        return rows
+
     def history(self, mission_id: str, limit: int = 500, include_types: set[str] | None = None) -> list[dict[str, Any]]:
         sql = "SELECT * FROM events WHERE mission_id = ?"
         params: list[Any] = [mission_id]

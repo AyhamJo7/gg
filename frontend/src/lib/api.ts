@@ -26,6 +26,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return (await resp.json()) as T;
 }
 
+import type { ActivityEvent } from "./activity";
 import type {
   Analytics,
   ArtifactEvidence,
@@ -50,6 +51,9 @@ import type {
 } from "./types";
 
 export const api = {
+  events: {
+    recent: (limit: number) => req<ActivityEvent[]>(`/api/events/recent?limit=${limit}`),
+  },
   projects: {
     list: () => req<Project[]>("/api/projects"),
     add: (path: string, name?: string) =>

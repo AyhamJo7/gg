@@ -14,28 +14,41 @@ import json
 import logging
 from typing import Any
 
+from .context_compiler import BlockType, Priority
 from .db import Database
 from .invocations import STATUS_SUCCEEDED, TERMINAL_RUN_STATUSES
-from .mission_summary import review_summary
-from .review import inherited_open_findings
+from .mission_summary import bounded_redacted, inherited_for, review_summary, serialize_finding
 from .security import redact
 
 logger = logging.getLogger(__name__)
 
-# Handoffs routinely exceed 20k characters; the relay shows a bounded preview
+# Handoffs routinely exceed 20k characters; the relay reads a bounded prefix
 # and serves the full redacted text on demand.
 HANDOFF_PREVIEW_CHARS = 1200
-FINDING_TEXT_CHARS = 600
+# Extra prefix read past the preview so a secret straddling the preview
+# boundary is still matched (and redacted) as a whole before slicing.
+REDACTION_MARGIN_CHARS = 512
+HANDOFF_MAX_CHARS = 1_000_000
 RUN_SUMMARY_CHARS = 400
-# Required evidence blocks below this size are flagged: the dogfood review ran
-# on a 131-character GIT_DIFF while believing it saw the change.
+# Evidence blocks below this size are flagged: the dogfood review ran on a
+# 131-character GIT_DIFF while believing it saw the change.
 THIN_EVIDENCE_BLOCK_CHARS = 500
-# Framing blocks are short by design and never count as thin evidence.
-FRAMING_BLOCK_TYPES = frozenset({"SYSTEM_INSTRUCTIONS", "OUTPUT_CONTRACT"})
-MANDATORY_PRIORITY = "MANDATORY"
+# Only blocks that carry evidence about the candidate can be "thin". Task
+# objectives, criteria and framing blocks are legitimately short.
+EVIDENCE_BLOCK_TYPES = frozenset(
+    {
+        BlockType.GIT_DIFF,
+        BlockType.TEST_RESULT,
+        BlockType.FAILURE_EVIDENCE,
+        BlockType.RELEVANT_CODE,
+        BlockType.DEPENDENCY_HANDOFF,
+    }
+)
 # A run that consumed this long and still failed is surfaced as lost work.
 LOST_WORK_MIN_MS = 60_000
 RELAY_RUN_LIMIT = 500
+RELAY_ITEM_LIMIT = 500
+UNKNOWN_OUTCOME = "UNKNOWN"
 
 
 def _loads(raw: object) -> Any:
@@ -47,13 +60,6 @@ def _loads(raw: object) -> Any:
         return None
 
 
-def _bounded(text: object, limit: int) -> tuple[str, bool]:
-    value = redact(str(text or ""))
-    if len(value) <= limit:
-        return value, False
-    return value[:limit], True
-
-
 def _context_summary(manifest: dict[str, Any] | None) -> dict[str, Any] | None:
     if not manifest:
         return None
@@ -61,7 +67,7 @@ def _context_summary(manifest: dict[str, Any] | None) -> dict[str, Any] | None:
     blocks = blocks if isinstance(blocks, list) else []
     warnings = _loads(manifest.get("warnings_json"))
     thin: list[dict[str, Any]] = []
-    truncated: list[dict[str, Any]] = []
+    reduced: list[dict[str, Any]] = []
     for b in blocks:
         if not isinstance(b, dict):
             continue
@@ -74,11 +80,14 @@ def _context_summary(manifest: dict[str, Any] | None) -> dict[str, Any] | None:
             "block_id": str(b.get("block_id") or ""),
             "included_chars": included_chars,
             "original_chars": original_chars,
+            # Recorded compiler facts; the relay never infers why.
+            "representation": b.get("representation"),
+            "reason": b.get("reason") or None,
         }
         if (
             included
-            and str(b.get("priority") or "") == MANDATORY_PRIORITY
-            and block_type not in FRAMING_BLOCK_TYPES
+            and block_type in EVIDENCE_BLOCK_TYPES
+            and str(b.get("priority") or "") == Priority.MANDATORY
             and isinstance(included_chars, int)
             and included_chars < THIN_EVIDENCE_BLOCK_CHARS
         ):
@@ -89,7 +98,7 @@ def _context_summary(manifest: dict[str, Any] | None) -> dict[str, Any] | None:
             and isinstance(original_chars, int)
             and included_chars < original_chars
         ):
-            truncated.append(entry)
+            reduced.append(entry)
     return {
         "capture_status": manifest.get("capture_status"),
         "schema_version": manifest.get("schema_version"),
@@ -98,7 +107,7 @@ def _context_summary(manifest: dict[str, Any] | None) -> dict[str, Any] | None:
         "block_count": len(blocks),
         "warnings": [str(w) for w in warnings] if isinstance(warnings, list) else [],
         "thin_evidence_blocks": thin,
-        "truncated_blocks": truncated,
+        "reduced_blocks": reduced,
     }
 
 
@@ -106,10 +115,14 @@ def _outcome(run: dict[str, Any]) -> tuple[str, str]:
     status = str(run.get("run_status") or "")
     if status:
         return status, "run_status"
-    # Pre-observability rows carry only failure_class; say so explicitly.
+    # Pre-observability rows carry only failure_class; say so explicitly. An
+    # unfinished legacy row is an unrecorded outcome, not work in flight.
     if not run.get("finished_at"):
-        return "UNKNOWN", "legacy"
-    return ("SUCCEEDED" if run.get("failure_class") == "NONE" else str(run.get("failure_class") or "UNKNOWN")), "legacy"
+        return UNKNOWN_OUTCOME, "legacy"
+    failure = str(run.get("failure_class") or "")
+    if failure == "NONE":
+        return STATUS_SUCCEEDED, "legacy"
+    return failure or UNKNOWN_OUTCOME, "legacy"
 
 
 def _commit_change(run: dict[str, Any]) -> bool | None:
@@ -121,14 +134,14 @@ def _commit_change(run: dict[str, Any]) -> bool | None:
 
 def _run_entry(run: dict[str, Any], manifest: dict[str, Any] | None) -> dict[str, Any]:
     outcome, source = _outcome(run)
-    summary, summary_truncated = _bounded(run.get("summary"), RUN_SUMMARY_CHARS)
+    summary, summary_truncated = bounded_redacted(run.get("summary"), RUN_SUMMARY_CHARS)
     duration = run.get("duration_ms")
     flags: list[str] = []
     context = _context_summary(manifest)
     if context and context["thin_evidence_blocks"]:
         flags.append("THIN_REQUIRED_EVIDENCE")
-    if context and context["truncated_blocks"]:
-        flags.append("CONTEXT_TRUNCATED")
+    if context and context["reduced_blocks"]:
+        flags.append("CONTEXT_REDUCED")
     if (
         outcome in TERMINAL_RUN_STATUSES
         and outcome != STATUS_SUCCEEDED
@@ -167,8 +180,10 @@ def _run_entry(run: dict[str, Any], manifest: dict[str, Any] | None) -> dict[str
 
 
 def _handoff_entry(row: dict[str, Any]) -> dict[str, Any]:
-    content = redact(str(row.get("content") or ""))
-    preview, truncated = _bounded(content, HANDOFF_PREVIEW_CHARS)
+    # ``head`` is a SQL prefix of the stored content: redact once, then slice.
+    head = redact(str(row.get("head") or ""))
+    stored = int(row.get("stored_chars") or 0)
+    preview = head[:HANDOFF_PREVIEW_CHARS]
     return {
         "kind": "handoff",
         "id": row["id"],
@@ -177,32 +192,9 @@ def _handoff_entry(row: dict[str, Any]) -> dict[str, Any]:
         "to_provider": row.get("to_provider"),
         "role": row.get("role"),
         "git_head": row.get("git_head"),
-        "content_chars": len(content),
+        "stored_chars": stored,
         "preview": preview,
-        "preview_truncated": truncated,
-    }
-
-
-def _finding_entry(row: dict[str, Any]) -> dict[str, Any]:
-    description, d_trunc = _bounded(row.get("description"), FINDING_TEXT_CHARS)
-    fix, f_trunc = _bounded(row.get("recommended_fix"), FINDING_TEXT_CHARS)
-    return {
-        "id": row["id"],
-        "severity": row.get("severity"),
-        "category": row.get("category"),
-        "file": row.get("file"),
-        "status": row.get("status"),
-        "description": description,
-        "recommended_fix": fix,
-        "text_truncated": d_trunc or f_trunc,
-        "origin_review_id": row.get("origin_review_id"),
-        "origin_sha": row.get("origin_sha"),
-        "resolved_review_id": row.get("resolved_review_id"),
-        "resolved_sha": row.get("resolved_sha"),
-        "verified_by": row.get("verified_by"),
-        "inherited_from_mission_id": row.get("inherited_from_mission_id"),
-        "created_at": row.get("created_at"),
-        "resolved_at": row.get("resolved_at"),
+        "preview_truncated": stored > HANDOFF_PREVIEW_CHARS,
     }
 
 
@@ -210,9 +202,9 @@ def _outcome_bucket(run: dict[str, Any]) -> str:
     outcome = run["outcome"]
     if outcome == STATUS_SUCCEEDED:
         return "succeeded"
-    if outcome == "UNKNOWN":
-        return "in_flight"
-    # Legacy rows are finished (they have finished_at) with a failure class.
+    if outcome == UNKNOWN_OUTCOME:
+        return "outcome_unknown"
+    # Legacy rows reaching here are finished (they have finished_at).
     if outcome in TERMINAL_RUN_STATUSES or run["outcome_source"] == "legacy":
         return "not_succeeded"
     return "in_flight"
@@ -230,6 +222,7 @@ def _provider_totals(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "succeeded": 0,
                 "not_succeeded": 0,
                 "in_flight": 0,
+                "outcome_unknown": 0,
                 "known_duration_ms": 0,
                 "unknown_duration_runs": 0,
                 "roles": [],
@@ -247,7 +240,13 @@ def _provider_totals(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(totals.values())
 
 
-def mission_relay(db: Database, mission_id: str) -> dict[str, Any]:
+def _limited(db: Database, sql: str, params: tuple[Any, ...]) -> tuple[list[dict[str, Any]], bool]:
+    rows = db.query(sql + " LIMIT ?", (*params, RELAY_ITEM_LIMIT + 1))
+    return rows[:RELAY_ITEM_LIMIT], len(rows) > RELAY_ITEM_LIMIT
+
+
+def mission_relay(db: Database, mission: dict[str, Any]) -> dict[str, Any]:
+    mission_id = str(mission["id"])
     runs = db.query(
         "SELECT * FROM provider_runs WHERE mission_id=? ORDER BY started_at, rowid LIMIT ?",
         (mission_id, RELAY_RUN_LIMIT + 1),
@@ -258,30 +257,33 @@ def mission_relay(db: Database, mission_id: str) -> dict[str, Any]:
     if runs:
         placeholders = ",".join("?" for _ in runs)
         for m in db.query(
-            f"SELECT * FROM run_context_manifests WHERE run_id IN ({placeholders})",  # noqa: S608 - placeholders only
+            "SELECT run_id, capture_status, schema_version, prompt_chars, estimated_prompt_tokens, "  # noqa: S608
+            f"blocks_json, warnings_json FROM run_context_manifests WHERE run_id IN ({placeholders})",
             tuple(r["id"] for r in runs),
         ):
             manifests[str(m["run_id"])] = m
     run_entries = [_run_entry(r, manifests.get(str(r["id"]))) for r in runs]
-    handoffs = [
-        _handoff_entry(h)
-        for h in db.query("SELECT * FROM handoffs WHERE mission_id=? ORDER BY created_at, rowid", (mission_id,))
-    ]
-    review_rows = db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at, rowid", (mission_id,))
+    handoff_rows, handoffs_truncated = _limited(
+        db,
+        "SELECT id, from_provider, to_provider, role, git_head, created_at, "
+        "substr(content, 1, ?) AS head, length(content) AS stored_chars "
+        "FROM handoffs WHERE mission_id=? ORDER BY created_at, rowid",
+        (HANDOFF_PREVIEW_CHARS + REDACTION_MARGIN_CHARS, mission_id),
+    )
+    handoffs = [_handoff_entry(h) for h in handoff_rows]
+    review_rows, reviews_truncated = _limited(
+        db, "SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at, rowid", (mission_id,)
+    )
     reviews = []
     for r in review_rows:
         summary = review_summary(r) or {}
         reviews.append({"kind": "review", "at": r.get("created_at"), **summary})
-    findings = [
-        _finding_entry(f)
-        for f in db.query("SELECT * FROM review_findings WHERE mission_id=? ORDER BY created_at, rowid", (mission_id,))
-    ]
-    inherited_available = True
-    try:
-        findings.extend(_finding_entry(f) for f in inherited_open_findings(db, mission_id))
-    except Exception:
-        logger.warning("inherited findings unavailable for relay %s", mission_id, exc_info=True)
-        inherited_available = False
+    finding_rows, findings_truncated = _limited(
+        db, "SELECT * FROM review_findings WHERE mission_id=? ORDER BY created_at, rowid", (mission_id,)
+    )
+    findings = [serialize_finding(f) for f in finding_rows]
+    inherited, inherited_available = inherited_for(db, mission)
+    findings.extend(serialize_finding(f) for f in inherited)
     timeline = sorted(
         [*run_entries, *handoffs, *reviews],
         key=lambda e: (str(e.get("at") or ""), {"run": 0, "handoff": 1, "review": 2}[e["kind"]]),
@@ -292,28 +294,37 @@ def mission_relay(db: Database, mission_id: str) -> dict[str, Any]:
         "findings": findings,
         "providers": _provider_totals(run_entries),
         "runs_truncated": runs_truncated,
+        "handoffs_truncated": handoffs_truncated,
+        "reviews_truncated": reviews_truncated,
+        "findings_truncated": findings_truncated,
         "inherited_findings_available": inherited_available,
         "limits": {
             "handoff_preview_chars": HANDOFF_PREVIEW_CHARS,
             "thin_evidence_block_chars": THIN_EVIDENCE_BLOCK_CHARS,
             "lost_work_min_ms": LOST_WORK_MIN_MS,
             "run_limit": RELAY_RUN_LIMIT,
+            "item_limit": RELAY_ITEM_LIMIT,
         },
     }
 
 
 def handoff_content(db: Database, mission_id: str, handoff_id: str) -> dict[str, Any] | None:
-    rows = db.query("SELECT * FROM handoffs WHERE id=? AND mission_id=?", (handoff_id, mission_id))
+    rows = db.query(
+        "SELECT id, from_provider, to_provider, role, created_at, substr(content, 1, ?) AS head, "
+        "length(content) AS stored_chars FROM handoffs WHERE id=? AND mission_id=?",
+        (HANDOFF_MAX_CHARS, handoff_id, mission_id),
+    )
     if not rows:
         return None
     row = rows[0]
-    content = redact(str(row.get("content") or ""))
+    stored = int(row.get("stored_chars") or 0)
     return {
         "id": row["id"],
         "from_provider": row.get("from_provider"),
         "to_provider": row.get("to_provider"),
         "role": row.get("role"),
-        "content": content,
-        "content_chars": len(content),
+        "content": redact(str(row.get("head") or "")),
+        "stored_chars": stored,
+        "truncated": stored > HANDOFF_MAX_CHARS,
         "created_at": row.get("created_at"),
     }

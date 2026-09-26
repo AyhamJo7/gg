@@ -24,14 +24,14 @@ presentation endpoints over persisted records. Unknown is never rendered as zero
 
 ## Tier 3 — live and fast
 
-- [ ] T3.1 Global `/ws/events` activity feed + attention notifications.
-- [ ] T3.2 ⌘K command palette and keyboard navigation.
-- [ ] T3.3 Retry affordance on the blocking-issue card.
+- [x] T3.1 Global `/ws/events` activity feed + attention notifications.
+- [x] T3.2 ⌘K command palette and keyboard navigation.
+- [x] T3.3 Retry affordance on the blocking-issue card.
 
 ## Tier 4 — polish
 
-- [ ] T4.1 DAG with drawn dependency edges.
-- [ ] T4.2 Consistent icons / type scale / mission picker.
+- [x] T4.1 DAG with drawn dependency edges.
+- [x] T4.2 Consistent SVG icon set, brand mark, clean lint (no warnings).
 
 ## Review loop log
 
@@ -41,29 +41,29 @@ presentation endpoints over persisted records. Unknown is never rendered as zero
 
 Fix plan:
 
-- [ ] A-H1 Thin-evidence flag only for named evidence block types (GIT_DIFF,
+- [x] A-H1 Thin-evidence flag only for named evidence block types (GIT_DIFF,
       TEST_RESULT, FAILURE_EVIDENCE, RELEVANT_CODE, DEPENDENCY_HANDOFF); short
       objectives/criteria never flag.
-- [ ] A-M1 Split open vs repair-claimed counts so one finding is never listed twice.
-- [ ] A-M2 `inherited_available=False` when a retry has no readable ancestors.
-- [ ] A-M3 Trust computed only for terminal missions in the list; bounded queries.
-- [ ] A-M4 Relay reads handoff prefix + length in SQL, redacts once; relay polls
+- [x] A-M1 Split open vs repair-claimed counts so one finding is never listed twice.
+- [x] A-M2 `inherited_available=False` when a retry has no readable ancestors.
+- [x] A-M3 Trust computed only for terminal missions in the list; bounded queries.
+- [x] A-M4 Relay reads handoff prefix + length in SQL, redacts once; relay polls
       only while expanded and mission active.
-- [ ] A-M5 Truncated blocks carry recorded `representation`/`reason`; no invented
+- [x] A-M5 Truncated blocks carry recorded `representation`/`reason`; no invented
       "budget" cause.
-- [ ] A-M6 Overview attention capped, stopped before caveated, superseded
+- [x] A-M6 Overview attention capped, stopped before caveated, superseded
       (retried) missions excluded.
-- [ ] A-M7 Parity test: trust counts vs `open_blockers`/`unverified_findings`
+- [x] A-M7 Parity test: trust counts vs `open_blockers`/`unverified_findings`
       after a real retry seeding.
-- [ ] A-L1 Drop unused `inherited_unresolved`.
-- [ ] A-L2 Legacy unfinished runs → "outcome not recorded", not in flight.
-- [ ] A-L3 Reviewer-less review spans all lanes.
-- [ ] A-L4 Trust card wording; unparsed review stated.
-- [ ] A-L5 Remove non-existent BLOCKED state; PAUSED explicit.
-- [ ] A-L6 Inherited findings computed once per detail request.
-- [ ] S-M1/M2 Shared redacting finding serializer for detail findings/inherited;
+- [x] A-L1 Drop unused `inherited_unresolved`.
+- [x] A-L2 Legacy unfinished runs → "outcome not recorded", not in flight.
+- [x] A-L3 Reviewer-less review spans all lanes.
+- [x] A-L4 Trust card wording; unparsed review stated.
+- [x] A-L5 Remove non-existent BLOCKED state; PAUSED explicit.
+- [x] A-L6 Inherited findings computed once per detail request.
+- [x] S-M1/M2 Shared redacting finding serializer for detail findings/inherited;
       redact run summaries and latest handoff on detail.
-- [ ] S-M3 Relay handoffs/reviews/findings bounded with truncation flags; full
+- [x] S-M3 Relay handoffs/reviews/findings bounded with truncation flags; full
       handoff capped.
-- [ ] S-L1 Redact and cap finding `file`.
-- [ ] S-L2 (covered by A-M3).
+- [x] S-L1 Redact and cap finding `file`.
+- [x] S-L2 (covered by A-M3).

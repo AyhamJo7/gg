@@ -15,12 +15,11 @@ from pydantic import BaseModel, Field
 from .. import git_ops
 from ..config import Config
 from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
-from ..mission_summary import mission_trust, mission_trust_bulk
+from ..mission_summary import TerminalTrustCache, inherited_for, mission_trust, serialize_finding
 from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
 from ..project_engine import ProductValidationError
 from ..relay import handoff_content, mission_relay
-from ..review import inherited_open_findings
 from ..security import read_redacted_tail, redact, validate_workspace_path
 from ..workspace import inspect_workspace
 from .auth import AuthMiddleware, is_authorized, load_or_create_token
@@ -94,6 +93,10 @@ class AdoptChangesRequest(BaseModel):
     message: str = "human: adopt workspace changes"
 
 
+RECENT_EVENTS_DEFAULT = 50
+RECENT_EVENTS_MAX = 200
+
+
 def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
     for key in ("providers_used", "providers_failed", "choices", "payload", "command"):
         if isinstance(row.get(key), str):
@@ -112,6 +115,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         await orchestrator.shutdown()
 
     app = FastAPI(title="GG Orchestrator", version="0.1.0", lifespan=lifespan)
+    trust_cache = TerminalTrustCache()
     app.state.db = db_path
     app.state.auth_token = load_or_create_token(db_path.parent)
     # Registration order matters: Starlette builds the middleware stack by
@@ -234,7 +238,8 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             )
         else:
             rows = orchestrator.db.query("SELECT * FROM missions ORDER BY created_at DESC LIMIT 200")
-        trust = mission_trust_bulk(orchestrator.db, rows)
+        # Only terminal missions carry a verdict; their trust is memoized.
+        trust = trust_cache.list_trust(orchestrator.db, rows)
         out = [_jsonable(r) for r in rows]
         for m in out:
             m["trust"] = trust.get(str(m["id"]))
@@ -268,29 +273,32 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
                 "SELECT * FROM human_gates WHERE mission_id=? ORDER BY created_at DESC", (mission_id,)
             )
         ]
-        mission["findings"] = orchestrator.db.query(
-            "SELECT * FROM review_findings WHERE mission_id=? ORDER BY created_at", (mission_id,)
-        )
+        mission["findings"] = [
+            serialize_finding(f)
+            for f in orchestrator.db.query(
+                "SELECT * FROM review_findings WHERE mission_id=? ORDER BY created_at", (mission_id,)
+            )
+        ]
         reviews = orchestrator.db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at", (mission_id,))
         mission["reviews"] = reviews
         latest_review = reviews[-1] if reviews else None
         mission["latest_review"] = latest_review
         mission["degraded_review"] = bool(latest_review and not latest_review["independent"])
-        mission["trust"] = mission_trust(orchestrator.db, mission)
-        try:
-            mission["inherited_findings"] = inherited_open_findings(orchestrator.db, mission_id)
-        except Exception:
-            logger.warning("inherited findings unavailable for %s", mission_id, exc_info=True)
-            mission["inherited_findings"] = None
-        mission["runs"] = orchestrator.db.query(
+        inherited, inherited_available = inherited_for(orchestrator.db, mission)
+        mission["trust"] = mission_trust(orchestrator.db, mission, (inherited, inherited_available))
+        mission["inherited_findings"] = [serialize_finding(f) for f in inherited] if inherited_available else None
+        runs = orchestrator.db.query(
             "SELECT id, provider, role, failure_class, provider_state, exit_code, started_at, finished_at, "
             "summary FROM provider_runs WHERE mission_id=? ORDER BY started_at",
             (mission_id,),
         )
+        for run in runs:
+            run["summary"] = redact(str(run.get("summary") or ""))
+        mission["runs"] = runs
         latest_handoff = orchestrator.db.query(
             "SELECT * FROM handoffs WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,)
         )
-        mission["latest_handoff"] = latest_handoff[0]["content"] if latest_handoff else None
+        mission["latest_handoff"] = redact(str(latest_handoff[0]["content"] or "")) if latest_handoff else None
         mission["integrations"] = orchestrator.db.query(
             "SELECT * FROM task_integrations WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,)
         )
@@ -298,9 +306,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
 
     @app.get("/api/missions/{mission_id}/relay")
     def get_mission_relay(mission_id: str) -> dict[str, Any]:
-        if not orchestrator.db.get("missions", mission_id):
+        mission = orchestrator.db.get("missions", mission_id)
+        if not mission:
             raise HTTPException(404, "mission not found")
-        return mission_relay(orchestrator.db, mission_id)
+        return mission_relay(orchestrator.db, mission)
 
     @app.get("/api/missions/{mission_id}/handoffs/{handoff_id}")
     def get_mission_handoff(mission_id: str, handoff_id: str) -> dict[str, Any]:
@@ -946,6 +955,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return {r["key"][len("profile.") :]: json.loads(r["value"]) for r in rows}
 
     # ---------------- events / analytics ----------------
+    @app.get("/api/events/recent")
+    def recent_events(limit: int = RECENT_EVENTS_DEFAULT) -> list[dict[str, Any]]:
+        return orchestrator.events.recent(max(1, min(int(limit), RECENT_EVENTS_MAX)))
+
     @app.get("/api/missions/{mission_id}/events")
     def mission_events(mission_id: str, limit: int = 500) -> list[dict[str, Any]]:
         return orchestrator.events.history(mission_id, limit)
@@ -1264,18 +1277,30 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         status["acceptance_state"] = product.get("acceptance_state")
         status["delivery_sha"] = product.get("delivery_sha")
         attempts: list[dict[str, Any]] = []
-        for phase in orchestrator.db.query(
-            "SELECT id FROM project_phases WHERE project_id=?", (project_id,)
-        ):
+        for phase in orchestrator.db.query("SELECT id FROM project_phases WHERE project_id=?", (project_id,)):
             for att in orchestrator.db.query(
                 "SELECT id, phase_id, attempt_number, mission_id, trigger, status, base_sha,"
                 " result_sha, started_at, finished_at FROM project_phase_attempts"
                 " WHERE phase_id=? ORDER BY attempt_number ASC",
                 (phase["id"],),
             ):
-                attempts.append({k: att.get(k) for k in (
-                    "id", "phase_id", "attempt_number", "mission_id", "trigger", "status",
-                    "base_sha", "result_sha", "started_at", "finished_at")})
+                attempts.append(
+                    {
+                        k: att.get(k)
+                        for k in (
+                            "id",
+                            "phase_id",
+                            "attempt_number",
+                            "mission_id",
+                            "trigger",
+                            "status",
+                            "base_sha",
+                            "result_sha",
+                            "started_at",
+                            "finished_at",
+                        )
+                    }
+                )
         status["phase_attempts"] = attempts
         return status
 

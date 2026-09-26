@@ -34,3 +34,15 @@ describe("DagGraph", () => {
     expect(screen.getByText("Depends on: Greeting")).toBeInTheDocument();
   });
 });
+
+describe("DagGraph edges", () => {
+  it("draws one edge per dependency and keeps a text list for assistive tech", () => {
+    render(<DagGraph tasks={tasks} dependencies={[{ from_task_id: "a", to_task_id: "b", created_at: "" }]} activeTaskId="b" />);
+    const svg = screen.getByTestId("dag-edges");
+    const paths = svg.querySelectorAll("path.dag-edge");
+    expect(paths).toHaveLength(1);
+    expect(paths[0].getAttribute("class")).toContain("done");
+    expect(paths[0].getAttribute("class")).toContain("focused");
+    expect(screen.getByText("Dependency list (1)")).toBeInTheDocument();
+  });
+});

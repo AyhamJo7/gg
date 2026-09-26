@@ -9,8 +9,9 @@ vi.mock("../lib/api", () => ({ api: {
   missions: { list: mocks.missions }, providers: { list: async () => [] },
 } }));
 const cleanTrust = {
-  unresolved_findings: { BLOCKER: 0, HIGH: 0, MEDIUM: 0, LOW: 0 }, unresolved_other: 0, unverified_repairs: 0,
-  inherited_unresolved: 0, inherited_available: true, review_count: 1,
+  open_findings: { BLOCKER: 0, HIGH: 0, MEDIUM: 0, LOW: 0 },
+  repair_claimed_findings: { BLOCKER: 0, HIGH: 0, MEDIUM: 0, LOW: 0 }, unrecognized_severity: 0,
+  inherited_available: true, review_count: 1,
   review: { id: "r", reviewer: "codex", independent: true, degradation_reason: null, writer_set: ["claude"],
     reviewer_in_writer_set: false, parsed: true, reviewed_base_sha: null, reviewed_head_sha: null, created_at: null },
 };
@@ -43,11 +44,11 @@ describe("overview", () => {
   it("surfaces a completed standalone mission with caveats as needing attention", async () => {
     mocks.list.mockResolvedValue([]);
     mocks.missions.mockResolvedValue([{ ...mission, id: "rr", title: "RechnungsRadar", trust: { ...cleanTrust,
-      unresolved_findings: { BLOCKER: 0, HIGH: 0, MEDIUM: 1, LOW: 0 }, review: { ...cleanTrust.review, independent: false } } }]);
+      open_findings: { BLOCKER: 0, HIGH: 0, MEDIUM: 1, LOW: 0 }, review: { ...cleanTrust.review, independent: false } } }]);
     render(<MemoryRouter><OverviewPage /></MemoryRouter>);
     const section = (await screen.findByRole("heading", { name: /Needs your attention/ })).closest("section")!;
     expect(section).toHaveTextContent("RechnungsRadar");
-    expect(section).toHaveTextContent("1 unresolved MEDIUM");
+    expect(section).toHaveTextContent("1 open MEDIUM");
     expect(section.querySelector("a")).toHaveAttribute("href", "/missions?mission=rr");
   });
   it("lists clean completed missions under recent outcomes", async () => {

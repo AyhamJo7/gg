@@ -46,8 +46,9 @@ export function ReviewTrustCard({ review }: { review: ReviewSummary }) {
         <dt>Reviewed range</dt>
         <dd className="mono">{shortSha(review.reviewed_base_sha)} → {shortSha(review.reviewed_head_sha)}</dd>
       </dl>
+      {review.parsed === false && <p className="relay-flag-text">The review output could not be parsed, so findings from it may be missing.</p>}
       <p className="muted">
-        Findings from this review are real, but GG cannot certify that an independent provider checked this candidate.
+        Findings recorded from this review stand, but GG cannot certify that an independent provider checked this candidate.
       </p>
     </div>
   );

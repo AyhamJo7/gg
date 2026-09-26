@@ -1,5 +1,5 @@
 import type { ProviderHealth } from "../lib/types";
-import { statusColor } from "./Badge";
+import { statusColor } from "../lib/status";
 
 export function ProviderStrip({ providers, active }: { providers: ProviderHealth[]; active?: string | null }) {
   return (

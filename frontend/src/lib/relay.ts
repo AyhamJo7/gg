@@ -38,6 +38,7 @@ export function relayLanes(relay: Pick<MissionRelay, "timeline">): string[] {
   return lanes;
 }
 
+/** Lane for an entry; null means "span all lanes" (no recorded actor). */
 export function entryLane(entry: RelayEntry): string | null {
   if (entry.kind === "run") return entry.provider;
   if (entry.kind === "review") return entry.reviewer || null;
@@ -51,8 +52,14 @@ export function flagText(flag: RelayFlag, run: RelayRun, thinLimit: number): str
       const detail = blocks.map(b => `${b.block_type} ${formatChars(b.included_chars)}`).join(", ");
       return `Small required evidence (under ${thinLimit} chars): ${detail}`;
     }
-    case "CONTEXT_TRUNCATED":
-      return `${run.context?.truncated_blocks.length ?? 0} context block(s) were cut to fit the budget`;
+    case "CONTEXT_REDUCED": {
+      const blocks = run.context?.reduced_blocks ?? [];
+      const detail = blocks.map(b => {
+        const recorded = [b.representation, b.reason].filter(Boolean).join(", ");
+        return `${b.block_type} ${formatChars(b.included_chars)} of ${formatChars(b.original_chars)}${recorded ? ` (${recorded})` : ""}`;
+      }).join("; ");
+      return `Included in reduced form: ${detail}`;
+    }
     case "LOST_WORK":
       return `Ran ${formatDuration(run.duration_ms)} and did not succeed (${run.outcome.toLowerCase()})`;
     case "CONTEXT_NOT_CAPTURED":
@@ -62,7 +69,7 @@ export function flagText(flag: RelayFlag, run: RelayRun, thinLimit: number): str
 
 export const FLAG_SHORT: Record<RelayFlag, string> = {
   THIN_REQUIRED_EVIDENCE: "thin evidence",
-  CONTEXT_TRUNCATED: "context cut",
+  CONTEXT_REDUCED: "reduced context",
   LOST_WORK: "lost work",
   CONTEXT_NOT_CAPTURED: "context unknown",
 };

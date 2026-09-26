@@ -17,7 +17,7 @@ import { Terminal } from "../components/Terminal";
 import { WorkflowTimeline } from "../components/WorkflowTimeline";
 import { TERMINAL_TASK_STATUSES, type Mission } from "../lib/types";
 import { RunInspector } from "../components/RunInspector";
-import { AgentRelay } from "../components/AgentRelay";
+import { AgentRelaySection } from "../components/AgentRelay";
 import { operatorLabel, TERMINAL_MISSION_STATES } from "../lib/operator";
 import { MissionVerdictBadge, ReviewTrustCard } from "../components/MissionVerdict";
 
@@ -80,6 +80,15 @@ export function MissionControlPage() {
     finally { setBusy(false); }
   };
 
+  const retry = async () => {
+    if (!mission) return;
+    setBusy(true); setActionError(null);
+    try { const newM = await api.missions.retry(mission.id); setSelectedId(newM.id); refreshMissions(); }
+    catch (e) { setActionError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  };
+  const retryable = !!mission && ["FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status);
+
   const refreshAll = () => {
     refreshMissions();
     refreshDetail();
@@ -119,25 +128,15 @@ export function MissionControlPage() {
         {mission && !["COMPLETED", "FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status) && (
           <>
             {mission.status === "PAUSED" ? (
-              <button disabled={busy} onClick={() => act("resume")}>▶ Resume</button>
+              <button disabled={busy} onClick={() => act("resume")}>Resume</button>
             ) : (
-              <button disabled={busy} onClick={() => act("pause")}>⏸ Pause</button>
+              <button disabled={busy} onClick={() => act("pause")}>Pause</button>
             )}
-            <button disabled={busy} className="danger" onClick={() => act("cancel")}>✕ Cancel</button>
+            <button disabled={busy} className="danger" onClick={() => act("cancel")}>Cancel mission</button>
           </>
         )}
-        {mission && ["FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status) && (
-          <button
-            onClick={async () => {
-              setBusy(true); setActionError(null);
-              try { const newM = await api.missions.retry(mission.id); setSelectedId(newM.id); refreshMissions(); }
-              catch (e) { setActionError(e instanceof Error ? e.message : String(e)); }
-              finally { setBusy(false); }
-            }}
-            disabled={busy}
-          >
-            🔄 Retry
-          </button>
+        {retryable && (
+          <button onClick={retry} disabled={busy}>Retry mission</button>
         )}
       </div>
 
@@ -155,8 +154,12 @@ export function MissionControlPage() {
 
           {mission.blocking_issue && !openGate && (
             <div className="card" style={{ borderColor: "var(--orange)" }}>
-              <h3>Blocking issue</h3>
-              <pre className="muted" style={{ whiteSpace: "pre-wrap", margin: 0 }}>{mission.blocking_issue}</pre>
+              <div className="row spread">
+                <h3>Blocking issue</h3>
+                {retryable && <button className="primary" onClick={retry} disabled={busy}>Retry mission</button>}
+              </div>
+              <pre className="muted scroll-box" style={{ margin: 0 }}>{mission.blocking_issue}</pre>
+              {retryable && <p className="muted">A retry starts a new mission that inherits unresolved findings; fix the cause above first if it is environmental.</p>}
             </div>
           )}
 
@@ -172,17 +175,11 @@ export function MissionControlPage() {
             </div>
           )}
 
-          <section className="card" aria-labelledby="relay-heading">
-            <div className="row spread">
-              <h3 id="relay-heading">Agent relay</h3>
-              <span className="muted">Who ran, what they were told, and what they handed on — from recorded evidence.</span>
-            </div>
-            <AgentRelay
-              missionId={mission.id}
-              active={!TERMINAL_MISSION_STATES.has(mission.status)}
-              onInspectRun={(id) => { setInspectedRunId(id); document.getElementById("provider-runs")?.scrollIntoView({ behavior: "smooth" }); }}
-            />
-          </section>
+          <AgentRelaySection
+            missionId={mission.id}
+            running={!TERMINAL_MISSION_STATES.has(mission.status) && !["PAUSED", "WAITING_FOR_HUMAN"].includes(mission.status)}
+            onInspectRun={(id) => { setInspectedRunId(id); document.getElementById("provider-runs")?.scrollIntoView({ behavior: "smooth" }); }}
+          />
 
           {isParallel && dag && (
             <div className="card">

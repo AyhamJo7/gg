@@ -48,10 +48,10 @@ export interface ReviewSummary {
 }
 
 export interface MissionTrust {
-  unresolved_findings: SeverityCounts;
-  unresolved_other: number;
-  unverified_repairs: number;
-  inherited_unresolved: number;
+  /** Disjoint buckets: a finding is either open or has an unverified repair claim. */
+  open_findings: SeverityCounts;
+  repair_claimed_findings: SeverityCounts;
+  unrecognized_severity: number;
   inherited_available: boolean;
   review: ReviewSummary | null;
   review_count: number;
@@ -62,6 +62,8 @@ export interface RelayBlockRef {
   block_id: string;
   included_chars: number | null;
   original_chars: number | null;
+  representation?: string | null;
+  reason?: string | null;
 }
 
 export interface RelayContext {
@@ -72,10 +74,10 @@ export interface RelayContext {
   block_count: number;
   warnings: string[];
   thin_evidence_blocks: RelayBlockRef[];
-  truncated_blocks: RelayBlockRef[];
+  reduced_blocks: RelayBlockRef[];
 }
 
-export type RelayFlag = "THIN_REQUIRED_EVIDENCE" | "CONTEXT_TRUNCATED" | "LOST_WORK" | "CONTEXT_NOT_CAPTURED";
+export type RelayFlag = "THIN_REQUIRED_EVIDENCE" | "CONTEXT_REDUCED" | "LOST_WORK" | "CONTEXT_NOT_CAPTURED";
 
 export interface RelayRun {
   kind: "run";
@@ -112,7 +114,8 @@ export interface RelayHandoff {
   to_provider: string | null;
   role: string | null;
   git_head: string | null;
-  content_chars: number;
+  /** Stored length before redaction. */
+  stored_chars: number;
   preview: string;
   preview_truncated: boolean;
 }
@@ -126,6 +129,7 @@ export type RelayEntry = RelayRun | RelayHandoff | RelayReview;
 
 export interface RelayFinding {
   id: string;
+  mission_id?: string | null;
   severity: string;
   category: string | null;
   file: string | null;
@@ -149,6 +153,7 @@ export interface RelayProviderTotals {
   succeeded: number;
   not_succeeded: number;
   in_flight: number;
+  outcome_unknown: number;
   known_duration_ms: number;
   unknown_duration_runs: number;
   roles: string[];
@@ -160,12 +165,16 @@ export interface MissionRelay {
   findings: RelayFinding[];
   providers: RelayProviderTotals[];
   runs_truncated: boolean;
+  handoffs_truncated?: boolean;
+  reviews_truncated?: boolean;
+  findings_truncated?: boolean;
   inherited_findings_available?: boolean;
   limits: {
     handoff_preview_chars: number;
     thin_evidence_block_chars: number;
     lost_work_min_ms: number;
     run_limit: number;
+    item_limit?: number;
   };
 }
 
@@ -175,7 +184,8 @@ export interface HandoffContent {
   to_provider: string | null;
   role: string | null;
   content: string;
-  content_chars: number;
+  stored_chars: number;
+  truncated: boolean;
   created_at: string | null;
 }
 
