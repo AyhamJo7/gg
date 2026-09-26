@@ -41,8 +41,16 @@ describe("DagGraph edges", () => {
     const svg = screen.getByTestId("dag-edges");
     const paths = svg.querySelectorAll("path.dag-edge");
     expect(paths).toHaveLength(1);
-    expect(paths[0].getAttribute("class")).toContain("done");
     expect(paths[0].getAttribute("class")).toContain("focused");
+    expect(paths[0].getAttribute("marker-end")).toBe("url(#dag-arrow-focused)");
     expect(screen.getByText("Dependency list (1)")).toBeInTheDocument();
+  });
+});
+
+describe("DagGraph edge tone", () => {
+  it("never styles an edge into a stale task as done", () => {
+    const stale = tasks.map(t => t.id === "b" ? { ...t, status: "STALE" } : t);
+    render(<DagGraph tasks={stale} dependencies={[{ from_task_id: "a", to_task_id: "b", created_at: "" }]} />);
+    expect(screen.getByTestId("dag-edges").querySelector("path.dag-edge")!.getAttribute("class")).toContain("pending");
   });
 });

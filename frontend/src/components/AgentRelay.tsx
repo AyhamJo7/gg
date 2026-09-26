@@ -2,7 +2,7 @@ import { useState, type CSSProperties } from "react";
 import { api } from "../lib/api";
 import { usePolling } from "../lib/hooks";
 import {
-  FLAG_SHORT, UNRECORDED_SENDER, entryLane, flagText, formatChars, formatDuration, laneColorIndex, relayLanes,
+  FLAG_SHORT, UNRECORDED_SENDER, entryLane, flagText, formatChars, formatDuration, formatKnownDuration, laneColorIndex, relayLanes,
   runOutcomeLabel,
 } from "../lib/relay";
 import { operatorLabel } from "../lib/operator";
@@ -183,7 +183,7 @@ export function AgentRelayView({ relay, onInspectRun }: { relay: MissionRelay; o
               {p.outcome_unknown ? ` · ${p.outcome_unknown} outcome not recorded` : ""}
             </span>
             <span className="muted">
-              {formatDuration(p.known_duration_ms)}{p.unknown_duration_runs ? ` + ${p.unknown_duration_runs} run(s) of unknown length` : ""}
+              {formatKnownDuration(p.known_duration_ms, p.runs, p.unknown_duration_runs)}
             </span>
           </div>
         ))}

@@ -10,6 +10,13 @@ const SEED_LIMIT = 50;
 const LAST_SEEN_KEY = "gg-activity-seen";
 const CLOCK_TICK_MS = 30_000;
 const BASE_TITLE = "GG Orchestrator";
+const TITLE_REFRESH_MS = 30_000;
+
+/** Seeded rows use "+00:00" and live frames "Z": compare instants, not strings. */
+function atMs(iso: string): number {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : 0;
+}
 
 function readLastSeen(): string {
   try { return localStorage.getItem(LAST_SEEN_KEY) ?? ""; } catch { return ""; }
@@ -26,27 +33,70 @@ export function ActivityProvider({ children, live = true }: { children: ReactNod
   const [lastSeen, setLastSeen] = useState(readLastSeen);
   const seen = useRef(new Set<string>());
 
+  const [seeded, setSeeded] = useState(false);
+  const titles = useRef(new Map<string, string>());
+  const lastTitleFetch = useRef(0);
+
   const add = useCallback((incoming: ActivityItem[]) => {
     const fresh = incoming.filter(i => !seen.current.has(i.id));
     if (!fresh.length) return;
-    for (const i of fresh) seen.current.add(i.id);
-    setItems(prev => [...fresh, ...prev].sort((a, b) => b.at.localeCompare(a.at)).slice(0, FEED_LIMIT));
+    for (const i of fresh) {
+      seen.current.add(i.id);
+      if (i.missionId && i.missionTitle) titles.current.set(i.missionId, i.missionTitle);
+    }
+    setItems(prev => [...fresh, ...prev].sort((a, b) => atMs(b.at) - atMs(a.at)).slice(0, FEED_LIMIT));
   }, []);
 
-  useEffect(() => {
+  const seed = useCallback(() => {
     let cancelled = false;
     api.events.recent(SEED_LIMIT)
-      .then(events => { if (!cancelled) add(events.map(describeEvent).filter((i): i is ActivityItem => i !== null)); })
+      .then(events => {
+        if (cancelled) return;
+        add(events.map(describeEvent).filter((i): i is ActivityItem => i !== null));
+        setSeeded(true);
+        setSeedError(null);
+      })
       .catch((e: unknown) => { if (!cancelled) setSeedError(e instanceof Error ? e.message : String(e)); });
     return () => { cancelled = true; };
   }, [add]);
 
+  useEffect(() => seed(), [seed]);
+
+  /** Live frames carry no mission title: reuse known titles, else refresh
+   * the mission list at most once per interval. */
+  const withTitle = useCallback((item: ActivityItem): ActivityItem => {
+    if (!item.missionId || item.missionTitle) return item;
+    const known = titles.current.get(item.missionId);
+    if (known) return { ...item, missionTitle: known };
+    const now = Date.now();
+    if (now - lastTitleFetch.current > TITLE_REFRESH_MS) {
+      lastTitleFetch.current = now;
+      void api.missions.list().then(missions => {
+        for (const m of missions) titles.current.set(m.id, m.title);
+        setItems(prev => prev.map(i => (i.missionId && !i.missionTitle && titles.current.has(i.missionId)
+          ? { ...i, missionTitle: titles.current.get(i.missionId) ?? null } : i)));
+      }).catch(() => { /* title is cosmetic; the id stays shown */ });
+    }
+    return item;
+  }, []);
+
   const { connected } = useGlobalEvents((event) => {
     const item = describeEvent(event as ActivityEvent);
-    if (item) add([item]);
+    if (item) add([withTitle(item)]);
   }, live);
 
-  const unread = useMemo(() => items.filter(i => i.attention && i.at > lastSeen).length, [items, lastSeen]);
+  // /ws/events does not replay: re-seed on every (re)connect so events
+  // published while disconnected are not silently lost.
+  const wasConnected = useRef(false);
+  useEffect(() => {
+    if (connected && !wasConnected.current) {
+      wasConnected.current = true;
+      return seed();
+    }
+    if (!connected) wasConnected.current = false;
+  }, [connected, seed]);
+
+  const unread = useMemo(() => items.filter(i => i.attention && atMs(i.at) > atMs(lastSeen)).length, [items, lastSeen]);
   const markSeen = useCallback(() => {
     const newest = items[0]?.at;
     if (newest) { writeLastSeen(newest); setLastSeen(newest); }
@@ -56,8 +106,8 @@ export function ActivityProvider({ children, live = true }: { children: ReactNod
     document.title = unread > 0 ? `(${unread}) ${BASE_TITLE}` : BASE_TITLE;
   }, [unread]);
 
-  const value = useMemo(() => ({ items, unread, connected, seedError, open, setOpen, markSeen }),
-    [items, unread, connected, seedError, open, markSeen]);
+  const value = useMemo(() => ({ items, unread, connected, seeded, seedError, open, setOpen, markSeen }),
+    [items, unread, connected, seeded, seedError, open, markSeen]);
   return <ActivityContext.Provider value={value}>{children}</ActivityContext.Provider>;
 }
 
@@ -74,7 +124,7 @@ export function ActivityButton() {
 }
 
 export function ActivityPanel() {
-  const { items, connected, seedError, open, setOpen, markSeen } = useActivity();
+  const { items, connected, seeded, seedError, open, setOpen, markSeen } = useActivity();
   const [now, setNow] = useState(() => Date.now());
   const panelRef = useRef<HTMLElement>(null);
   useEffect(() => {
@@ -98,7 +148,8 @@ export function ActivityPanel() {
         {connected ? "Live — new events appear as GG records them." : "Not connected to live updates; showing recorded history."}
       </p>
       {seedError && <p role="alert" className="notice error">Recent history could not be loaded.</p>}
-      {!items.length && !seedError && <p className="muted">No activity recorded yet.</p>}
+      {!items.length && !seedError && !seeded && <p role="status" className="muted">Loading recent activity…</p>}
+      {!items.length && !seedError && seeded && <p className="muted">No activity recorded yet.</p>}
       <ol className="activity-list">
         {items.map(item => {
           const href = activityHref(item);

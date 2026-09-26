@@ -145,9 +145,7 @@ def max_repair_attempts(config: Config | None) -> int:
 
 
 def max_repairs_per_phase(config: Config | None) -> int:
-    raw = (
-        config.get("repair.max_per_phase", DEFAULT_MAX_REPAIRS_PER_PHASE) if config else DEFAULT_MAX_REPAIRS_PER_PHASE
-    )
+    raw = config.get("repair.max_per_phase", DEFAULT_MAX_REPAIRS_PER_PHASE) if config else DEFAULT_MAX_REPAIRS_PER_PHASE
     try:
         return max(1, int(raw))
     except (TypeError, ValueError):
@@ -569,9 +567,7 @@ class RepairCoordinator:
         return rows[0] if rows else None
 
     def attempts(self, cycle_id: str) -> list[dict[str, Any]]:
-        return self.db.query(
-            "SELECT * FROM repair_attempts WHERE cycle_id=? ORDER BY attempt_number ASC", (cycle_id,)
-        )
+        return self.db.query("SELECT * FROM repair_attempts WHERE cycle_id=? ORDER BY attempt_number ASC", (cycle_id,))
 
     def start_attempt(self, cycle_id: str, provider: str, base_sha: str) -> dict[str, Any]:
         """Begin one counted attempt (budget consumed: a provider invocation starts)."""
@@ -727,9 +723,7 @@ class RepairCoordinator:
         return cycle
 
     def list_cycles(self, project_id: str) -> list[dict[str, Any]]:
-        return self.db.query(
-            "SELECT * FROM repair_cycles WHERE project_id=? ORDER BY created_at ASC", (project_id,)
-        )
+        return self.db.query("SELECT * FROM repair_cycles WHERE project_id=? ORDER BY created_at ASC", (project_id,))
 
     def repair_stats(self, project_id: str) -> dict[str, Any]:
         cycles = self.list_cycles(project_id)
@@ -888,8 +882,7 @@ def repair_ticket_text(scope: RepairScope) -> str:
 def _unfinished_attempt(db: Database, cycle_id: str) -> dict[str, Any] | None:
     """Latest attempt row with no finished_at (crash between stages)."""
     rows = db.query(
-        "SELECT * FROM repair_attempts WHERE cycle_id=? AND finished_at IS NULL"
-        " ORDER BY attempt_number DESC LIMIT 1",
+        "SELECT * FROM repair_attempts WHERE cycle_id=? AND finished_at IS NULL ORDER BY attempt_number DESC LIMIT 1",
         (cycle_id,),
     )
     return rows[0] if rows else None
@@ -985,13 +978,14 @@ async def execute_repair_cycle(
             # Operational failure: no artifact, no code-budget semantics (R-12).
             coord.update_attempt(
                 str(attempt["id"]),
-                {"outcome": RepairAttemptOutcome.FAILED.value, "operational_failure": 1,
-                 "finished_at": utcnow().isoformat(),
-                 "detail_json": _detail({"error": str(exc)[:500]})},
+                {
+                    "outcome": RepairAttemptOutcome.FAILED.value,
+                    "operational_failure": 1,
+                    "finished_at": utcnow().isoformat(),
+                    "detail_json": _detail({"error": str(exc)[:500]}),
+                },
             )
-            db.execute(
-                "UPDATE repair_cycles SET attempts_used = attempts_used - 1 WHERE id=?", (cycle_id,)
-            )
+            db.execute("UPDATE repair_cycles SET attempts_used = attempts_used - 1 WHERE id=?", (cycle_id,))
             logger.info("repair cycle %s attempt %s provider operational failure", cycle_id, attempt["attempt_number"])
             return coord.finish_cycle(
                 cycle_id, RepairCycleStatus.WAITING_FOR_PROVIDER.value, f"repair provider unavailable: {exc}"
@@ -1022,9 +1016,7 @@ async def execute_repair_cycle(
             # One provider failover is allowed; otherwise this attempt ends the
             # cycle — never loop on no-change (R-27).
             _fresh0 = coord.require_cycle(cycle_id)
-            if _failover_exhausted(db, cycle_id) or int(_fresh0["attempts_used"]) >= int(
-                _fresh0["max_attempts"]
-            ):
+            if _failover_exhausted(db, cycle_id) or int(_fresh0["attempts_used"]) >= int(_fresh0["max_attempts"]):
                 return coord.finish_cycle(
                     cycle_id, RepairCycleStatus.BLOCKED.value, "repair produced no change; bounded stop"
                 )
@@ -1033,16 +1025,15 @@ async def execute_repair_cycle(
         if not await hooks.is_descendant(scope, normalized_base, normalized_result):
             coord.update_attempt(
                 str(attempt["id"]),
-                {"outcome": RepairAttemptOutcome.FAILED.value, "finished_at": utcnow().isoformat(),
-                 "detail_json": _detail({"error": "result is not a descendant of base; history rewrite rejected"})},
+                {
+                    "outcome": RepairAttemptOutcome.FAILED.value,
+                    "finished_at": utcnow().isoformat(),
+                    "detail_json": _detail({"error": "result is not a descendant of base; history rewrite rejected"}),
+                },
             )
-            return coord.finish_cycle(
-                cycle_id, RepairCycleStatus.FAILED.value, "repair result not descended from base"
-            )
+            return coord.finish_cycle(cycle_id, RepairCycleStatus.FAILED.value, "repair result not descended from base")
         coord.update_attempt(str(attempt["id"]), {"outcome": RepairAttemptOutcome.CODE_CHANGED.value})
-        coord.db.execute(
-            "UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.REVIEWING.value, cycle_id)
-        )
+        coord.db.execute("UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.REVIEWING.value, cycle_id))
 
         # Contract tampering guard: repair must not touch protected files
         # (acceptance commands, test assertions, requirement text). Independent
@@ -1095,9 +1086,7 @@ async def execute_repair_cycle(
                 return coord.finish_cycle(cycle_id, RepairCycleStatus.EXHAUSTED.value, "attempt budget exhausted")
             continue
 
-        coord.db.execute(
-            "UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.RECHECKING.value, cycle_id)
-        )
+        coord.db.execute("UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.RECHECKING.value, cycle_id))
         recheck = await hooks.recheck(scope, normalized_result)
         if not recheck.attempt_id or recheck.checked_sha.lower() != normalized_result:
             coord.update_attempt(
@@ -1201,18 +1190,14 @@ async def _resume_unfinished(
             str(attempt["id"]),
             {"outcome": RepairAttemptOutcome.REVIEW_FAILED.value, "finished_at": utcnow().isoformat()},
         )
-        coord.db.execute(
-            "UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.REPAIRING.value, cycle_id)
-        )
+        coord.db.execute("UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.REPAIRING.value, cycle_id))
         return None
     if str(attempt.get("recheck_outcome") or "") == "failed":
         coord.update_attempt(
             str(attempt["id"]),
             {"outcome": RepairAttemptOutcome.RECHECK_FAILED.value, "finished_at": utcnow().isoformat()},
         )
-        coord.db.execute(
-            "UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.REPAIRING.value, cycle_id)
-        )
+        coord.db.execute("UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.REPAIRING.value, cycle_id))
         return None
 
     if not str(attempt.get("review_outcome") or ""):
@@ -1228,7 +1213,8 @@ async def _resume_unfinished(
                 },
             )
             return coord.finish_cycle(
-                cycle_id, RepairCycleStatus.BLOCKED.value,
+                cycle_id,
+                RepairCycleStatus.BLOCKED.value,
                 f"repair modified protected contract files {tampered}; rejected",
             )
         verdict = await hooks.review(scope, normalized_result)
@@ -1260,9 +1246,7 @@ async def _resume_unfinished(
             return None
 
     logger.info("repair cycle %s resumed after review: rechecking %s", cycle_id, normalized_result[:12])
-    coord.db.execute(
-        "UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.RECHECKING.value, cycle_id)
-    )
+    coord.db.execute("UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.RECHECKING.value, cycle_id))
     recheck = await hooks.recheck(scope, normalized_result)
     if not recheck.attempt_id or recheck.checked_sha.lower() != normalized_result:
         coord.update_attempt(
@@ -1295,9 +1279,7 @@ async def _resume_unfinished(
         stop = _repetition_stop(coord, cycle_id, signature)
         if stop:
             return coord.finish_cycle(cycle_id, stop[0], stop[1])
-        coord.db.execute(
-            "UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.REPAIRING.value, cycle_id)
-        )
+        coord.db.execute("UPDATE repair_cycles SET status=? WHERE id=?", (RepairCycleStatus.REPAIRING.value, cycle_id))
         return None
     regression = await hooks.regress(scope, normalized_result)
     if not regression.passed:
@@ -1317,7 +1299,8 @@ async def _resume_unfinished(
     return coord.finish_cycle(cycle_id, RepairCycleStatus.SUCCEEDED.value, None)
 
 
-def _attempt_summary(attempt: dict[str, Any]) -> str:    return (
+def _attempt_summary(attempt: dict[str, Any]) -> str:
+    return (
         f"attempt {attempt.get('attempt_number')} by {attempt.get('provider')}: "
         f"base={str(attempt.get('base_sha') or '')[:12]} "
         f"result={str(attempt.get('result_sha') or '')[:12]} "
@@ -1344,9 +1327,7 @@ def _cycle_repair_providers(db: Database, cycle_id: str) -> set[str]:
 
 
 def _no_change_failover_used(db: Database, cycle_id: str, provider: str) -> bool:
-    rows = db.query(
-        "SELECT COUNT(*) AS n FROM repair_attempts WHERE cycle_id=? AND outcome='NO_CHANGE'", (cycle_id,)
-    )
+    rows = db.query("SELECT COUNT(*) AS n FROM repair_attempts WHERE cycle_id=? AND outcome='NO_CHANGE'", (cycle_id,))
     count = int(rows[0]["n"]) if rows else 0
     return count >= 2
 
@@ -1356,9 +1337,7 @@ def _record_failover(db: Database, cycle_id: str, provider: str) -> None:
 
 
 def _failover_exhausted(db: Database, cycle_id: str) -> bool:
-    rows = db.query(
-        "SELECT COUNT(*) AS n FROM repair_attempts WHERE cycle_id=? AND outcome='NO_CHANGE'", (cycle_id,)
-    )
+    rows = db.query("SELECT COUNT(*) AS n FROM repair_attempts WHERE cycle_id=? AND outcome='NO_CHANGE'", (cycle_id,))
     return (int(rows[0]["n"]) if rows else 0) >= 2
 
 

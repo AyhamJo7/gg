@@ -9,10 +9,10 @@ const failed = {
   blocking_issue: "Docker/network unavailable in the verification sandbox", git_head: null, scheduling_mode: "SEQUENTIAL",
   created_at: "2026-09-10T00:00:00Z", updated_at: "2026-09-10T01:00:00Z", finished_at: "2026-09-10T01:00:00Z", trust: null,
 };
-const mocks = vi.hoisted(() => ({ retry: vi.fn() }));
+const mocks = vi.hoisted(() => ({ retry: vi.fn(), extra: [] as unknown[] }));
 vi.mock("../lib/api", () => ({ api: {
   missions: {
-    list: () => Promise.resolve([failed]),
+    list: () => Promise.resolve([failed, ...mocks.extra]),
     get: () => Promise.resolve({ ...failed, tasks: [], gates: [], findings: [], runs: [], reviews: [], latest_review: null,
       degraded_review: false, latest_handoff: null, integrations: [], inherited_findings: [] }),
     dag: () => Promise.resolve(null),
@@ -40,5 +40,15 @@ describe("blocking issue retry", () => {
     const card = (await screen.findByRole("heading", { name: "Blocking issue" })).closest(".card") as HTMLElement;
     fireEvent.click(card.querySelector("button")!);
     expect(await screen.findByRole("alert")).toHaveTextContent("409 conflict");
+  });
+  it("opens the existing retry instead of promising a new mission", async () => {
+    mocks.extra = [{ ...failed, id: "m2", title: "Retry: Stopped run", status: "FAILED", retry_of_mission_id: "m1" }];
+    mocks.retry.mockClear();
+    render(<MemoryRouter initialEntries={["/missions?mission=m1"]}><MissionControlPage /></MemoryRouter>);
+    const card = (await screen.findByRole("heading", { name: "Blocking issue" })).closest(".card") as HTMLElement;
+    expect(card).toHaveTextContent("already retried as “Retry: Stopped run”");
+    expect(card).not.toHaveTextContent("starts a new mission");
+    expect(card.querySelector("button")).toHaveTextContent("Open retry");
+    mocks.extra = [];
   });
 });

@@ -5,6 +5,7 @@ export interface ActivityState {
   items: ActivityItem[];
   unread: number;
   connected: boolean;
+  seeded: boolean;
   seedError: string | null;
   open: boolean;
   setOpen: (open: boolean) => void;

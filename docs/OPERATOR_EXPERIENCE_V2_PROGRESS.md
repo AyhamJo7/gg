@@ -67,3 +67,13 @@ Fix plan:
       handoff capped.
 - [x] S-L1 Redact and cap finding `file`.
 - [x] S-L2 (covered by A-M3).
+
+### Review round 2 — security: OK TO MERGE; architecture: OK TO MERGE
+
+Fixed: split-secret fragment at SQL prefix cuts (margin trim + trailing-token
+strip), recent events exclude routine bookkeeping server-side with bounded
+payloads and an index (0018), `/ws/events` drops transient output, feed re-seeds
+on reconnect and shows loading, each stop counted once with the recorded cause,
+"Open retry" for idempotent retries, instant-based timestamp ordering, live
+mission titles, DAG arrow tones and no "done" edge into STALE tasks, relay never
+shows "0s" for unrecorded durations. Backend 661 passed; frontend 137 passed.

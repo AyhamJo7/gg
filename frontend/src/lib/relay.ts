@@ -95,3 +95,10 @@ export function runOutcomeLabel(outcome: string): string {
 export function relayAttentionCount(relay: MissionRelay): number {
   return relay.timeline.filter(e => e.kind === "run" && e.flags.some(f => f !== "CONTEXT_NOT_CAPTURED")).length;
 }
+
+/** Total provider time; never shows "0s" when no duration was recorded. */
+export function formatKnownDuration(knownMs: number, runs: number, unknownRuns: number): string {
+  if (runs > 0 && unknownRuns >= runs) return "duration not recorded";
+  const known = formatDuration(knownMs);
+  return unknownRuns ? `${known} + ${unknownRuns} run(s) of unknown length` : known;
+}

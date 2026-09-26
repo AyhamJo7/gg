@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from .. import git_ops
 from ..config import Config
 from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
+from ..events import TRANSIENT_TYPES
 from ..mission_summary import TerminalTrustCache, inherited_for, mission_trust, serialize_finding
 from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
@@ -1407,6 +1408,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         try:
             while True:
                 event = await queue.get()
+                # Workspace feed: transient provider output belongs to the
+                # per-mission stream and would crowd attention events out.
+                if event.type in TRANSIENT_TYPES:
+                    continue
                 await websocket.send_text(event.model_dump_json())
         except WebSocketDisconnect:
             pass

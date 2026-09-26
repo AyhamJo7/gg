@@ -88,6 +88,8 @@ export function MissionControlPage() {
     finally { setBusy(false); }
   };
   const retryable = !!mission && ["FAILED", "CANCELLED", "UNVERIFIED"].includes(mission.status);
+  // Retry is idempotent: an existing retry is opened, never re-created.
+  const existingRetry = mission ? missions?.find((m) => m.retry_of_mission_id === mission.id) ?? null : null;
 
   const refreshAll = () => {
     refreshMissions();
@@ -135,7 +137,7 @@ export function MissionControlPage() {
             <button disabled={busy} className="danger" onClick={() => act("cancel")}>Cancel mission</button>
           </>
         )}
-        {retryable && (
+        {retryable && !existingRetry && (
           <button onClick={retry} disabled={busy}>Retry mission</button>
         )}
       </div>
@@ -156,10 +158,12 @@ export function MissionControlPage() {
             <div className="card" style={{ borderColor: "var(--orange)" }}>
               <div className="row spread">
                 <h3>Blocking issue</h3>
-                {retryable && <button className="primary" onClick={retry} disabled={busy}>Retry mission</button>}
+                {retryable && existingRetry && <button className="primary" onClick={() => setSelectedId(existingRetry.id)}>Open retry</button>}
+                {retryable && !existingRetry && <button className="primary" onClick={retry} disabled={busy}>Retry mission</button>}
               </div>
               <pre className="muted scroll-box" style={{ margin: 0 }}>{mission.blocking_issue}</pre>
-              {retryable && <p className="muted">A retry starts a new mission that inherits unresolved findings; fix the cause above first if it is environmental.</p>}
+              {retryable && !existingRetry && <p className="muted">A retry starts a new mission that inherits unresolved findings; fix the cause above first if it is environmental.</p>}
+              {retryable && existingRetry && <p className="muted">This mission was already retried as “{existingRetry.title}” ({operatorLabel(existingRetry.status).toLowerCase()}).</p>}
             </div>
           )}
 

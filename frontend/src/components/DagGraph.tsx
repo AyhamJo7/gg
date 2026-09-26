@@ -12,6 +12,7 @@ export interface DagGraphProps {
 interface Edge { key: string; d: string; from: string; to: string }
 
 const EDGE_CURVE = 0.5;
+const EDGE_TONES = ["pending", "done", "focused"] as const;
 
 /** Measure node boxes and draw dependency curves (right edge → left edge). */
 function useDagEdges(dependencies: TaskDependency[], layoutKey: string) {
@@ -114,14 +115,18 @@ export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: Dag
       <div ref={containerRef} className="dag-canvas">
         <svg className="dag-edges" width={size.w} height={size.h} aria-hidden="true" data-testid="dag-edges">
           <defs>
-            <marker id="dag-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-              <path d="M0 0 L8 4 L0 8 z" fill="currentColor" />
-            </marker>
+            {EDGE_TONES.map(tone => (
+              <marker key={tone} id={`dag-arrow-${tone}`} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0 0 L8 4 L0 8 z" className={`dag-arrow ${tone}`} />
+              </marker>
+            ))}
           </defs>
           {edges.map(e => {
-            const upstreamDone = taskMap[e.from]?.status === "COMPLETED";
+            // "done" only when the upstream finished and the downstream input is not stale.
+            const upstreamDone = taskMap[e.from]?.status === "COMPLETED" && taskMap[e.to]?.status !== "STALE";
             const focused = activeTaskId === e.from || activeTaskId === e.to;
-            return <path key={e.key} d={e.d} className={`dag-edge ${upstreamDone ? "done" : ""} ${focused ? "focused" : ""}`} markerEnd="url(#dag-arrow)" />;
+            const tone = focused ? "focused" : upstreamDone ? "done" : "pending";
+            return <path key={e.key} d={e.d} className={`dag-edge ${tone}`} markerEnd={`url(#dag-arrow-${tone})`} />;
           })}
         </svg>
         <div className="dag-columns">

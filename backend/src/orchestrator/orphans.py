@@ -35,7 +35,9 @@ def verify_process_ownership(
         if actual_pgid != pgid:
             logger.warning(
                 "PID %d PGID mismatch: recorded=%d actual=%d — not killing",
-                pid, pgid, actual_pgid,
+                pid,
+                pgid,
+                actual_pgid,
             )
             return False
     except (ProcessLookupError, PermissionError):
@@ -72,7 +74,10 @@ def verify_process_ownership(
                     if abs(proc_starttime - expected_starttime_ticks) > 10 * clk_tck:
                         logger.warning(
                             "PID %d start time mismatch: recorded=%.1f proc_start=%d expected_ticks=%d — not killing",
-                            pid, started_at_ts, proc_starttime, expected_starttime_ticks,
+                            pid,
+                            started_at_ts,
+                            proc_starttime,
+                            expected_starttime_ticks,
                         )
                         return False
         except (OSError, ValueError, IndexError):

@@ -191,7 +191,7 @@ def test_handoffs_are_bounded_and_redacted(db: Database) -> None:
     entry = mission_relay(db, db.get("missions", "m1"))["timeline"][0]
     assert entry["kind"] == "handoff"
     assert entry["preview_truncated"] is True
-    assert len(entry["preview"]) == HANDOFF_PREVIEW_CHARS
+    assert len(entry["preview"]) <= HANDOFF_PREVIEW_CHARS
     assert entry["stored_chars"] == len(content)
     assert SECRET not in entry["preview"]
     full = handoff_content(db, "m1", "h1")
@@ -335,7 +335,7 @@ def test_full_handoff_is_capped(db: Database) -> None:
     full = handoff_content(db, "m1", "big")
     assert full is not None
     assert full["truncated"] is True
-    assert len(full["content"]) == HANDOFF_MAX_CHARS
+    assert len(full["content"]) <= HANDOFF_MAX_CHARS
     assert full["stored_chars"] == HANDOFF_MAX_CHARS + 10
 
 
@@ -360,3 +360,51 @@ def test_finding_file_is_redacted(db: Database) -> None:
         },
     )
     assert SECRET not in mission_relay(db, db.get("missions", "m1"))["findings"][0]["file"]
+
+
+def test_secret_split_by_preview_cut_is_not_leaked(db: Database) -> None:
+    """Security round 2 M1: a key straddling the SQL prefix cut."""
+    from orchestrator.relay import REDACTION_MARGIN_CHARS
+
+    cut = HANDOFF_PREVIEW_CHARS + REDACTION_MARGIN_CHARS
+    jwt = "eyJ" + "a" * 600 + "." + "eyJ" + "b" * 300 + "." + "c" * 300
+    key = "sk-ant-" + "Q" * 40
+    prefix = f"token {jwt} "
+    content = prefix + "p" * (cut - len(prefix) - 12) + key + " tail"
+    db.insert("handoffs", {"id": "h", "mission_id": "m1", "role": "r", "content": content, "created_at": "t"})
+    preview = mission_relay(db, db.get("missions", "m1"))["timeline"][0]["preview"]
+    assert "sk-ant-" not in preview
+
+
+def test_secret_split_by_full_cap_is_not_leaked(db: Database) -> None:
+    key = "sk-ant-" + "Q" * 40
+    content = "y" * (HANDOFF_MAX_CHARS - 12) + key
+    db.insert("handoffs", {"id": "big", "mission_id": "m1", "role": "r", "content": content, "created_at": "t"})
+    full = handoff_content(db, "m1", "big")
+    assert full is not None
+    assert full["truncated"] is True
+    assert "sk-ant-" not in full["content"]
+
+
+def test_long_jwt_cut_by_prefix_leaves_no_fragment(db: Database) -> None:
+    """Architecture round 2 L2: token longer than the redaction margin."""
+    from orchestrator.relay import REDACTION_MARGIN_CHARS
+
+    cut = HANDOFF_PREVIEW_CHARS + REDACTION_MARGIN_CHARS
+    start = HANDOFF_PREVIEW_CHARS - 50
+    jwt = "eyJhbGciOiJIUzI1NiJ9" + "a" * 700 + "." + "eyJzdWIi" + "b" * 50 + ".sig"
+    content = "p" * (start - 1) + " " + jwt + " tail"
+    assert start + len(jwt) > cut
+    db.insert("handoffs", {"id": "h", "mission_id": "m1", "role": "r", "content": content, "created_at": "t"})
+    preview = mission_relay(db, db.get("missions", "m1"))["timeline"][0]["preview"]
+    assert "eyJ" not in preview
+
+
+def test_recent_events_skip_routine_bookkeeping(tmp_path: Path) -> None:
+    database = Database(tmp_path / "ev.db")
+    _seed_mission(database)
+    orch = Orchestrator(database, make_config(), {"fake-a": FakeAdapter("fake-a", ["ok"])})
+    orch.events.publish(EventType.HUMAN_GATE_CREATED, "m1", reason="decide")
+    for _ in range(5):
+        orch.events.publish(EventType.LOCK_ACQUIRED, "m1")
+    assert [e["type"] for e in orch.events.recent(3)] == ["HUMAN_GATE_CREATED"]

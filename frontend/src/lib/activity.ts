@@ -51,8 +51,11 @@ export function describeEvent(event: ActivityEvent): ActivityItem | null {
     case "MISSION_CREATED": return make("Mission created", "info");
     case "MISSION_STATUS_CHANGED": {
       const status = str(p.status);
-      const attention = !!status && ["WAITING_FOR_HUMAN", "BLOCKED", "FAILED", "UNVERIFIED"].includes(status);
-      return make(withReason(`Now ${status ? operatorLabel(status).toLowerCase() : "in an unrecorded state"}`, p.reason), attention ? "attention" : "info", attention);
+      // FAILED and WAITING_FOR_HUMAN are followed by MISSION_FAILED /
+      // HUMAN_GATE_CREATED, which carry the attention; count each stop once.
+      const attention = status === "UNVERIFIED";
+      const stopped = !!status && ["WAITING_FOR_HUMAN", "FAILED", "UNVERIFIED"].includes(status);
+      return make(withReason(`Now ${status ? operatorLabel(status).toLowerCase() : "in an unrecorded state"}`, p.reason ?? p.blocking_issue), stopped ? "attention" : "info", attention);
     }
     case "MISSION_COMPLETED": return make("Mission completed — check its verdict for caveats", "good", true);
     case "MISSION_FAILED": return make(withReason("Mission stopped", p.reason), "bad", true);

@@ -99,6 +99,9 @@ def inherited_for(db: Database, mission: dict[str, Any]) -> tuple[list[dict[str,
     ``review.inherited_open_findings`` swallows lookup failures and returns
     ``[]``; a retry whose ancestor chain cannot be resolved is therefore
     reported here as unavailable instead of as "nothing inherited".
+    Known limit: if a single ancestor's findings query fails, the sealed
+    helper skips that ancestor and still returns normally, so that partial
+    undercount cannot be detected here.
     """
     mid = str(mission.get("id") or "")
     if not mid or not mission.get("retry_of_mission_id"):

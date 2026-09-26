@@ -381,3 +381,4 @@ kbd { font-family: var(--mono); font-size: 10.5px; padding: 1px 5px; border: 1px
 .dag-node { background: var(--bg-elevated); }
 .dag-dependency-list { margin-top: 8px; font-size: 11px; color: var(--text-faint); }
 .dag-dependency-list ul { margin: 6px 0 0; padding-left: 16px; }
+.dag-arrow { fill: var(--text-dim); } .dag-arrow.done { fill: var(--green); } .dag-arrow.focused { fill: var(--accent); }

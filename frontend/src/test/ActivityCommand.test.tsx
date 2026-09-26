@@ -7,14 +7,14 @@ import { activityHref, describeEvent, relativeTime } from "../lib/activity";
 import { commandMatches, commandScore } from "../lib/commands";
 import type { OrchestratorEvent } from "../lib/types";
 
-const mocks = vi.hoisted(() => ({ recent: vi.fn(), missions: vi.fn(), products: vi.fn(), onEvent: null as null | ((e: OrchestratorEvent) => void) }));
+const mocks = vi.hoisted(() => ({ recent: vi.fn(), missions: vi.fn(), products: vi.fn(), connected: true, onEvent: null as null | ((e: OrchestratorEvent) => void) }));
 vi.mock("../lib/api", () => ({ api: {
   events: { recent: mocks.recent },
   missions: { list: mocks.missions },
   lifecycle: { list: mocks.products },
 } }));
 vi.mock("../lib/ws", () => ({
-  useGlobalEvents: (cb: (e: OrchestratorEvent) => void) => { mocks.onEvent = cb; return { connected: true }; },
+  useGlobalEvents: (cb: (e: OrchestratorEvent) => void) => { mocks.onEvent = cb; return { connected: mocks.connected }; },
 }));
 
 const ev = (over: Partial<OrchestratorEvent> & { mission_title?: string }): OrchestratorEvent & { mission_title?: string } => ({
@@ -100,7 +100,7 @@ describe("CommandPalette", () => {
 });
 
 describe("Activity center", () => {
-  beforeEach(() => { localStorage.clear(); document.title = "GG Orchestrator"; });
+  beforeEach(() => { localStorage.clear(); document.title = "GG Orchestrator"; mocks.connected = true; mocks.missions.mockResolvedValue([]); });
   it("seeds history, counts unread attention, and clears it when opened", async () => {
     mocks.recent.mockResolvedValue([
       ev({ id: "a", type: "HUMAN_GATE_CREATED", payload: { reason: "credentials" }, mission_title: "Billing" }),
@@ -123,5 +123,42 @@ describe("Activity center", () => {
     fireEvent.click(screen.getByRole("button", { name: /Activity/ }));
     expect(await screen.findAllByText("Mission stopped: verification failed")).toHaveLength(1);
     expect(screen.getByRole("alert")).toHaveTextContent("Recent history could not be loaded.");
+  });
+  it("re-seeds history on reconnect so missed stops are not lost", async () => {
+    mocks.recent.mockResolvedValue([]);
+    const ui = () => <MemoryRouter><ActivityProvider><ActivityButton /><ActivityPanel /></ActivityProvider></MemoryRouter>;
+    const { rerender } = render(ui());
+    await waitFor(() => expect(mocks.recent).toHaveBeenCalled());
+    mocks.connected = false; rerender(ui());
+    mocks.recent.mockResolvedValue([ev({ id: "missed", type: "HUMAN_GATE_CREATED", payload: { reason: "while offline" } })]);
+    mocks.connected = true; rerender(ui());
+    await waitFor(() => expect(screen.getByLabelText("1 need attention")).toBeInTheDocument());
+  });
+  it("counts one failure once, with the recorded cause", async () => {
+    mocks.recent.mockResolvedValue([
+      ev({ id: "s", type: "MISSION_STATUS_CHANGED", payload: { status: "FAILED", blocking_issue: "verification failed" } }),
+      ev({ id: "f", type: "MISSION_FAILED", payload: { reason: "verification failed" } }),
+    ]);
+    render(<MemoryRouter><ActivityProvider><ActivityButton /><ActivityPanel /></ActivityProvider></MemoryRouter>);
+    await waitFor(() => expect(screen.getByLabelText("1 need attention")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /Activity/ }));
+    expect(await screen.findByText("Now stopped: verification failed")).toBeInTheDocument();
+  });
+  it("orders mixed timestamp formats by instant and names live missions", async () => {
+    mocks.recent.mockResolvedValue([ev({ id: "old", type: "MISSION_CREATED", created_at: "2026-09-12T01:00:00+00:00", mission_title: "Known" })]);
+    render(<MemoryRouter><ActivityProvider><ActivityButton /><ActivityPanel /></ActivityProvider></MemoryRouter>);
+    await waitFor(() => expect(mocks.recent).toHaveBeenCalled());
+    act(() => { mocks.onEvent?.(ev({ id: "new", type: "MISSION_PAUSED", created_at: "2026-09-12T01:00:01Z" })); });
+    fireEvent.click(screen.getByRole("button", { name: /Activity/ }));
+    const items = await screen.findAllByRole("listitem");
+    expect(items[0]).toHaveTextContent("Mission paused");
+    expect(items[0]).toHaveTextContent("Known");
+  });
+  it("shows loading until history arrives instead of claiming no activity", () => {
+    mocks.recent.mockReturnValue(new Promise(() => {}));
+    render(<MemoryRouter><ActivityProvider><ActivityButton /><ActivityPanel /></ActivityProvider></MemoryRouter>);
+    fireEvent.click(screen.getByRole("button", { name: /Activity/ }));
+    expect(screen.getByText("Loading recent activity…")).toBeInTheDocument();
+    expect(screen.queryByText("No activity recorded yet.")).not.toBeInTheDocument();
   });
 });

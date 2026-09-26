@@ -96,9 +96,7 @@ async def run_integration(
             task_id = branch_info["task_id"]
 
             # Idempotency: skip if this branch is already merged into HEAD
-            already_merged = await git_ops._spawn_git(
-                project_path, "branch", "--merged", "HEAD", "--list", branch
-            )
+            already_merged = await git_ops._spawn_git(project_path, "branch", "--merged", "HEAD", "--list", branch)
             if already_merged.stdout.strip():
                 summary_parts.append(f"already merged {branch}")
                 continue

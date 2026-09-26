@@ -24,12 +24,16 @@ class CodexAdapter(ProviderAdapter):
 
     def build_command(self, request: ExecutionRequest) -> list[str]:
         return [
-            self.executable, "exec",
+            self.executable,
+            "exec",
             "--json",
-            "--sandbox", "workspace-write",
+            "--sandbox",
+            "workspace-write",
             "--skip-git-repo-check",
-            "--color", "never",
-            "-C", str(request.workdir),
+            "--color",
+            "never",
+            "-C",
+            str(request.workdir),
             request.prompt,
         ]
 

@@ -59,13 +59,13 @@ Missions own tasks, runs, handoffs, findings, reviews, and mission gates.
 DAG edges, reservations, locks, branches, and integrations support parallel work.
 `provider_profiles` exists in the schema but is not used by routing.
 
-`db.py` uses one SQLite connection, WAL, foreign keys and a thread lock. Sixteen
+`db.py` uses one SQLite connection, WAL, foreign keys and a thread lock. Eighteen
 numbered migrations are applied at startup (0010: run attribution/stage/status/
 model columns, `run_context_manifests`, `run_usage`, `invocation_leases`,
 `orchestration_operations`; 0011: compiler manifest columns — budget/used/
 remaining estimates, repeated-context ratio, warnings, plan revision;
 0012–0013: artifact evidence/provenance and repository scope; 0014: dependency
-artifacts; 0015: repair cycles/attempts; 0016: product pause). Individual database
+artifacts; 0015: repair cycles/attempts; 0016: product pause; 0017: retry finding lineage; 0018: events recency index). Individual database
 calls usually commit separately; multi-step lifecycle mutations are not all atomic
 transactions. Run one backend owner per state directory; multi-process scheduling
 is unsupported. Historical runs keep NULL/UNKNOWN telemetry; never zero-filled.

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { AgentRelayView } from "../components/AgentRelay";
-import { flagText, formatChars, formatDuration, laneColorIndex, relayAttentionCount, relayLanes, runOutcomeLabel } from "../lib/relay";
+import { flagText, formatChars, formatDuration, formatKnownDuration, laneColorIndex, relayAttentionCount, relayLanes, runOutcomeLabel } from "../lib/relay";
 import type { MissionRelay, RelayHandoff, RelayRun } from "../lib/types";
 
 const mocks = vi.hoisted(() => ({ handoff: vi.fn() }));
@@ -42,7 +42,7 @@ const relay: MissionRelay = {
       recommended_fix: "", text_truncated: false, origin_review_id: "rv0", origin_sha: "1111111111", resolved_review_id: "rv1",
       resolved_sha: "2222222222", verified_by: "claude", inherited_from_mission_id: "44cdae6dbf4d45c5", created_at: null, resolved_at: null },
   ],
-  providers: [{ provider: "claude", runs: 1, succeeded: 1, not_succeeded: 0, in_flight: 0, outcome_unknown: 0, known_duration_ms: 642998, unknown_duration_runs: 1, roles: ["planning"] }],
+  providers: [{ provider: "claude", runs: 2, succeeded: 1, not_succeeded: 0, in_flight: 0, outcome_unknown: 0, known_duration_ms: 642998, unknown_duration_runs: 1, roles: ["planning"] }],
   runs_truncated: false,
   limits: { handoff_preview_chars: 1200, thin_evidence_block_chars: 500, lost_work_min_ms: 60000, run_limit: 500 },
 };
@@ -54,6 +54,8 @@ describe("relay helpers", () => {
     expect(formatDuration(438392)).toBe("7m 18s");
     expect(formatDuration(3_900_000)).toBe("1h 05m");
     expect(formatChars(null)).toBe("unknown size");
+    expect(formatKnownDuration(0, 4, 4)).toBe("duration not recorded");
+    expect(formatKnownDuration(60000, 3, 1)).toBe("1m 00s + 1 run(s) of unknown length");
   });
   it("orders lanes by first appearance and adds a GG lane only for unrecorded senders", () => {
     expect(relayLanes(relay)).toEqual(["claude", "codex", "agy"]);

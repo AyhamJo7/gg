@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from .context_compiler import BlockType, Priority
@@ -25,10 +26,11 @@ logger = logging.getLogger(__name__)
 # Handoffs routinely exceed 20k characters; the relay reads a bounded prefix
 # and serves the full redacted text on demand.
 HANDOFF_PREVIEW_CHARS = 1200
-# Extra prefix read past the preview so a secret straddling the preview
-# boundary is still matched (and redacted) as a whole before slicing.
+# Extra prefix read past the preview, then dropped after redaction, so a
+# secret split by the SQL cut is never returned as an unmatched fragment.
 REDACTION_MARGIN_CHARS = 512
 HANDOFF_MAX_CHARS = 1_000_000
+_TRAILING_TOKEN = re.compile(r"[A-Za-z0-9_\-.+/=]+$")
 RUN_SUMMARY_CHARS = 400
 # Evidence blocks below this size are flagged: the dogfood review ran on a
 # 131-character GIT_DIFF while believing it saw the change.
@@ -179,10 +181,25 @@ def _run_entry(run: dict[str, Any], manifest: dict[str, Any] | None) -> dict[str
     }
 
 
+def _redacted_prefix(raw_prefix: str, stored_chars: int) -> str:
+    """Redact a SQL prefix without leaking a secret split by the cut.
+
+    A secret straddling the cut survives as a fragment too short to match.
+    When the prefix is a cut, drop the redacted tail margin: any fragment long
+    enough to remain is at least the margin long and matches every pattern.
+    """
+    redacted = redact(raw_prefix)
+    if stored_chars > len(raw_prefix):
+        trimmed = redacted[: max(0, len(redacted) - REDACTION_MARGIN_CHARS)]
+        # A token longer than the margin (e.g. a JWT) may still be cut
+        # before its closing structure: drop any trailing token-like run.
+        return _TRAILING_TOKEN.sub("", trimmed)
+    return redacted
+
+
 def _handoff_entry(row: dict[str, Any]) -> dict[str, Any]:
-    # ``head`` is a SQL prefix of the stored content: redact once, then slice.
-    head = redact(str(row.get("head") or ""))
     stored = int(row.get("stored_chars") or 0)
+    head = _redacted_prefix(str(row.get("head") or ""), stored)
     preview = head[:HANDOFF_PREVIEW_CHARS]
     return {
         "kind": "handoff",
@@ -323,7 +340,7 @@ def handoff_content(db: Database, mission_id: str, handoff_id: str) -> dict[str,
         "from_provider": row.get("from_provider"),
         "to_provider": row.get("to_provider"),
         "role": row.get("role"),
-        "content": redact(str(row.get("head") or "")),
+        "content": _redacted_prefix(str(row.get("head") or ""), stored),
         "stored_chars": stored,
         "truncated": stored > HANDOFF_MAX_CHARS,
         "created_at": row.get("created_at"),

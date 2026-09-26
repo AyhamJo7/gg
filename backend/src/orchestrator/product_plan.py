@@ -168,9 +168,7 @@ def validate_product_plan(data: dict[str, Any]) -> list[str]:
             if not a.id.strip():
                 errors.append(f"requirement {r.id} has a criterion with a blank id")
             elif a.id in seen_criteria:
-                errors.append(
-                    f"duplicate criterion id: {a.id} (in {seen_criteria[a.id]} and {r.id})"
-                )
+                errors.append(f"duplicate criterion id: {a.id} (in {seen_criteria[a.id]} and {r.id})")
             else:
                 seen_criteria[a.id] = r.id
             ok, _ = is_executable_command(a.verify)
