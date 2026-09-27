@@ -1,0 +1,16 @@
+{
+  "restore_generated": ["frontend/tsconfig.tsbuildinfo"],
+  "gates": [
+    {"name": "build", "run": "make build", "timeout": 900},
+    {"name": "lint", "run": "make lint", "timeout": 600},
+    {"name": "typecheck", "run": "make typecheck", "timeout": 600},
+    {"name": "unit", "run": "make test", "timeout": 2400}
+  ],
+  "fast": ["lint", "typecheck"],
+  "stress": {
+    "run": "cd backend && uv run pytest -q -p no:cacheprovider {targets}",
+    "default_targets": "tests",
+    "iterations": 20,
+    "timeout": 1200
+  }
+}
