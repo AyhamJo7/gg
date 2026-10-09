@@ -1,111 +1,190 @@
+<div align="center">
+
 # GG Orchestrator
 
-GG is a local software-building orchestrator for authenticated CLI subscriptions.
-Its React browser UI drives a Python/FastAPI backend, SQLite state, Git checkpoints,
-and installed `claude`, `codex`, `agy`, and `opencode` adapters. It does not require
-a paid API-key gateway. Authentication and account access belong to the CLIs;
-installation alone does not prove available quota.
+**A local control plane for coding agents, from task planning to artifact verification.**
 
-## Start locally
+React · TypeScript · FastAPI · SQLite · Git worktrees
 
-Requires Python 3.12+, `uv`, Node/npm, Git, and authenticated provider CLIs on PATH.
-Objective verification additionally requires Linux `bubblewrap` (`bwrap`) with
-working unprivileged user namespaces. It fails closed when unavailable.
+[Get started](#get-started) · [Architecture](ARCHITECTURE.md) · [Providers](PROVIDERS.md) · [Security](SECURITY.md) · [Rights reserved](LICENSE)
+
+</div>
+
+## Overview
+
+GG coordinates authenticated coding CLIs through a browser interface. It turns a
+repository task or product plan into an observable execution workflow: planning,
+implementation, testing, review, integration and technical verification.
+
+Built end to end by [Ayham Joumran](https://github.com/AyhamJo7), including the
+React/TypeScript interface, FastAPI backend, SQLite persistence, provider adapters
+and regression tests.
+
+**Current scope:** local, single-operator software. GG is not a hosted multi-user
+service. It uses installed provider CLIs and their existing authentication;
+availability depends on your accounts, installed versions and provider capacity.
+
+## Capabilities
+
+| Capability | How it works |
+| --- | --- |
+| Multiple coding providers | Adapters for Claude Code, Codex, Antigravity and OpenCode |
+| Parallel development | Dependency-aware tasks in separate Git worktrees, followed by integration |
+| Product planning | Structured requirements, architecture and sequential roadmap phases |
+| Review and repair | Review findings, bounded repair attempts and explicit stop reasons |
+| Objective verification | Toolchain and acceptance commands confined with Linux bubblewrap |
+| Artifact provenance | Repository- and commit-scoped review, verification and delivery evidence |
+| Recovery | Persisted execution state, process ownership and restart reconciliation |
+| Operator visibility | Mission progress, provider invocations, context manifests and usage provenance |
+
+The distinction between an agent finishing and an artifact passing acceptance is
+central to GG. A mission can finish while its product remains blocked or unverified.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    UI[React operator interface] --> API[FastAPI: REST and WebSockets]
+    API --> O[Scheduler and mission orchestration]
+    O --> SEQ[Sequential workflow]
+    O --> PAR[Parallel task graph]
+    PAR --> WT[Separate Git worktrees]
+    WT --> INT[Integration and review]
+    SEQ --> CLI[Authenticated provider CLIs]
+    WT --> CLI
+    INT --> VERIFY[Sandboxed technical verification]
+    SEQ --> VERIFY
+    O --> DB[SQLite state and invocation records]
+    VERIFY --> EV[Evidence tied to repository and commit]
+    classDef default fill:#eef2ff,stroke:#6366f1,color:#172554,stroke-width:1.5px
+```
+
+[Current architecture](ARCHITECTURE.md) describes implemented behavior and known
+limits. The separate [architecture audit](docs/ARCHITECTURE.md) includes proposals;
+its recommendations are not a feature list.
+
+## Get started
+
+Requirements: Python 3.12+, `uv`, Node/npm, Git and at least one authenticated
+provider CLI on `PATH`. Objective verification also requires Linux `bubblewrap`
+(`bwrap`) with working unprivileged user namespaces. Verification fails closed
+when its sandbox is unavailable.
+
+From a local source checkout:
 
 ```bash
 make install
 make dev
 ```
 
-Open **http://localhost:5173**. The backend listens on **127.0.0.1:8787**.
-`make dev` creates the local auth token before starting Vite. Under the Makefile,
-state and token live in `backend/.orchestrator/`; the configured database path is
-relative to the backend's working directory. Do not publish the built frontend:
-Vite embeds this checkout's bearer token.
+Open **http://localhost:5173**. The backend binds to **127.0.0.1:8787**.
+Provider selection and priorities are configured in
+[`config/orchestrator.yaml`](config/orchestrator.yaml).
+
+`make dev` initializes the local bearer token before starting Vite. State and token
+live in `backend/.orchestrator/` under this workflow. Run one backend per state
+directory.
+
+> **Local interface only:** Vite embeds this checkout's bearer token at dev/build
+> time. Do not publish the built frontend, expose the service through a public
+> tunnel, or upload runtime state and logs.
 
 ## Two workflows
 
-- **Idea → Product:** create a product idea, generate a structured plan, inspect
-  requirements/architecture/roadmap, then select **Start Project**. Each roadmap
-  phase becomes a sequential mission. External prerequisites appear as Human
-  Gates. Final acceptance checks requirements and replays the detected toolchain
-  in a fresh checkout before recording a delivery SHA and report.
-- **Repositories → New Mission:** register an existing repository and request work.
-  Choose sequential execution or **Parallel Safe**, optionally supplying a task
-  DAG. Parallel tasks use separate Git worktrees and a later integration step.
+### Work on an existing repository
 
-The **Overview** groups attention, ongoing work, recent outcomes, and provider
-availability. **Repositories** registers codebases; **Products** manages product
-lifecycles; **Missions** opens individual execution details. Product pages default
-to current work, repair progress, and verification, with plans and exact evidence
-in separate sections. Product creation and plan generation are separate
-steps. Use the explicit Start action: the current auto-execute/approval fields do
-not provide a reliable unattended approval workflow.
+Register a repository, create a mission, and choose sequential execution or
+**Parallel Safe**. Parallel tasks use separate worktrees and an integration step.
+Inspect the plan, execution results, review findings and technical checks.
 
-## What completion means
+### Develop a product from an idea
 
-Missions include planning, implementation, testing, review/repair, and deterministic
-toolchain verification. `COMPLETED` is a mission verdict; `DELIVERED` is a separate
-product verdict. Review independence currently compares provider names and can
-degrade to disclosed self-review. Unavailable or failed verification can produce
-`UNVERIFIED`; product acceptance can become `BLOCKED`.
+Create an idea, generate its plan, inspect requirements and architecture, then
+select **Start Project**. Roadmap phases become sequential missions. External
+prerequisites become Human Gates; product acceptance checks executable criteria
+and repeats the detected toolchain in a fresh checkout before recording delivery.
 
-Requirement checks run allowlisted commands in a sandbox. Human Gates support
-external setup and variable-name checks; configure secret values in your own
-editor, never in plan text or resolution notes. Waivers are explicit exceptions,
-not proof that a requirement passed. Fresh-checkout verification repeats
-the detected toolchain and executable requirement-specific criteria. Delivery
-requires current repository/SHA-bound evidence; historical passes cannot certify
-a changed checkout.
+Use the explicit Start action. Current auto-execute/approval fields do not provide
+a reliable unattended approval workflow.
 
-Blocked acceptance is triaged into bounded autonomous repair: only well-scoped
-implementation defects with deterministic evidence are repaired automatically
-(default 2 attempts per cycle), with mandatory independent review and exact
-recheck. Environment, credential, ambiguous, contradictory, conflict, and unknown
-failures stop with a persisted reason and an operator-visible gate instead.
+## From task to evidence
 
-## Providers and safety
+```mermaid
+sequenceDiagram
+    actor Operator
+    participant GG as GG orchestrator
+    participant Agents as Coding CLIs
+    participant Git as Git worktrees
+    participant Checks as Sandboxed checks
+    Operator->>GG: Submit mission and inspect plan
+    GG->>Agents: Dispatch scoped tasks
+    Agents->>Git: Produce candidate changes
+    GG->>Git: Integrate parallel results
+    GG->>Agents: Request review / bounded repair
+    GG->>Checks: Verify candidate commit
+    Checks-->>GG: Results tied to repository + SHA
+    GG-->>Operator: Verdict, findings and evidence
+```
 
-Configure providers in [config/orchestrator.yaml](config/orchestrator.yaml).
-All four adapters are enabled there; the current OpenCode default is
-`opencode-go/muse-spark-1.3-contributor` with `variant: xhigh`. Other adapters inherit
-their CLI model defaults. Role priorities and saved profiles are editable in the
-browser; profile behavior differs between execution paths.
+## What the verdicts mean
 
-Provider processes have substantial local authority. GG's verification sandbox
-does not uniformly sandbox provider CLIs. Raw provider logs are sensitive local
-files; streamed output is redacted heuristically. Git checkpoints exclude internal
-runtime files and recognized secrets. See [SECURITY.md](SECURITY.md) for the actual
-boundaries, including network-enabled dependency installation.
+| Verdict | Meaning |
+| --- | --- |
+| `COMPLETED` | Mission execution verdict; separate from product delivery |
+| `DELIVERED` | Product acceptance verdict backed by current repository/commit evidence |
+| `UNVERIFIED` | Required verification is unavailable or has not established acceptance |
+| `BLOCKED` | Acceptance or prerequisites prevent progression |
 
-## Invocation observability
+Code-changing autonomous repairs require an independent reviewer outside the
+candidate's writer set and an exact-commit recheck. Other review paths can degrade
+to disclosed self-review; inspect reviewer provenance. Repair budgets bound
+attempts, and environment or ambiguous failures stop for operator intervention.
 
-Every provider execution is one durable invocation with owner/stage, terminal
-outcome, prompt manifest (`~N estimated` via `char4-v1`), usage provenance
-(`PROVIDER_REPORTED`/`CLI_REPORTED`/`UNKNOWN` with `COMPLETE`/`PARTIAL`/`UNKNOWN`),
-and lease-owned cancellation/recovery. Inspect runs at `/api/runs`,
-`/api/runs/{id}`, `/api/runs/{id}/context`, and `/api/analytics/usage`; the UI
-Run Inspector shows the same without ever rendering unknown as zero.
-Artifact evidence (writers, exact-SHA review/verification/criteria/fresh
-status, delivery readiness) is read-only at
-`/api/product-projects/{id}/evidence` and on the product Overview and Delivery &
-evidence sections. Activity shows the latest 50 attributed provider invocations;
-it is not a complete lifecycle event timeline.
+## Design decisions
 
-## Development and documentation
+- **Git worktrees isolate parallel changes.** Integration remains an explicit
+  stage; parallel execution does not guarantee conflict-free results.
+- **SQLite keeps deployment local.** Durable state supports recovery without a
+  separate database service; multiple backend owners are unsupported.
+- **Checks are tied to artifacts.** Historical passing checks cannot certify a
+  changed commit or another repository.
+- **Usage has provenance.** Provider-reported, CLI-reported and unknown usage stay
+  distinct. GG does not infer subscription quota or billing from token estimates.
 
-`make test`, `make lint`, and `make typecheck` are deterministic development checks.
-`make smoke` invokes real providers and consumes subscription capacity.
+## Development and safety
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): current components, state, and limitations.
-- [DEVELOPMENT.md](DEVELOPMENT.md): commands, tests, migrations, desktop shell.
-- [PROVIDERS.md](PROVIDERS.md): commands, output formats, usage visibility.
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md): operator recovery and diagnostics.
-- [AGENTS.md](AGENTS.md): concise contributor instructions.
-- [Architecture audit and proposed blueprint](docs/ARCHITECTURE.md): assessment
-  dated 2026-09-10; proposals are not implemented features.
-- [Operator experience retrospective](docs/OPERATOR_EXPERIENCE_REVIEW.md):
-  implementation review, browser evidence, and frontend evolution.
+```bash
+make test-backend
+make test-frontend
+make lint
+make typecheck
+make e2e
+```
 
-Historical release reports and ADRs live under `docs/`. Their verification claims
-apply to their recorded versions; current source takes precedence.
+Routine tests use fake providers and temporary fixtures. `make smoke` and real
+missions invoke providers and consume account capacity.
+
+Provider CLIs have substantial local authority and are not uniformly sandboxed.
+The objective-check sandbox does not contain every provider action. Raw local logs
+can contain confidential request content; output redaction is heuristic. Read
+[SECURITY.md](SECURITY.md) before selecting repositories or exposing any interface.
+
+## Documentation
+
+| Document | Purpose |
+| --- | --- |
+| [Architecture](ARCHITECTURE.md) | Components, execution semantics, evidence and limits |
+| [Development](DEVELOPMENT.md) | Setup, checks, migrations and desktop shell |
+| [Providers](PROVIDERS.md) | Adapter contracts and output/usage visibility |
+| [Troubleshooting](TROUBLESHOOTING.md) | Recovery and operator diagnostics |
+| [Publication preparation](PUBLICATION.md) | History review, packaging boundaries and outstanding release decisions |
+
+## License and public inspection
+
+**Proprietary · All rights reserved.** This repository is available for portfolio
+inspection. It is not open source; running, modifying, deploying or redistributing
+it requires prior written permission. GitHub platform rights and third-party
+license terms remain applicable. See [LICENSE](LICENSE).
+
+The setup instructions document the author's workflow and do not grant a usage
+license. See [PUBLICATION.md](PUBLICATION.md) for the publication review record.
