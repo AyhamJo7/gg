@@ -27,3 +27,6 @@ frontend/src-tauri/target/
 # OS / editor
 .DS_Store
 *.swp
+
+# TypeScript incremental build state (rewritten by tsc -b)
+*.tsbuildinfo
