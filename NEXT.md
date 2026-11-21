@@ -6,62 +6,68 @@ Operator Experience v1 are not reopened without evidence from a real run.
 
 ## State
 
-- Branch `feature/operator-experience-v2`, draft PR #6 into `main` (mergeable, no CI
-  checks exist: the repo has no `.github/` workflows).
+- Branch `feature/operator-experience-v2`, draft PR #6 into `main` (mergeable). `main`
+  has no branch protection and the repo has no `.github/` workflows, so no CI exists.
 - Progress record: [docs/OPERATOR_EXPERIENCE_V2_PROGRESS.md](docs/OPERATOR_EXPERIENCE_V2_PROGRESS.md);
-  every tier and review round 1-7 is closed with no open Critical/High/Medium findings.
-- Draft PR #7 (`chore/claude-gates`) adds `.claude/gates.json`; until it merges,
-  `gates preflight` fails with "no gates config". Run the Makefile gates directly.
+  tiers and review rounds 1-7 are closed. Round 8 (below) covers the e2e/docs commits.
+- Draft PR #7 (`chore/claude-gates`) adds `.claude/gates.json` and untracks
+  `frontend/tsconfig.tsbuildinfo`; it asks for an e2e gate once PR #6 lands. Until then
+  `gates preflight` fails with "no gates config". Never stage `tsconfig.tsbuildinfo`
+  (`tsc -b` rewrites it; it shows as modified).
 
-## Verified gates (WSL, Node v26.10.0, Python 3.12)
+## Verified gates (WSL, Node v26.10.0, Python 3.12) at `cb8bdd5`
 
-| Gate | Command | SHA | Result |
-|---|---|---|---|
-| Backend tests | `make test-backend` (699 tests, ~10.5 min) | 93cbfe1 | RUN+PASSED |
-| Backend lint | `uv run ruff check src tests` | 93cbfe1 | RUN+PASSED |
-| Backend types | `uv run mypy src` | 93cbfe1 | RUN+PASSED |
-| Frontend tests | `npm --prefix frontend run test -- --run` (140 tests) | 4f0c07c | RUN+PASSED |
-| Frontend lint | `npm --prefix frontend run lint` | 4f0c07c | RUN+PASSED |
-| Frontend types | `npm --prefix frontend run typecheck` | 4f0c07c | RUN+PASSED |
-| Browser e2e | `make e2e` | 93cbfe1 | RUN+FAILED (environment, see below) |
+| Gate | Command | Result |
+|---|---|---|
+| Backend tests | `make test-backend` (700 tests, ~11 min) | RUN+PASSED |
+| Backend lint / types | `make lint`, `make typecheck` | RUN+PASSED |
+| Frontend tests | `npm --prefix frontend run test -- --run` (140 tests) | RUN+PASSED |
+| Frontend lint / types | `make lint`, `make typecheck` | RUN+PASSED |
+| Browser e2e | `make e2e` (6 checks, isolated, fake providers) | RUN+PASSED |
 
-The only change between 93cbfe1 and 4f0c07c is `frontend/src/test/setup.ts`; backend
-results carry over by diff, not by re-run.
+Commits after this record are documentation only. Re-run on any later code change.
 
 ## Done this session
 
-- Found and fixed a baseline failure: on Node 25+ the built-in `localStorage` getter
-  returns `undefined` and shadows jsdom's Storage, so 8 `ActivityCommand` tests failed
-  on Node 26 independent of the code. `frontend/src/test/setup.ts` now installs an
-  in-memory Storage (4f0c07c). Before: 8 failed / 132 passed; after: 140 passed.
+- `4f0c07c` Test setup installs an in-memory `localStorage`: on Node 25+ the built-in
+  global shadowed jsdom's, failing 8 `ActivityCommand` tests regardless of the code.
+- Installed Playwright Chromium (`npx playwright install chromium`); e2e now runs.
+- Review round 8 (independent `security-reviewer`, e2e harness + public docs): no
+  Critical/High. Fixed M1/M2/L1-L5 in `1d78941` and `cb8bdd5`; L6 is PR #7.
+- `6530480` Real defect found via the e2e leak: a connected UI websocket held uvicorn's
+  graceful shutdown open forever, so SIGTERM/Ctrl-C never reached
+  `orchestrator.shutdown()`. `server.build_uvicorn_config` now sets
+  `GRACEFUL_SHUTDOWN_SECONDS = 3`; `tests/test_server_shutdown.py` fails (13 s timeout)
+  without it.
 
-## Blocked (human-owned)
+## Next (ordered)
 
-1. **Browser e2e not run.** Playwright's Chromium is not installed
-   (`~/.cache/ms-playwright/chromium_headless_shell-1243` missing). Run
-   `cd frontend && npx playwright install chromium`, then `make e2e` (isolated:
-   temp state dir, ports 8799/5174, fake providers, no quota).
-2. **PR #6 merge** is a product decision (draft, no CI, no reviewer assigned).
-3. **No CI.** There are no GitHub Actions workflows, so nothing enforces the gates
-   above on push. Adding one runs on hosted runners; decide before it is built.
+1. Push, mark PR #6 ready and merge it (no protection, no CI; gates above are the
+   evidence). Then verify `main` at the merge SHA.
+2. Rebase PR #7 on `main`, add `{"name": "e2e", "run": "make e2e", "timeout": 1800}` to
+   `.claude/gates.json`, run `gates preflight`, merge.
+3. Further work only from real dogfood evidence (`docs/dogfood/`).
 
-## Known gaps (documented, deliberately not built)
+## Human decisions
 
+- Author email remains in commit metadata (`PUBLICATION.md`); acceptable for publication?
+- Adding GitHub Actions CI (hosted runner minutes) is not done.
+
+## Known gaps (documented, not built)
+
+- On forced shutdown uvicorn logs a `CancelledError` traceback per still-open websocket
+  (visible at the end of `make e2e`). Harmless; the websocket handlers could close on
+  shutdown instead.
 - `repair_worker` does not carry failover notes (no reliable retry-to-failed-run link
-  without touching sealed Increment 4 semantics). Port only if a dogfood run shows
-  duplicated work there.
+  without touching sealed Increment 4 semantics). Port only if dogfood shows duplicated work.
 - Reset hints in JSON notices whose type is neither error nor fail are not read.
-- The repo pins no Node version; the suite is verified on v26.10.0 only.
-
-## Next
-
-1. After the human steps above: `make e2e`, then mark PR #6 ready or merge per decision.
-2. Further work comes from real dogfood evidence (`docs/dogfood/`), not speculation.
+- The repo pins no Node version; verified on v26.10.0 only.
+- `tests/conftest.py` has mypy errors under `mypy tests` (the gate checks `src` only).
 
 ## Resume
 
 ```
 git status && git log --oneline -5
-make lint && make typecheck && make test-frontend
-make test-backend          # ~10 min; run in the background
+make lint && make typecheck && make test-frontend && make e2e
+make test-backend          # ~11 min; run in the background
 ```
