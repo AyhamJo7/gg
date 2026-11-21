@@ -2,6 +2,8 @@
 
 # GG Orchestrator
 
+  <img src=".github/assets/banner.png" alt="GG Orchestrator" width="800" />
+
 **A local control plane for coding agents, from task planning to artifact verification.**
 
 React · TypeScript · FastAPI · SQLite · Git worktrees
