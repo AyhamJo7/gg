@@ -23,6 +23,7 @@ from orchestrator.db import Database
 from orchestrator.models import EventType
 from orchestrator.orchestrator import Orchestrator
 from orchestrator.providers.fake import FakeAdapter
+from orchestrator.server import build_uvicorn_config
 
 MISSION_ID = "e2e-rr"
 FIXTURE_TS = "2026-09-12T01:00:00+00:00"
@@ -166,7 +167,7 @@ def main() -> None:
     config = _config()
     orch = Orchestrator(db, config, {"fake-a": FakeAdapter("fake-a", ["ok"])})
     orch.events.publish(EventType.MISSION_COMPLETED, MISSION_ID)
-    uvicorn.run(create_app(db_path, config, orch), host="127.0.0.1", port=port, log_level="warning")
+    uvicorn.Server(build_uvicorn_config(create_app(db_path, config, orch), "127.0.0.1", port, "warning")).run()
 
 
 if __name__ == "__main__":
