@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { statusColor } from "../components/Badge";
+import { statusColor } from "../lib/status";
 
 describe("statusColor", () => {
   it("maps lifecycle states", () => {

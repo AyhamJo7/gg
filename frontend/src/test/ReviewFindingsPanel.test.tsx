@@ -21,4 +21,20 @@ describe("ReviewFindingsPanel", () => {
     expect(screen.getByText("Spacing")).toBeInTheDocument();
     expect(screen.getByText("2 blocker/high")).toBeInTheDocument();
   });
+
+  it("lists inherited unresolved findings and never calls a repair claim verified", () => {
+    const inherited: ReviewFinding[] = [
+      { id: "i1", mission_id: "parent", severity: "MEDIUM", category: "security", file: null, description: "Rate limit missing",
+        recommended_fix: "", status: "repair_attempted", created_at: "", inherited_from_mission_id: "44cdae6dbf4d45c5" },
+    ];
+    render(<ReviewFindingsPanel findings={[]} inherited={inherited} />);
+    expect(screen.getByText("Rate limit missing")).toBeInTheDocument();
+    expect(screen.getByText(/Repair claimed · not verified/)).toHaveTextContent("inherited from 44cdae6d");
+    expect(screen.getByText("1 unresolved")).toBeInTheDocument();
+  });
+
+  it("says when inherited history could not be read", () => {
+    render(<ReviewFindingsPanel findings={[]} inherited={null} />);
+    expect(screen.getByText("Findings inherited from earlier attempts could not be loaded.")).toBeInTheDocument();
+  });
 });

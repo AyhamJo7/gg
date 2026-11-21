@@ -184,8 +184,20 @@ class ProviderRegistry:
             (ProviderState.AVAILABLE.value, cooldown_until, name),
         )
 
-    def record_failure(self, name: str, failure: FailureClass, runtime_s: float, error: str) -> ProviderState:
-        """Apply exponential cooldown. Returns the recorded state."""
+    def record_failure(
+        self,
+        name: str,
+        failure: FailureClass,
+        runtime_s: float,
+        error: str,
+        stated_reset_s: float | None = None,
+    ) -> ProviderState:
+        """Apply exponential cooldown. Returns the recorded state.
+
+        ``stated_reset_s`` is the provider's own "try again at/in" hint; for
+        rate/quota limits it raises the cooldown floor so a provider is not
+        re-selected before the time it announced (dogfood 2026-09-12).
+        """
         base = float(self._config.get("orchestration.cooldown_base_seconds", 60))
         mult = float(self._config.get("orchestration.cooldown_multiplier", 2.0))
         cap = float(self._config.get("orchestration.cooldown_max_seconds", 3600))
@@ -195,6 +207,21 @@ class ProviderRegistry:
         if failure == FailureClass.QUOTA_EXHAUSTED:
             # Daily or long-horizon quota limit: enforce minimum 4-hour floor (F-18)
             cooldown_s = max(cooldown_s, float(self._config.get("orchestration.quota_cooldown_seconds", 14400)))
+        if stated_reset_s and failure in (FailureClass.RATE_LIMIT, FailureClass.QUOTA_EXHAUSTED):
+            # Provider text is untrusted: bounded by config, and shown to the
+            # operator as the reason for the longer cooldown.
+            # Default cap = the quota floor: plain-text output (which cannot be
+            # told apart from model prose) can bench a provider at most that long.
+            stated_cap = float(
+                self._config.get(
+                    "orchestration.stated_reset_max_seconds",
+                    self._config.get("orchestration.quota_cooldown_seconds", 14400),
+                )
+            )
+            stated = min(stated_reset_s, stated_cap)
+            if stated > cooldown_s:
+                cooldown_s = stated
+                error = f"provider-stated reset in {int(stated)}s; {error}"
         state_by_failure = {
             FailureClass.RATE_LIMIT: ProviderState.RATE_LIMITED,
             FailureClass.QUOTA_EXHAUSTED: ProviderState.RATE_LIMITED,

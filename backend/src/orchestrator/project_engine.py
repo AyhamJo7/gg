@@ -472,7 +472,7 @@ class ProjectCoordinator:
             stage=STAGE_PRODUCT_PLANNING,
             product_project_id=project_id,
             provider=provider_name,
-            task_objective=f"{_row.get('idea', '')}\n{_row.get('constraints_text', '')}",
+            task_objective=str(_row.get("constraints_text", "") or _row.get("idea", "")),
             task_title=str(_row.get("name", project_id)),
             task_description=str(_row.get("idea", "")),
             extra_context=prompt,

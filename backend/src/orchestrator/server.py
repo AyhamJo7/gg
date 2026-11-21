@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import uvicorn
+from starlette.types import ASGIApp
 
 from .api.app import create_app
 from .config import Config
@@ -15,6 +16,16 @@ from .orchestrator import Orchestrator
 from .providers import ProviderAdapter, build_real_adapters
 
 logger = logging.getLogger(__name__)
+
+# Open UI websockets otherwise keep uvicorn's graceful shutdown waiting forever,
+# so SIGTERM/Ctrl-C never reached orchestrator.shutdown() while a tab was open.
+GRACEFUL_SHUTDOWN_SECONDS = 3
+
+
+def build_uvicorn_config(app: ASGIApp, host: str, port: int, log_level: str = "info") -> uvicorn.Config:
+    return uvicorn.Config(
+        app, host=host, port=port, log_level=log_level, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS
+    )
 
 
 def build_orchestrator(
@@ -57,12 +68,7 @@ def main() -> None:
     orchestrator = build_orchestrator(db_path, config)
     app = create_app(db_path, config, orchestrator)
     port = int(os.environ.get("GG_SERVER_PORT") or config.get("server.port", 8787))
-    uvicorn.run(
-        app,
-        host=config.get("server.host", "127.0.0.1"),
-        port=port,
-        log_level="info",
-    )
+    uvicorn.Server(build_uvicorn_config(app, config.get("server.host", "127.0.0.1"), port)).run()
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return (await resp.json()) as T;
 }
 
+import type { ActivityEvent } from "./activity";
 import type {
   Analytics,
   ArtifactEvidence,
@@ -33,9 +34,11 @@ import type {
   DagDependencyInput,
   DagTaskInput,
   GitState,
+  HandoffContent,
   Mission,
   MissionDag,
   MissionDetail,
+  MissionRelay,
   PriorityMatrix,
   ProductProjectDetail,
   ProductProjectSummary,
@@ -48,6 +51,9 @@ import type {
 } from "./types";
 
 export const api = {
+  events: {
+    recent: (limit: number) => req<ActivityEvent[]>(`/api/events/recent?limit=${limit}`),
+  },
   projects: {
     list: () => req<Project[]>("/api/projects"),
     add: (path: string, name?: string) =>
@@ -64,6 +70,9 @@ export const api = {
     list: (projectId?: string) =>
       req<Mission[]>(`/api/missions${projectId ? `?project_id=${projectId}` : ""}`),
     get: (id: string) => req<MissionDetail>(`/api/missions/${id}`),
+    relay: (id: string) => req<MissionRelay>(`/api/missions/${encodeURIComponent(id)}/relay`),
+    handoff: (id: string, handoffId: string) =>
+      req<HandoffContent>(`/api/missions/${encodeURIComponent(id)}/handoffs/${encodeURIComponent(handoffId)}`),
     create: (body: {
       project_id: string;
       title: string;

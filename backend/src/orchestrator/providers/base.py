@@ -17,7 +17,7 @@ from typing import Any
 
 from ..models import FailureClass, ProviderState, utcnow
 from ..process import run_process
-from .classify import FAILURE_TO_STATE, classify_output
+from .classify import FAILURE_TO_STATE, RAW_TAIL_CHARS, classify_output
 
 OutputHandler = Callable[[str], None]
 
@@ -175,7 +175,7 @@ class ProviderAdapter(abc.ABC):
             argv=argv,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
-            raw_tail=result.combined_tail[-4000:],
+            raw_tail=result.combined_tail[-RAW_TAIL_CHARS:],
             assistant_text=self.extract_assistant_text(result.stdout_tail),
             started_at=started.isoformat(),
             finished_at=finished.isoformat(),

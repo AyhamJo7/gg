@@ -27,6 +27,7 @@ from .context_manifest import (
     measure_prompt,
 )
 from .models import FailureClass, ProviderState, utcnow
+from .providers.classify import parse_reset_after
 from .security import redact
 
 logger = logging.getLogger(__name__)
@@ -783,7 +784,11 @@ class InvocationService:
                     self._registry.record_success(spec.provider, result.duration_s)
                 else:
                     self._registry.record_failure(
-                        spec.provider, failure, result.duration_s, (result.raw_tail or "")[:300]
+                        spec.provider,
+                        failure,
+                        result.duration_s,
+                        (result.raw_tail or "")[:300],
+                        stated_reset_s=parse_reset_after(result.raw_tail or ""),
                     )
             except Exception:
                 logger.warning("provider health update failed for run %s", run_id, exc_info=True)

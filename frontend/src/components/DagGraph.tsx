@@ -1,3 +1,4 @@
+import { useLayoutEffect, useRef, useState } from "react";
 import { Badge } from "./Badge";
 import type { TaskRecord, TaskDependency } from "../lib/types";
 
@@ -8,7 +9,64 @@ export interface DagGraphProps {
   onTaskClick?: (taskId: string) => void;
 }
 
+interface Edge { key: string; d: string; from: string; to: string }
+
+const EDGE_CURVE = 0.5;
+const EDGE_TONES = ["pending", "done", "focused"] as const;
+
+/** Measure node boxes and draw dependency curves (right edge → left edge). */
+function useDagEdges(dependencies: TaskDependency[], layoutKey: string) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [edges, setEdges] = useState<Edge[]>([]);
+  const [size, setSize] = useState({ w: 0, h: 0 });
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const measure = () => {
+      const origin = container.getBoundingClientRect();
+      const box = (id: string) => container.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(id)}"]`)?.getBoundingClientRect();
+      const next: Edge[] = [];
+      const boxes = new Map<string, DOMRect>();
+      for (const dep of dependencies) {
+        for (const id of [dep.from_task_id, dep.to_task_id]) {
+          const r = boxes.has(id) ? boxes.get(id) : box(id);
+          if (r) boxes.set(id, r);
+        }
+      }
+      const drawable = dependencies.filter(d => boxes.has(d.from_task_id) && boxes.has(d.to_task_id));
+      // Spread edges over "ports" along each card side so they never merge.
+      const port = (id: string, side: "in" | "out", other: string) => {
+        const peers = drawable
+          .filter(d => (side === "in" ? d.to_task_id : d.from_task_id) === id)
+          .map(d => (side === "in" ? d.from_task_id : d.to_task_id))
+          .sort((x, y) => boxes.get(x)!.top - boxes.get(y)!.top);
+        const r = boxes.get(id)!;
+        return r.top + (r.height * (peers.indexOf(other) + 1)) / (peers.length + 1) - origin.top;
+      };
+      for (const dep of drawable) {
+        const a = boxes.get(dep.from_task_id)!;
+        const b = boxes.get(dep.to_task_id)!;
+        const x1 = a.right - origin.left, y1 = port(dep.from_task_id, "out", dep.to_task_id);
+        const x2 = b.left - origin.left, y2 = port(dep.to_task_id, "in", dep.from_task_id);
+        const dx = Math.max(24, (x2 - x1) * EDGE_CURVE);
+        next.push({ key: `${dep.from_task_id}->${dep.to_task_id}`, from: dep.from_task_id, to: dep.to_task_id,
+          d: `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}` });
+      }
+      setEdges(next);
+      setSize({ w: container.scrollWidth, h: container.scrollHeight });
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [dependencies, layoutKey]);
+  return { containerRef, edges, size };
+}
+
 export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: DagGraphProps) {
+  const layoutKey = tasks.map(t => `${t.id}:${t.status}`).join("|");
+  const { containerRef, edges, size } = useDagEdges(dependencies, layoutKey);
   if (!tasks.length) {
     return <p className="muted">No tasks in this mission yet.</p>;
   }
@@ -54,9 +112,26 @@ export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: Dag
   return (
     <div className="dag-graph" style={{ overflowX: "auto", padding: "8px 0" }}>
       <p className="muted">Read left to right. Tasks in the same column have no dependency on each other; provider capacity and file locks may still limit parallel execution.</p>
-      <div style={{ display: "flex", gap: 24, alignItems: "flex-start" }}>
+      <div ref={containerRef} className="dag-canvas">
+        <svg className="dag-edges" width={size.w} height={size.h} aria-hidden="true" data-testid="dag-edges">
+          <defs>
+            {EDGE_TONES.map(tone => (
+              <marker key={tone} id={`dag-arrow-${tone}`} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0 0 L8 4 L0 8 z" className={`dag-arrow ${tone}`} />
+              </marker>
+            ))}
+          </defs>
+          {edges.map(e => {
+            // "done" only when the upstream finished and the downstream input is not stale.
+            const upstreamDone = taskMap[e.from]?.status === "COMPLETED" && taskMap[e.to]?.status !== "STALE";
+            const focused = activeTaskId === e.from || activeTaskId === e.to;
+            const tone = focused ? "focused" : upstreamDone ? "done" : "pending";
+            return <path key={e.key} d={e.d} className={`dag-edge ${tone}`} markerEnd={`url(#dag-arrow-${tone})`} />;
+          })}
+        </svg>
+        <div className="dag-columns">
         {levels.map((level, li) => (
-          <div key={li} style={{ display: "flex", flexDirection: "column", gap: 10, minWidth: 180 }}>
+          <div key={li} className="dag-column">
             <h4 className="muted">{li === 0 ? "Independent work" : `Dependency stage ${li + 1}`}</h4>
             {level.map((tid) => {
               const t = taskMap[tid];
@@ -79,6 +154,7 @@ export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: Dag
                   }}
                   onClick={() => onTaskClick?.(tid)}
                   data-testid={`dag-node-${tid}`}
+                  data-node-id={tid}
                 >
                   <div className="row spread" style={{ marginBottom: 6 }}>
                     <Badge value={t.status} pulse={["RUNNING", "CLAIMED", "WAITING_FOR_PROVIDER"].includes(t.status)} />
@@ -105,15 +181,19 @@ export function DagGraph({ tasks, dependencies, activeTaskId, onTaskClick }: Dag
             })}
           </div>
         ))}
+        </div>
       </div>
       {dependencies.length > 0 && (
-        <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-faint)" }}>
-          {dependencies.map((d) => (
-            <span key={`${d.from_task_id}-${d.to_task_id}`} className="mono" style={{ marginRight: 12 }}>
-              {taskMap[d.from_task_id]?.title || d.from_task_id} → {taskMap[d.to_task_id]?.title || d.to_task_id}
-            </span>
-          ))}
-        </div>
+        <details className="dag-dependency-list">
+          <summary>Dependency list ({dependencies.length})</summary>
+          <ul>
+            {dependencies.map((d) => (
+              <li key={`${d.from_task_id}-${d.to_task_id}`} className="mono">
+                {taskMap[d.from_task_id]?.title || d.from_task_id} → {taskMap[d.to_task_id]?.title || d.to_task_id}
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
     </div>
   );

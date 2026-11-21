@@ -27,6 +27,175 @@ export interface Mission {
   created_at: string;
   updated_at: string;
   finished_at: string | null;
+  retry_of_mission_id?: string | null;
+  /** Derived caveats; absent on older backends (render as unknown, not clean). */
+  trust?: MissionTrust | null;
+}
+
+export type SeverityCounts = Record<"BLOCKER" | "HIGH" | "MEDIUM" | "LOW", number>;
+
+export interface ReviewSummary {
+  id: string | null;
+  reviewer: string;
+  independent: boolean;
+  degradation_reason: string | null;
+  writer_set: string[];
+  reviewer_in_writer_set: boolean;
+  parsed: boolean | null;
+  reviewed_base_sha: string | null;
+  reviewed_head_sha: string | null;
+  created_at: string | null;
+}
+
+export interface MissionTrust {
+  /** Disjoint buckets: a finding is either open or has an unverified repair claim. */
+  open_findings: SeverityCounts;
+  repair_claimed_findings: SeverityCounts;
+  unrecognized_severity: number;
+  inherited_available: boolean;
+  review: ReviewSummary | null;
+  review_count: number;
+  /** Latest SHA-bound verification; skipped_tests null = not reported. */
+  verification?: VerificationSummary | null;
+}
+
+export interface VerificationSummary {
+  status: string | null;
+  sha: string | null;
+  skipped_tests: number | null;
+  finished_at: string | null;
+}
+
+export interface RelayBlockRef {
+  block_type: string;
+  block_id: string;
+  included_chars: number | null;
+  original_chars: number | null;
+  representation?: string | null;
+  reason?: string | null;
+}
+
+export interface RelayContext {
+  capture_status: string | null;
+  schema_version: string | null;
+  prompt_chars: number | null;
+  estimated_prompt_tokens: number | null;
+  block_count: number;
+  warnings: string[];
+  thin_evidence_blocks: RelayBlockRef[];
+  reduced_blocks: RelayBlockRef[];
+}
+
+export type RelayFlag = "THIN_REQUIRED_EVIDENCE" | "CONTEXT_REDUCED" | "LOST_WORK" | "CONTEXT_NOT_CAPTURED";
+
+export interface RelayRun {
+  kind: "run";
+  id: string;
+  at: string | null;
+  provider: string;
+  role: string;
+  stage: string | null;
+  task_id: string | null;
+  attempt_number: number | null;
+  retry_of_run_id: string | null;
+  outcome: string;
+  outcome_source: "run_status" | "legacy";
+  failure_class: string | null;
+  exit_code: number | null;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  model_observed: string | null;
+  commit_before: string | null;
+  commit_after: string | null;
+  changed_commit: boolean | null;
+  summary: string;
+  summary_truncated: boolean;
+  context: RelayContext | null;
+  flags: RelayFlag[];
+}
+
+export interface RelayHandoff {
+  kind: "handoff";
+  id: string;
+  at: string | null;
+  from_provider: string | null;
+  to_provider: string | null;
+  role: string | null;
+  git_head: string | null;
+  /** Stored length before redaction. */
+  stored_chars: number;
+  preview: string;
+  preview_truncated: boolean;
+}
+
+export interface RelayReview extends ReviewSummary {
+  kind: "review";
+  at: string | null;
+}
+
+export type RelayEntry = RelayRun | RelayHandoff | RelayReview;
+
+export interface RelayFinding {
+  id: string;
+  mission_id?: string | null;
+  severity: string;
+  category: string | null;
+  file: string | null;
+  status: string;
+  description: string;
+  recommended_fix: string;
+  text_truncated: boolean;
+  origin_review_id: string | null;
+  origin_sha: string | null;
+  resolved_review_id: string | null;
+  resolved_sha: string | null;
+  verified_by: string | null;
+  inherited_from_mission_id: string | null;
+  created_at: string | null;
+  resolved_at: string | null;
+}
+
+export interface RelayProviderTotals {
+  provider: string;
+  runs: number;
+  succeeded: number;
+  not_succeeded: number;
+  in_flight: number;
+  outcome_unknown: number;
+  known_duration_ms: number;
+  unknown_duration_runs: number;
+  roles: string[];
+}
+
+export interface MissionRelay {
+  mission_id: string;
+  timeline: RelayEntry[];
+  findings: RelayFinding[];
+  providers: RelayProviderTotals[];
+  runs_truncated: boolean;
+  handoffs_truncated?: boolean;
+  reviews_truncated?: boolean;
+  findings_truncated?: boolean;
+  inherited_findings_available?: boolean;
+  limits: {
+    handoff_preview_chars: number;
+    thin_evidence_block_chars: number;
+    lost_work_min_ms: number;
+    run_limit: number;
+    item_limit?: number;
+  };
+}
+
+export interface HandoffContent {
+  id: string;
+  from_provider: string | null;
+  to_provider: string | null;
+  role: string | null;
+  content: string;
+  stored_chars: number;
+  truncated: boolean;
+  created_at: string | null;
 }
 
 export interface ReviewRecord {
@@ -49,6 +218,8 @@ export interface MissionDetail extends Mission {
   degraded_review: boolean;
   latest_handoff: string | null;
   integrations: IntegrationRecord[];
+  /** Unresolved retry-lineage findings; null when history was unreadable. */
+  inherited_findings?: ReviewFinding[] | null;
 }
 
 export interface TaskRecord {
@@ -162,6 +333,7 @@ export interface ReviewFinding {
   recommended_fix: string;
   status: string;
   created_at: string;
+  inherited_from_mission_id?: string | null;
 }
 
 export interface ProviderRun {

@@ -41,6 +41,7 @@ requires that token to exist already. Vite embeds it, including in builds.
 ```bash
 make test-backend     # pytest: unit + state machine + failover + recovery + API
 make test-frontend    # vitest: components + helpers
+make e2e              # Playwright: verdict, relay, palette, activity (isolated, fake providers)
 cd backend && uv run pytest tests/test_engine_e2e.py -q   # E2E with fake providers
 ```
 

@@ -15,9 +15,12 @@ from pydantic import BaseModel, Field
 from .. import git_ops
 from ..config import Config
 from ..dag import DagValidationError, namespace_dag_ids, validate_task_graph
+from ..events import TRANSIENT_TYPES
+from ..mission_summary import TerminalTrustCache, inherited_for, mission_trust, serialize_finding
 from ..models import TERMINAL_STATUSES, MissionStatus, Role, TaskGraphTask, TaskStatus, utcnow
 from ..orchestrator import IllegalMissionTransitionError, Orchestrator
 from ..project_engine import ProductValidationError
+from ..relay import handoff_content, mission_relay
 from ..security import read_redacted_tail, redact, validate_workspace_path
 from ..workspace import inspect_workspace
 from .auth import AuthMiddleware, is_authorized, load_or_create_token
@@ -91,6 +94,10 @@ class AdoptChangesRequest(BaseModel):
     message: str = "human: adopt workspace changes"
 
 
+RECENT_EVENTS_DEFAULT = 50
+RECENT_EVENTS_MAX = 200
+
+
 def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
     for key in ("providers_used", "providers_failed", "choices", "payload", "command"):
         if isinstance(row.get(key), str):
@@ -109,6 +116,7 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         await orchestrator.shutdown()
 
     app = FastAPI(title="GG Orchestrator", version="0.1.0", lifespan=lifespan)
+    trust_cache = TerminalTrustCache()
     app.state.db = db_path
     app.state.auth_token = load_or_create_token(db_path.parent)
     # Registration order matters: Starlette builds the middleware stack by
@@ -231,7 +239,12 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
             )
         else:
             rows = orchestrator.db.query("SELECT * FROM missions ORDER BY created_at DESC LIMIT 200")
-        return [_jsonable(r) for r in rows]
+        # Only terminal missions carry a verdict; their trust is memoized.
+        trust = trust_cache.list_trust(orchestrator.db, rows)
+        out = [_jsonable(r) for r in rows]
+        for m in out:
+            m["trust"] = trust.get(str(m["id"]))
+        return out
 
     @app.post("/api/missions", status_code=201)
     async def create_mission(req: CreateMissionRequest) -> dict[str, Any]:
@@ -261,27 +274,50 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
                 "SELECT * FROM human_gates WHERE mission_id=? ORDER BY created_at DESC", (mission_id,)
             )
         ]
-        mission["findings"] = orchestrator.db.query(
-            "SELECT * FROM review_findings WHERE mission_id=? ORDER BY created_at", (mission_id,)
-        )
+        mission["findings"] = [
+            serialize_finding(f)
+            for f in orchestrator.db.query(
+                "SELECT * FROM review_findings WHERE mission_id=? ORDER BY created_at", (mission_id,)
+            )
+        ]
         reviews = orchestrator.db.query("SELECT * FROM reviews WHERE mission_id=? ORDER BY created_at", (mission_id,))
         mission["reviews"] = reviews
         latest_review = reviews[-1] if reviews else None
         mission["latest_review"] = latest_review
         mission["degraded_review"] = bool(latest_review and not latest_review["independent"])
-        mission["runs"] = orchestrator.db.query(
+        inherited, inherited_available = inherited_for(orchestrator.db, mission)
+        mission["trust"] = mission_trust(orchestrator.db, mission, (inherited, inherited_available))
+        mission["inherited_findings"] = [serialize_finding(f) for f in inherited] if inherited_available else None
+        runs = orchestrator.db.query(
             "SELECT id, provider, role, failure_class, provider_state, exit_code, started_at, finished_at, "
             "summary FROM provider_runs WHERE mission_id=? ORDER BY started_at",
             (mission_id,),
         )
+        for run in runs:
+            run["summary"] = redact(str(run.get("summary") or ""))
+        mission["runs"] = runs
         latest_handoff = orchestrator.db.query(
             "SELECT * FROM handoffs WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,)
         )
-        mission["latest_handoff"] = latest_handoff[0]["content"] if latest_handoff else None
+        mission["latest_handoff"] = redact(str(latest_handoff[0]["content"] or "")) if latest_handoff else None
         mission["integrations"] = orchestrator.db.query(
             "SELECT * FROM task_integrations WHERE mission_id=? ORDER BY created_at DESC LIMIT 1", (mission_id,)
         )
         return mission
+
+    @app.get("/api/missions/{mission_id}/relay")
+    def get_mission_relay(mission_id: str) -> dict[str, Any]:
+        mission = orchestrator.db.get("missions", mission_id)
+        if not mission:
+            raise HTTPException(404, "mission not found")
+        return mission_relay(orchestrator.db, mission)
+
+    @app.get("/api/missions/{mission_id}/handoffs/{handoff_id}")
+    def get_mission_handoff(mission_id: str, handoff_id: str) -> dict[str, Any]:
+        handoff = handoff_content(orchestrator.db, mission_id, handoff_id)
+        if handoff is None:
+            raise HTTPException(404, "handoff not found")
+        return handoff
 
     @app.post("/api/missions/{mission_id}/start")
     async def start_mission(mission_id: str) -> dict[str, str]:
@@ -920,6 +956,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         return {r["key"][len("profile.") :]: json.loads(r["value"]) for r in rows}
 
     # ---------------- events / analytics ----------------
+    @app.get("/api/events/recent")
+    def recent_events(limit: int = RECENT_EVENTS_DEFAULT) -> list[dict[str, Any]]:
+        return orchestrator.events.recent(max(1, min(int(limit), RECENT_EVENTS_MAX)))
+
     @app.get("/api/missions/{mission_id}/events")
     def mission_events(mission_id: str, limit: int = 500) -> list[dict[str, Any]]:
         return orchestrator.events.history(mission_id, limit)
@@ -1356,6 +1396,10 @@ def create_app(db_path: Path, config: Config, orchestrator: Orchestrator) -> Fas
         try:
             while True:
                 event = await queue.get()
+                # Workspace feed: transient provider output belongs to the
+                # per-mission stream and would crowd attention events out.
+                if event.type in TRANSIENT_TYPES:
+                    continue
                 await websocket.send_text(event.model_dump_json())
         except WebSocketDisconnect:
             pass

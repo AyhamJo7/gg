@@ -280,8 +280,7 @@ class RepairWorker:
 
 def _abandon_unfinished_attempt(db: Any, cycle_id: str, reason: str) -> None:
     rows = db.query(
-        "SELECT id FROM repair_attempts WHERE cycle_id=? AND finished_at IS NULL"
-        " ORDER BY attempt_number DESC LIMIT 1",
+        "SELECT id FROM repair_attempts WHERE cycle_id=? AND finished_at IS NULL ORDER BY attempt_number DESC LIMIT 1",
         (cycle_id,),
     )
     if not rows:
@@ -289,8 +288,7 @@ def _abandon_unfinished_attempt(db: Any, cycle_id: str, reason: str) -> None:
     db.update(
         "repair_attempts",
         str(rows[0]["id"]),
-        {"outcome": "FAILED", "finished_at": utcnow().isoformat(),
-         "detail_json": f'{{"abandoned": "{reason[:300]}"}}'},
+        {"outcome": "FAILED", "finished_at": utcnow().isoformat(), "detail_json": f'{{"abandoned": "{reason[:300]}"}}'},
     )
 
 
@@ -535,6 +533,7 @@ class ProductionRepairHooks:
         workspace_scope: list[str],
         git_files: list[str],
         plan_revision: int | None = None,
+        git_diff_summary: str = "",
     ) -> tuple[str, dict[str, Any]]:
         from .context_compiler import ContextCompileSpec, prepare_invocation_context
 
@@ -553,6 +552,7 @@ class ProductionRepairHooks:
             attempt=attempt,
             workspace_scope=list(workspace_scope),
             git_files_changed=list(git_files),
+            git_diff_summary=git_diff_summary,
             plan_revision=plan_revision,
         )
         # Compiled-v2 strict: compilation failure blocks invocation with no
@@ -614,33 +614,53 @@ class ProductionRepairHooks:
         )
         try:
             prompt, meta = self._compile(
-                role="repairer", stage="repair", legacy_prompt=legacy_prompt, project_id=project_id,
-                provider=provider, base_sha=scope.base_sha, candidate_sha=None,
-                requirement_ids=requirement_ids, failure_text=f"{scope.observed}\n{scope.output_tail}",
-                failure_command=scope.command, failure_exit=scope.exit_code,
+                role="repairer",
+                stage="repair",
+                legacy_prompt=legacy_prompt,
+                project_id=project_id,
+                provider=provider,
+                base_sha=scope.base_sha,
+                candidate_sha=None,
+                requirement_ids=requirement_ids,
+                failure_text=f"{scope.observed}\n{scope.output_tail}",
+                failure_command=scope.command,
+                failure_exit=scope.exit_code,
                 task_objective=f"Fix: {scope.expected}",
-                attempt=scope.attempt_number, workspace_scope=scope.relevant_files,
+                attempt=scope.attempt_number,
+                workspace_scope=scope.relevant_files,
                 git_files=scope.relevant_files,
             )
         except Exception as exc:
             raise ProviderOperationalError(f"repair context compilation failed: {exc}") from exc
         commit_before = await git_ops.head_sha(repo)
         outcome = await self._invoke(
-            role="repair", stage="repair", provider=provider, prompt=prompt, meta=meta, repo=repo,
-            project_id=project_id, phase_id=self._phase_of(project_id),
+            role="repair",
+            stage="repair",
+            provider=provider,
+            prompt=prompt,
+            meta=meta,
+            repo=repo,
+            project_id=project_id,
+            phase_id=self._phase_of(project_id),
             attempt_number=scope.attempt_number,
         )
         self._raise_for_outcome(outcome, role="repair")
-        result_sha = await self._checkpoint_result(repo, project_id, provider, "repair", outcome.run_id,
-                                                   commit_before or scope.base_sha)
+        result_sha = await self._checkpoint_result(
+            repo, project_id, provider, "repair", outcome.run_id, commit_before or scope.base_sha
+        )
         try:
             touched = await git_ops.diff_names(repo, scope.base_sha, result_sha, limit=100)
         except Exception:
             touched = []
         from .repair import RepairResult
 
-        return RepairResult(result_sha=result_sha, provider=provider, touched_files=touched,
-                            summary=str(outcome.summary or "")[:1000], provider_run_id=outcome.run_id)
+        return RepairResult(
+            result_sha=result_sha,
+            provider=provider,
+            touched_files=touched,
+            summary=str(outcome.summary or "")[:1000],
+            provider_run_id=outcome.run_id,
+        )
 
     async def review(self, scope: Any, result_sha: str) -> Any:
         from .repair import ProviderOperationalError, RepairCoordinator, ReviewVerdict
@@ -664,15 +684,32 @@ class ProductionRepairHooks:
             f"Repair intent: {scope.expected}\nFailing command was: {scope.command}\n"
             "Output exactly one REVIEW_FINDINGS_JSON line."
         )
+        _rev_files: list[str] = list(scope.relevant_files or [])
+        _rev_summary: str = ""
+        if repo is not None and scope.base_sha and result_sha:
+            try:
+                _rev_files = await git_ops.diff_names(repo, scope.base_sha, result_sha, limit=100)
+                _rev_summary = await git_ops.diff_stat_range(repo, scope.base_sha, result_sha)
+            except Exception:
+                _rev_files, _rev_summary = list(scope.relevant_files or []), ""
         try:
             prompt, meta = self._compile(
-                role="reviewer", stage="review", legacy_prompt=legacy_prompt, project_id=project_id,
-                provider=reviewer, base_sha=scope.base_sha, candidate_sha=result_sha,
-                requirement_ids=requirement_ids, failure_text="",
-                failure_command="", failure_exit=None,
+                role="reviewer",
+                stage="review",
+                legacy_prompt=legacy_prompt,
+                project_id=project_id,
+                provider=reviewer,
+                base_sha=scope.base_sha,
+                candidate_sha=result_sha,
+                requirement_ids=requirement_ids,
+                failure_text="",
+                failure_command="",
+                failure_exit=None,
                 task_objective=f"Review repair for: {scope.expected}",
-                attempt=scope.attempt_number, workspace_scope=scope.relevant_files,
-                git_files=scope.relevant_files,
+                attempt=scope.attempt_number,
+                workspace_scope=scope.relevant_files,
+                git_files=_rev_files,
+                git_diff_summary=_rev_summary,
             )
         except Exception as exc:
             raise ProviderOperationalError(f"review context compilation failed: {exc}") from exc
@@ -680,14 +717,21 @@ class ProductionRepairHooks:
             raise WorkerAbort("BLOCKED", "target repository missing")
         commit_before = await git_ops.head_sha(repo)
         outcome = await self._invoke(
-            role="review", stage="review", provider=reviewer, prompt=prompt, meta=meta, repo=repo,
-            project_id=project_id, phase_id=self._phase_of(project_id),
+            role="review",
+            stage="review",
+            provider=reviewer,
+            prompt=prompt,
+            meta=meta,
+            repo=repo,
+            project_id=project_id,
+            phase_id=self._phase_of(project_id),
             attempt_number=scope.attempt_number,
         )
         self._raise_for_outcome(outcome, role="review")
         # A rogue reviewer must not silently rewrite code: checkpoint + provenance.
-        await self._checkpoint_result(repo, project_id, reviewer, "review", outcome.run_id,
-                                      commit_before or scope.base_sha)
+        await self._checkpoint_result(
+            repo, project_id, reviewer, "review", outcome.run_id, commit_before or scope.base_sha
+        )
         text = f"{outcome.assistant_text or ''}\n{outcome.raw_tail or ''}"
         try:
             parsed_ok, findings = parse_review_output(text)
@@ -696,7 +740,8 @@ class ProductionRepairHooks:
         if not parsed_ok:
             return ReviewVerdict(passed=False, reviewer=reviewer, detail="review output unparseable")
         blockers = [
-            f for f in findings
+            f
+            for f in findings
             if str(f.get("severity", "")).upper() in ("BLOCKER", "HIGH")
             or (
                 str(f.get("severity", "")).upper() == "MEDIUM"
@@ -706,7 +751,8 @@ class ProductionRepairHooks:
         if blockers:
             first = blockers[0]
             return ReviewVerdict(
-                passed=False, reviewer=reviewer,
+                passed=False,
+                reviewer=reviewer,
                 detail=f"{len(blockers)} blocking finding(s); first: {first.get('description', '')}"[:2000],
             )
         return ReviewVerdict(passed=True, reviewer=reviewer, detail=f"{len(findings)} non-blocking note(s)")
@@ -733,8 +779,12 @@ class ProductionRepairHooks:
             raise WorkerAbort("FAILED", "recheck produced no evidence for the repaired SHA")
         row = rows[0]
         passed = str(row.get("result") or "") == "SATISFIED"
-        return RecheckVerdict(passed=passed, attempt_id=str(row["id"]), checked_sha=result_sha,
-                              output=str(row.get("output_tail") or "")[:1000])
+        return RecheckVerdict(
+            passed=passed,
+            attempt_id=str(row["id"]),
+            checked_sha=result_sha,
+            output=str(row.get("output_tail") or "")[:1000],
+        )
 
     async def regress(self, scope: Any, result_sha: str) -> Any:
         from .repair import RecheckVerdict
@@ -749,8 +799,12 @@ class ProductionRepairHooks:
         report = await run_verification(
             info, self.db, self.orch.events, "", repo, sha=result_sha, product_project_id=project_id
         )
-        return RecheckVerdict(passed=report.all_passed, attempt_id=f"regress-{result_sha[:12]}",
-                              checked_sha=result_sha, output=report.summary()[:1000])
+        return RecheckVerdict(
+            passed=report.all_passed,
+            attempt_id=f"regress-{result_sha[:12]}",
+            checked_sha=result_sha,
+            output=report.summary()[:1000],
+        )
 
     # -- small helpers ---------------------------------------------------
 
@@ -794,8 +848,13 @@ class ProductionRepairHooks:
             from .provenance import record_provider_write, repo_identity
 
             await record_provider_write(
-                self.db, workdir=repo, run_id=run_id, product_project_id=project_id,
-                provider=provider, role=role, base_sha=base_sha,
+                self.db,
+                workdir=repo,
+                run_id=run_id,
+                product_project_id=project_id,
+                provider=provider,
+                role=role,
+                base_sha=base_sha,
                 repo_key_value=await repo_identity(repo),
             )
         except Exception:
