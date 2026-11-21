@@ -7,7 +7,8 @@ Operator Experience v1 are not reopened without evidence from a real run.
 ## State
 
 - Branch `feature/operator-experience-v2`, draft PR #6 into `main` (mergeable). `main`
-  has no branch protection and the repo has no `.github/` workflows, so no CI exists.
+  has no branch protection and `.github/` holds only the README banner, no workflows,
+  so no CI exists.
 - Progress record: [docs/OPERATOR_EXPERIENCE_V2_PROGRESS.md](docs/OPERATOR_EXPERIENCE_V2_PROGRESS.md);
   tiers and review rounds 1-7 are closed. Round 8 (below) covers the e2e/docs commits.
 - Draft PR #7 (`chore/claude-gates`) adds `.claude/gates.json` and untracks
@@ -15,7 +16,11 @@ Operator Experience v1 are not reopened without evidence from a real run.
   `gates preflight` fails with "no gates config". Never stage `tsconfig.tsbuildinfo`
   (`tsc -b` rewrites it; it shows as modified).
 
-## Verified gates (WSL, Node v26.10.0, Python 3.12) at `cb8bdd5`
+## Verified gates (WSL, Node v26.10.0, Python 3.12)
+
+Run at `cb8bdd5`, before a rebase onto PR #8 (README banner). `git diff cb8bdd5 0bdaf2c`
+is only `.github/assets/banner.png` and 2 README lines, so the code under test is
+identical to `0bdaf2c`. Anything after `0bdaf2c` is documentation.
 
 | Gate | Command | Result |
 |---|---|---|
@@ -33,8 +38,8 @@ Commits after this record are documentation only. Re-run on any later code chang
   global shadowed jsdom's, failing 8 `ActivityCommand` tests regardless of the code.
 - Installed Playwright Chromium (`npx playwright install chromium`); e2e now runs.
 - Review round 8 (independent `security-reviewer`, e2e harness + public docs): no
-  Critical/High. Fixed M1/M2/L1-L5 in `1d78941` and `cb8bdd5`; L6 is PR #7.
-- `6530480` Real defect found via the e2e leak: a connected UI websocket held uvicorn's
+  Critical/High. Fixed M1/M2/L1-L5 in `efbdfd7` and `0bdaf2c`; L6 is PR #7.
+- `ad0c3cb` Real defect found via the e2e leak: a connected UI websocket held uvicorn's
   graceful shutdown open forever, so SIGTERM/Ctrl-C never reached
   `orchestrator.shutdown()`. `server.build_uvicorn_config` now sets
   `GRACEFUL_SHUTDOWN_SECONDS = 3`; `tests/test_server_shutdown.py` fails (13 s timeout)
