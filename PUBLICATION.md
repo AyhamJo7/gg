@@ -8,25 +8,34 @@ Prepare the source repository for inspection by other developers. Public visibil
 license selection and distribution of executable artifacts are separate decisions.
 Visibility is managed separately through GitHub; this record describes the source inspection and its limits.
 
-## Review record — 2026-10-09
+## Review record — 2026-11-21
 
-Source HEAD inspected: `0f81b421f394db98a4661b3c780d60ecd40258b7`.
-README and publication preparation changes are uncommitted and not covered by that
-HEAD identifier.
+History scanned: every commit up to `a20aacf` on `feature/operator-experience-v2`.
+Changes after that commit are not covered; repeat the scan on the release candidate.
 
 | Check | Result |
 | --- | --- |
-| Git history secret scan | `gitleaks git /home/adam/projects/gg --redact --no-banner --report-format json --report-path /tmp/gg-publication-gitleaks.json --log-level error` exited 1 with three findings |
-| Finding inspection | Historical source context places all three in synthetic security test fixtures: AWS-shaped key, generic API-key sample and JWT sample |
+| Git history secret scan | `gitleaks git . --redact --no-banner --report-format json --report-path <tmp>/gitleaks.json --log-level error` exited 1 with three findings |
+| Finding inspection | All three inspected at their commits and are synthetic test fixtures (table below) |
 | Tracked sensitive/build path inventory | No tracked `.env`, database, `.orchestrator/` runtime directory or `frontend/dist/` paths found in the inspected inventory |
 | Runtime packaging | README explicitly prohibits publishing the token-bearing built frontend, local state and raw logs |
 | Feature claims | README distinguishes current implementation from proposed redesign and documents local/single-operator scope |
 | License | Proprietary rights-reserved notice added in `LICENSE` |
-| Functional checks | No fresh application build, lint, typecheck or test result established by this documentation work |
+| Functional checks | Gate results per commit are recorded in [NEXT.md](NEXT.md); they are not release proof for a later SHA |
+
+| Rule | File:line | Commit | Content |
+| --- | --- | --- | --- |
+| `aws-access-token` | `backend/tests/test_git_ops.py:71` | `d9c817071` | placeholder `AKIAABCDEFGHIJKLMNOP` fed to the checkpoint secret filter |
+| `generic-api-key` | `backend/tests/test_f05_f06_git_secrets.py:35` | `9be944786` | placeholder `sk-live-1234567890abcdef` planted to prove it is never committed |
+| `jwt` | `backend/tests/test_security.py:20` | `edc2718fa` | the public jwt.io sample token fed to `redact()` |
 
 The secret scanner did **not** return a clean result. Test-context inspection explains
 its three findings; it does not prove every historical file contains only publishable
 information. No broad exclusions or scanner suppressions were added.
+
+Personally identifying information: the author email in commit metadata is part of
+history and is a deliberate owner decision, not covered by the secret scan. The copy
+in `docs/dogfood/2026-09-12-rechnungsradar.md` was redacted.
 
 ## Publication review boundaries
 

@@ -89,7 +89,8 @@ directory.
 
 > **Local interface only:** Vite embeds this checkout's bearer token at dev/build
 > time. Do not publish the built frontend, expose the service through a public
-> tunnel, or upload runtime state and logs.
+> tunnel, or upload runtime state and logs. The token stops a blind network caller,
+> not another local process that can read the token file (see [SECURITY.md](SECURITY.md)).
 
 ## Two workflows
 
