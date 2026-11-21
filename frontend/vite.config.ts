@@ -13,8 +13,12 @@ import react from "@vitejs/plugin-react";
 // run, or a checkout that hasn't started the backend yet) — never throw.
 function readAuthToken(warnIfMissing: boolean): string {
   try {
-    // GG_AUTH_TOKEN_FILE lets isolated runs (browser e2e) use their own state dir.
-    const tokenFile = process.env.GG_AUTH_TOKEN_FILE ?? resolve(__dirname, "../backend/.orchestrator/auth_token");
+    // GG_AUTH_TOKEN_FILE lets isolated runs (browser e2e, GG_E2E=1) use their own
+    // state dir; it is ignored otherwise so no stray variable can embed another file.
+    const tokenFile =
+      process.env.GG_E2E === "1" && process.env.GG_AUTH_TOKEN_FILE
+        ? process.env.GG_AUTH_TOKEN_FILE
+        : resolve(__dirname, "../backend/.orchestrator/auth_token");
     return readFileSync(tokenFile, "utf-8").trim();
   } catch {
     if (warnIfMissing) {
@@ -32,7 +36,12 @@ function readAuthToken(warnIfMissing: boolean): string {
 }
 
 // Isolated runs (browser e2e) point the dev proxy at their own backend.
+// The proxy forwards the bearer token, so the target must be a loopback host:port.
+const LOOPBACK_HOST_PORT = /^(127\.0\.0\.1|localhost):\d{1,5}$/;
 const BACKEND_HOST = process.env.GG_BACKEND_HOST ?? "127.0.0.1:8787";
+if (!LOOPBACK_HOST_PORT.test(BACKEND_HOST)) {
+  throw new Error(`GG_BACKEND_HOST must be 127.0.0.1:<port> or localhost:<port>, got "${BACKEND_HOST}"`);
+}
 
 export default defineConfig(() => ({
   plugins: [react()],
