@@ -4,7 +4,8 @@
     {"name": "build", "run": "make build", "timeout": 900},
     {"name": "lint", "run": "make lint", "timeout": 600},
     {"name": "typecheck", "run": "make typecheck", "timeout": 600},
-    {"name": "unit", "run": "make test", "timeout": 2400}
+    {"name": "unit", "run": "make test", "timeout": 2400},
+    {"name": "e2e", "run": "make e2e", "timeout": 1800}
   ],
   "fast": ["lint", "typecheck"],
   "stress": {
