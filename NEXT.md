@@ -1,68 +1,67 @@
 # NEXT — engineering handoff
 
 Read [AGENTS.md](AGENTS.md) first. GG is a local, single-operator orchestrator of
-authenticated provider CLIs, in dogfood/stabilization: sealed Increments 1-4 and
-Operator Experience v1 are not reopened without evidence from a real run.
+authenticated provider CLIs, in dogfood/stabilization: sealed Increments 1-4,
+Operator Experience v1 and v2 are not reopened without evidence from a real run.
 
 ## State
 
-- Branch `feature/operator-experience-v2`, draft PR #6 into `main` (mergeable). `main`
-  has no branch protection and `.github/` holds only the README banner, no workflows,
-  so no CI exists.
-- Progress record: [docs/OPERATOR_EXPERIENCE_V2_PROGRESS.md](docs/OPERATOR_EXPERIENCE_V2_PROGRESS.md);
-  tiers and review rounds 1-7 are closed. Round 8 (below) covers the e2e/docs commits.
-- Draft PR #7 (`chore/claude-gates`) adds `.claude/gates.json` and untracks
-  `frontend/tsconfig.tsbuildinfo`; it asks for an e2e gate once PR #6 lands. Until then
-  `gates preflight` fails with "no gates config". Never stage `tsconfig.tsbuildinfo`
-  (`tsc -b` rewrites it; it shows as modified).
+- `main` contains Operator Experience v2 (PR #6, merge `62eb38d`) and the verification
+  gates config (PR #7, merge `e9b08c9`). No open PRs, no open feature work.
+- `main` has no branch protection and the repo has no CI workflows (`.github/` holds only
+  the README banner). The gates below are the only evidence; nothing enforces them on push.
+- `.claude/gates.json` lists build, lint, typecheck, unit and e2e; `gates preflight`
+  accepts it. `frontend/tsconfig.tsbuildinfo` is no longer tracked.
+- Progress record: [docs/OPERATOR_EXPERIENCE_V2_PROGRESS.md](docs/OPERATOR_EXPERIENCE_V2_PROGRESS.md)
+  (tiers and review rounds 1-7; round 8, an independent security review of the e2e
+  harness and public docs, is summarised below).
 
 ## Verified gates (WSL, Node v26.10.0, Python 3.12)
 
-Run at `cb8bdd5`, before a rebase onto PR #8 (README banner). `git diff cb8bdd5 0bdaf2c`
-is only `.github/assets/banner.png` and 2 README lines, so the code under test is
-identical to `0bdaf2c`. Anything after `0bdaf2c` is documentation.
+Run on commit `cb8bdd5` (since rebased as `0bdaf2c`; the code is identical, the only
+difference is the README banner PR #8). `main` at `e9b08c9` differs from that tree only by
+PR #7 (`.claude/gates.json`, `.gitignore`, untracked `tsbuildinfo`); `make build` was run
+on the merged PR #6 tree.
 
 | Gate | Command | Result |
 |---|---|---|
 | Backend tests | `make test-backend` (700 tests, ~11 min) | RUN+PASSED |
 | Backend lint / types | `make lint`, `make typecheck` | RUN+PASSED |
-| Frontend tests | `npm --prefix frontend run test -- --run` (140 tests) | RUN+PASSED |
+| Frontend tests | `make test-frontend` (140 tests) | RUN+PASSED |
 | Frontend lint / types | `make lint`, `make typecheck` | RUN+PASSED |
 | Browser e2e | `make e2e` (6 checks, isolated, fake providers) | RUN+PASSED |
+| Build | `make build` (wheel + vite) | RUN+PASSED |
 
-Commits after this record are documentation only. Re-run on any later code change.
+Not re-run on `e9b08c9` itself: re-run the Resume block before relying on it for a release.
 
-## Done this session
+## Done in the last session
 
-- `4f0c07c` Test setup installs an in-memory `localStorage`: on Node 25+ the built-in
-  global shadowed jsdom's, failing 8 `ActivityCommand` tests regardless of the code.
-- Installed Playwright Chromium (`npx playwright install chromium`); e2e now runs.
-- Review round 8 (independent `security-reviewer`, e2e harness + public docs): no
-  Critical/High. Fixed M1/M2/L1-L5 in `efbdfd7` and `0bdaf2c`; L6 is PR #7.
-- `ad0c3cb` Real defect found via the e2e leak: a connected UI websocket held uvicorn's
-  graceful shutdown open forever, so SIGTERM/Ctrl-C never reached
-  `orchestrator.shutdown()`. `server.build_uvicorn_config` now sets
-  `GRACEFUL_SHUTDOWN_SECONDS = 3`; `tests/test_server_shutdown.py` fails (13 s timeout)
-  without it.
+- Test setup installs an in-memory `localStorage`: on Node 25+ the built-in global
+  shadowed jsdom's, failing 8 `ActivityCommand` tests regardless of the code.
+- Playwright Chromium installed locally, so `make e2e` runs.
+- Round 8 review: no Critical/High. Fixed the e2e harness (busy-port refusal, child
+  liveness, bounded cleanup, `--no-install`, loopback-only `GG_BACKEND_HOST`,
+  `GG_AUTH_TOKEN_FILE` only under `GG_E2E=1`), the stale `PUBLICATION.md` record
+  (gitleaks findings with file, line, commit) and the author email in the dogfood report.
+- Real defect: a connected UI websocket held uvicorn's graceful shutdown open forever, so
+  SIGTERM/Ctrl-C never reached `orchestrator.shutdown()`. `server.build_uvicorn_config`
+  now sets `GRACEFUL_SHUTDOWN_SECONDS = 3`; `tests/test_server_shutdown.py` fails
+  (13 s timeout) without it.
 
-## Next (ordered)
+## Next
 
-1. Push, mark PR #6 ready and merge it (no protection, no CI; gates above are the
-   evidence). Then verify `main` at the merge SHA.
-2. Rebase PR #7 on `main`, add `{"name": "e2e", "run": "make e2e", "timeout": 1800}` to
-   `.claude/gates.json`, run `gates preflight`, merge.
-3. Further work only from real dogfood evidence (`docs/dogfood/`).
+Nothing actionable is open. Further work comes from real dogfood evidence
+(`docs/dogfood/`); do not start speculative Increment 5 work.
 
 ## Human decisions
 
-- Author email remains in commit metadata (`PUBLICATION.md`); acceptable for publication?
-- Adding GitHub Actions CI (hosted runner minutes) is not done.
+- The author email stays in commit metadata (see `PUBLICATION.md`): acceptable for publication?
+- GitHub Actions CI (hosted runner minutes) is not set up; decide whether to add it.
 
 ## Known gaps (documented, not built)
 
 - On forced shutdown uvicorn logs a `CancelledError` traceback per still-open websocket
-  (visible at the end of `make e2e`). Harmless; the websocket handlers could close on
-  shutdown instead.
+  (visible at the end of `make e2e`). Harmless; the handlers could close on shutdown.
 - `repair_worker` does not carry failover notes (no reliable retry-to-failed-run link
   without touching sealed Increment 4 semantics). Port only if dogfood shows duplicated work.
 - Reset hints in JSON notices whose type is neither error nor fail are not read.
@@ -73,6 +72,6 @@ Commits after this record are documentation only. Re-run on any later code chang
 
 ```
 git status && git log --oneline -5
-make lint && make typecheck && make test-frontend && make e2e
+make lint && make typecheck && make test-frontend && make e2e && make build
 make test-backend          # ~11 min; run in the background
 ```
